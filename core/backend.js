@@ -14,6 +14,7 @@ import { BACKUP_PARTS, PART_STORES, writeBackup, readBackup, sealKeys, openKeys 
 import { WALLET_LIMITS, PREMIUM, DECOR_KINDS, SHOP_GIFTS, LEDGER_KINDS, premiumOf, decorKey, cents, yuan, shopGifts, normalizeGift, validateGift } from './wallet.js';
 import { DRAW_ENGINES, DRAW_ENGINE_NAMES, GPT_IMAGE_MODELS, GPT_QUALITIES, normalizeGpt, gptBase, gptSize, gptPrompt, gptGenerate, normalizeComfy, comfyUrl, checkWorkflow, workflowPlaceholders, COMFY_LIMITS, comfySize, comfyPrompt, comfyValues, fillWorkflow, comfyGenerate, comfyCatalog, comfyLoras, tavernWorkflows, tavernWorkflow, orientationOf, DEFAULT_COMFY_WORKFLOW, COMFY_PARAM_KEYS, applyComfyWorkflow } from './image-engines.js';
 import {activeLoraWorkflow, normalizeDisabledLoras, inspectLoras, editLoras, pickLoraSource} from './comfy-loras.js';
+import { sortVoiceLibrary, normalizeLibraryEntry, parseVoiceLibraryText, mergeVoiceLibrary, pickAutoVoice, parseSpeakerAndForm } from './voice-library.js';
 import { normalizeSettings, validateSettings, modelRules, freshState } from './state.js';
 import { normalizeRoute, switchRouteEngine, removeRoute } from './routes.js';
 import { DEFAULT_PROMPT, DEFAULT_FORMAT, promptPlan, validatePreset, parseDialogue, isPlaceholderRole, knownFormats } from './protocol.js';
@@ -1447,6 +1448,124 @@ export class TTSBackend {
         this.player.playBlob(favorite.blob, { speaker: favorite.role, engine: favorite.engine, requestKey: favorite.requestKey,
             line: { role: favorite.role, text: favorite.text, translation: favorite.translation, emotion: '' } });
     }
+    saveVoiceLibrary(list) {
+        const next = this.getState();
+        next.voiceLibrary = sortVoiceLibrary((list || []).map(normalizeLibraryEntry).filter(Boolean));
+        return this.save(next);
+    }
+    mergeVoiceLibrary(incoming) {
+        const next = this.getState();
+        const { added, overwritten, list } = mergeVoiceLibrary(next.voiceLibrary, incoming);
+        next.voiceLibrary = list;
+        this.save(next);
+        return { added, overwritten, count: list.length };
+    }
+    parseVoiceLibraryText(text) {
+        return parseVoiceLibraryText(text);
+    }
+    auditionVoice(voiceId, language = 'zh') {
+        const temporary = this.getState();
+        const route = normalizeRoute({
+            id: 'audition-voice',
+            name: '试听音色',
+            engine: 'fish',
+            voice: String(voiceId || '').trim(),
+            model: '',
+            language
+        });
+        temporary.routes = [route];
+        const revision = this.revision;
+        const text = ({ zh: '雨还没停，再坐一会儿吧。', en: 'The rain has not stopped. Stay a little longer.', ja: '雨はまだ止んでいません。もう少しここにいましょう。', ko: '비가 아직 그치지 않았어요.' })[languageCode(language || temporary.general.defaultLanguage)] || 'Hello.';
+        this.player.start([{ role: route.name, emotion: 'calm', text, translation: '' }], () => !this.closed && revision === this.revision, temporary);
+    }
+    saveVoicePreset(name, defaultVoice, voices) {
+        const trimmed = String(name || '').trim();
+        if (!trimmed) throw Error('预设名称不能为空');
+        const next = this.getState();
+        next.voicePresets = next.voicePresets || {};
+        next.voicePresets[trimmed] = {
+            name: trimmed,
+            defaultVoice: String(defaultVoice !== undefined ? defaultVoice : (next.defaultVoice || '')).trim(),
+            voices: clone(voices || next.routes || []),
+            updatedAt: Date.now()
+        };
+        next.activeVoicePreset = trimmed;
+        return this.save(next);
+    }
+    applyVoicePreset(name) {
+        const next = this.getState();
+        const preset = next.voicePresets?.[name];
+        if (!preset) throw Error('音声预设不存在：' + name);
+        this.player.stop('应用音声预设');
+        if (preset.defaultVoice !== undefined) next.defaultVoice = String(preset.defaultVoice || '').trim();
+        if (Array.isArray(preset.voices)) {
+            next.routes = preset.voices.map(normalizeRoute);
+        } else if (preset.voices && typeof preset.voices === 'object') {
+            const routes = [];
+            for (const [sName, sVal] of Object.entries(preset.voices)) {
+                if (!sName) continue;
+                if (typeof sVal === 'string') {
+                    routes.push(normalizeRoute({ id: crypto.randomUUID(), name: sName, engine: 'fish', voice: sVal.trim(), model: '' }));
+                } else if (sVal && typeof sVal === 'object') {
+                    const forms = {};
+                    if (sVal.forms && typeof sVal.forms === 'object') {
+                        for (const [fName, fVoice] of Object.entries(sVal.forms)) {
+                            const vStr = typeof fVoice === 'string' ? fVoice : (fVoice?.voice || '');
+                            if (vStr) forms[fName] = { voice: vStr.trim(), model: '' };
+                        }
+                    }
+                    routes.push(normalizeRoute({
+                        id: crypto.randomUUID(),
+                        name: sName,
+                        engine: 'fish',
+                        voice: String(sVal.default || sVal.voice || '').trim(),
+                        model: '',
+                        forms
+                    }));
+                }
+            }
+            next.routes = routes;
+        }
+        next.activeVoicePreset = name;
+        return this.save(next);
+    }
+    deleteVoicePreset(name) {
+        const next = this.getState();
+        if (next.voicePresets?.[name]) {
+            delete next.voicePresets[name];
+            if (next.activeVoicePreset === name) next.activeVoicePreset = '';
+            return this.save(next);
+        }
+        return next;
+    }
+    renameVoicePreset(oldName, newName) {
+        const trimmed = String(newName || '').trim();
+        if (!trimmed) throw Error('新预设名称不能为空');
+        const next = this.getState();
+        if (!next.voicePresets?.[oldName]) throw Error('预设不存在：' + oldName);
+        if (trimmed !== oldName && next.voicePresets[trimmed]) throw Error('已有同名预设：' + trimmed);
+        const preset = next.voicePresets[oldName];
+        delete next.voicePresets[oldName];
+        preset.name = trimmed;
+        preset.updatedAt = Date.now();
+        next.voicePresets[trimmed] = preset;
+        if (next.activeVoicePreset === oldName) next.activeVoicePreset = trimmed;
+        return this.save(next);
+    }
+    setDefaultVoice(voiceId) {
+        const next = this.getState();
+        next.defaultVoice = String(voiceId || '').trim();
+        return this.save(next);
+    }
+    setAutoVoice(enabled) {
+        const next = this.getState();
+        next.autoVoice = !!enabled;
+        return this.save(next);
+    }
+    matchAutoVoice(profile) {
+        const state = this.getState();
+        return pickAutoVoice(profile, state.voiceLibrary, profile?.language || state.general.defaultLanguage || 'zh');
+    }
     audition(route) {
         const temporary = this.getState();
         route = normalizeRoute(clone(route));
@@ -1508,7 +1627,7 @@ export class TTSBackend {
             previewRequest: (engine, connection, route, line) => { const request = buildRequest(engine, connection || this.settings.connections[engine], route, line, this.providers.references); if (request.body.provider?.options?.['fish-audio']?.references) for (const ref of request.body.provider.options['fish-audio'].references) ref.audio = '[本地参考音频]'; if (request.body.audio?.voice?.startsWith?.('data:')) request.body.audio.voice = '[本地克隆样本：' + route.voice + ']'; return request; },
             status: () => this.player.snapshot(), subscribe: listener => this.subscribe(listener), levels: () => this.player.sink.levels(),
             pendingRole: () => this.player.pending, stop: () => this.player.stop(), toggle: () => this.player.toggle(), resume: () => this.player.continuePending(),
-            audition: route => this.audition(route), lineState: line => this.player.lineState(line),
+            saveVoiceLibrary: list => this.saveVoiceLibrary(list), mergeVoiceLibrary: list => this.mergeVoiceLibrary(list), parseVoiceLibraryText: text => this.parseVoiceLibraryText(text), auditionVoice: (id, lang) => this.auditionVoice(id, lang), saveVoicePreset: (name, defV, vList) => this.saveVoicePreset(name, defV, vList), applyVoicePreset: name => this.applyVoicePreset(name), deleteVoicePreset: name => this.deleteVoicePreset(name), renameVoicePreset: (oldN, newN) => this.renameVoicePreset(oldN, newN), setDefaultVoice: v => this.setDefaultVoice(v), setAutoVoice: v => this.setAutoVoice(v), matchAutoVoice: p => this.matchAutoVoice(p), audition: route => this.audition(route), lineState: line => this.player.lineState(line),
             setVolume: value => this.savePhone({ volume: value }), getVolume: () => this.player.getVolume(),
             cacheStats: () => this.cache.stats(), clearCache: () => this.clearCache(), listAudio: () => this.cache.list(),
             deleteAudio: async key => { if (this.player.requestKey === key) this.player.stop('音频已删除'); if (this.prepared?.key === key) this.prepared = null; await this.cache.remove(key); this.emit('library', { collection: 'cache' }); },

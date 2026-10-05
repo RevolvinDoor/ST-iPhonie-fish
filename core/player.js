@@ -1,3 +1,4 @@
+import { resolveVoiceRoute } from './routes.js';
 import { buildRequest } from './providers.js';
 import { requestHash } from './cache.js';
 
@@ -158,7 +159,7 @@ export class DialoguePlayer {
  getVolume() { return this.volume; }
  /** The cache key a line's audio has with its speaker's current voice settings, or null without a speaker. */
  async lineKey(line) {
-  const s = this.settings(), route = s.routes.find(r => r.name === line.role);
+  const s = this.settings(), route = resolveVoiceRoute(s.routes, line.role, s.defaultVoice)?.route;
   if (!route) return null;
   return requestHash(buildRequest(route.engine, s.connections[route.engine], { ...route, language: route.language || s.general.defaultLanguage }, line, this.providers.references));
  }
@@ -221,7 +222,7 @@ export class DialoguePlayer {
    while (this.index < this.queue.length) {
     if (!this.canContinue(epoch)) return;
     const s = this.settingsOverride || this.settings(), line = this.queue[this.index];
-    const route = s.routes.find(r => r.name === line.role);
+    const resolved = resolveVoiceRoute(s.routes, line.role, s.defaultVoice); const route = resolved?.route;
     this.line = line;
     this.speaker = line.role;
     this.engine = route?.engine || '';

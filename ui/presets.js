@@ -6,7 +6,7 @@ const positions = [['in_chat', '聊天内'], ['before_prompt', '主提示词之�
 const roles = [['system', '系统'], ['user', '用户'], ['assistant', '助手']];
 // Preset kinds: voice (dialogue tags), chat (phone chat replies, 朋友圈, and bringing chats into the story), drawing
 // (<img> tags in the chat text). A chat rule says where it is used: 私聊, 群聊, 朋友圈.
-const KINDS = [['tts', '配音', 'listen'], ['chat', '聊天', 'chat'], ['draw', '绘图', 'draw']];
+const KINDS = [['tts', '配音', 'listen'], ['voice', '音声方案', 'roles'], ['voicelib', '音色库', 'roles'], ['chat', '聊天', 'chat'], ['draw', '绘图', 'draw']];
 const USES = [['dm', '私聊'], ['group', '群聊'], ['moments', '朋友圈'], ['call', '电话'], ['forum', '论坛'], ['peek', '查手机']];
 // Drawing rules: which engines an entry is sent with (none ticked or all ticked: every engine).
 const ENGINE_USES = [['nai', 'NovelAI'], ['gpt', 'GPT 生图'], ['comfy', 'ComfyUI']];
@@ -226,6 +226,183 @@ export function presetsApp(ctx) {
   v.on('click', '[data-action]', async el => {
     const index = Number(el.dataset.index);
     switch (el.dataset.action) {
+      case 'save-default-voice': {
+        const val = v.root.querySelector('input[data-field="default-voice-val"]')?.value?.trim() || '';
+        api.setDefaultVoice(val);
+        ctx.notify('默认音色已更新');
+        break;
+      }
+      case 'pick-default-voice': {
+        const state = api.getState();
+        const libEntries = state.voiceLibrary || [];
+        const dialog = ctx.dialog('选择默认音色', `<div class="field"><input class="search" type="search" placeholder="搜索音色"></div><div class="group" data-voices>${libEntries.map(r => `<button class="list-row" data-voice="${esc(r.id)}"><span class="disc">${icon('wave')}</span><span style="min-width:0;flex:1;text-align:left"><strong>${esc(r.name)}</strong><small class="mono">${esc(r.id)}</small></span>${icon('next')}</button>`).join('') || '<p class="hint">音色库为空</p>'}</div>`);
+        dialog.body.addEventListener('click', e => {
+          const b = e.target.closest('button[data-voice]');
+          if (b) {
+            api.setDefaultVoice(b.dataset.voice);
+            dialog.close();
+            render();
+            ctx.notify('已设为默认音色');
+          }
+        });
+        break;
+      }
+      case 'auto-voice-toggle': {
+        const cur = api.getState().autoVoice;
+        api.setAutoVoice(!cur);
+        render();
+        ctx.notify(!cur ? '已开启未绑定角色智能匹配' : '已关闭智能匹配');
+        break;
+      }
+      case 'save-current-as-preset': {
+        const name = (await ctx.prompt('保存当前角色为音声方案', '例如：日常角色包、战斗剧场', ''))?.trim();
+        if (!name) break;
+        api.saveVoicePreset(name);
+        ctx.notify(`已保存方案「${name}」`);
+        render();
+        break;
+      }
+      case 'apply-voice-preset': {
+        const name = el.dataset.name;
+        if (await ctx.confirm('应用音声方案？', `将覆盖当前的角色音色绑定为方案「${name}」。`)) {
+          api.applyVoicePreset(name);
+          ctx.notify(`已应用方案「${name}」`);
+          render();
+        }
+        break;
+      }
+      case 'rename-voice-preset': {
+        const oldName = el.dataset.name;
+        const newName = (await ctx.prompt('重命名音声方案', '', oldName))?.trim();
+        if (!newName || newName === oldName) break;
+        api.renameVoicePreset(oldName, newName);
+        ctx.notify('方案已重命名');
+        render();
+        break;
+      }
+      case 'delete-voice-preset': {
+        const name = el.dataset.name;
+        if (await ctx.confirm('删除方案？', `确定删除音声方案「${name}」？当前的角色音色不受影响。`)) {
+          api.deleteVoicePreset(name);
+          ctx.notify('已删除方案');
+          render();
+        }
+        break;
+      }
+      case 'export-voice-presets': {
+        const state = api.getState();
+        const data = { type: 'fish_dialogue_voice_presets', version: 1, presets: state.voicePresets || {} };
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'voice-presets.json'; a.click();
+        ctx.notify('音声方案已导出');
+        break;
+      }
+      case 'import-voice-presets': {
+        const inputEl = document.createElement('input'); inputEl.type = 'file'; inputEl.accept = '.json,application/json';
+        inputEl.onchange = async () => {
+          const file = inputEl.files?.[0];
+          if (!file) return;
+          try {
+            const parsed = JSON.parse(await file.text());
+            const incoming = parsed.presets || (parsed.name ? { [parsed.name]: parsed } : null);
+            if (!incoming || typeof incoming !== 'object') throw new Error('无效的预设 JSON 格式');
+            for (const [k, v] of Object.entries(incoming)) {
+              if (v && v.name) api.saveVoicePreset(v.name, v.defaultVoice, v.voices);
+            }
+            ctx.notify('音声方案导入完成');
+            render();
+          } catch (e) {
+            ctx.notify('导入失败：' + e.message);
+          }
+        };
+        inputEl.click();
+        break;
+      }
+      case 'add-lib-single': {
+        const dialog = ctx.dialog('添加音色到库', `
+          <div class="field"><label>音色 ID</label><input data-id class="text" placeholder="Fish 音色 ID"></div>
+          <div class="field"><label>音色名称</label><input data-name class="text" placeholder="例如：少女音、低沉大叔"></div>
+          <div class="field"><label>主语言分类</label><select data-category><option value="zh">中文</option><option value="ja">日语</option><option value="en">英语</option></select></div>
+          <div class="field"><label>小类/标签</label><input data-sub class="text" placeholder="例如：温柔、御姐、热血（选填）"></div>
+          <div class="field"><label>描述/关键词</label><textarea data-desc rows="2" placeholder="声音特征描述，用于智能匹配（选填）"></textarea></div>
+          <div class="actions">${btn('confirm-add-lib', '添加', 'primary')}</div>
+        `);
+        dialog.body.addEventListener('click', e => {
+          if (e.target.closest('button[data-action="confirm-add-lib"]')) {
+            const id = dialog.body.querySelector('[data-id]').value.trim();
+            const name = dialog.body.querySelector('[data-name]').value.trim();
+            const category = dialog.body.querySelector('[data-category]').value;
+            const sub = dialog.body.querySelector('[data-sub]').value.trim();
+            const desc = dialog.body.querySelector('[data-desc]').value.trim();
+            if (!id || !name) { ctx.notify('音色 ID 和名称不能为空'); return; }
+            api.mergeVoiceLibrary([{ id, name, category, sub, desc }]);
+            dialog.close();
+            render();
+            ctx.notify('已添加到音色库');
+          }
+        });
+        break;
+      }
+      case 'batch-lib-text': {
+        const dialog = ctx.dialog('批量文本导入音色', `
+          <p class="hint">支持 FISH-TTS-TT 文本格式：<br>第一行写分类，如 <code>中文/低沉</code> 或 <code>日语</code>；后续行写 <code>{音色ID} {音色名称}</code></p>
+          <div class="field"><textarea data-batch-text rows="8" placeholder="中文/温柔&#10;7f92e5544d6d4048少女温柔音&#10;日语/御姐&#10;8823901a88bb3321女王"></textarea></div>
+          <div class="actions">${btn('confirm-batch-lib', '解析并导入', 'primary')}</div>
+        `);
+        dialog.body.addEventListener('click', e => {
+          if (e.target.closest('button[data-action="confirm-batch-lib"]')) {
+            const text = dialog.body.querySelector('[data-batch-text]').value;
+            const { entries, invalid } = api.parseVoiceLibraryText(text);
+            if (!entries.length) { ctx.notify('未解析出有效音色，请检查分类标题与音色行格式'); return; }
+            const { added, overwritten } = api.mergeVoiceLibrary(entries);
+            dialog.close();
+            render();
+            ctx.notify(`批量导入完成：新增 ${added} 条，更新 ${overwritten} 条${invalid.length ? '，' + invalid.length + ' 行无法识别' : ''}`);
+          }
+        });
+        break;
+      }
+      case 'export-lib-json': {
+        const state = api.getState();
+        const data = { type: 'fish_dialogue_voice_library', version: 1, voices: state.voiceLibrary || [] };
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'voice-library.json'; a.click();
+        ctx.notify('音色库已导出');
+        break;
+      }
+      case 'import-lib-json': {
+        const inputEl = document.createElement('input'); inputEl.type = 'file'; inputEl.accept = '.json,application/json';
+        inputEl.onchange = async () => {
+          const file = inputEl.files?.[0];
+          if (!file) return;
+          try {
+            const parsed = JSON.parse(await file.text());
+            const rawList = Array.isArray(parsed) ? parsed : (parsed.voices || parsed.library || []);
+            if (!Array.isArray(rawList)) throw new Error('未找到有效音色列表');
+            const { added, overwritten } = api.mergeVoiceLibrary(rawList);
+            ctx.notify(`音色库导入完成：新增 ${added} 条，更新 ${overwritten} 条`);
+            render();
+          } catch (e) {
+            ctx.notify('导入失败：' + e.message);
+          }
+        };
+        inputEl.click();
+        break;
+      }
+      case 'audition-lib-item': {
+        api.auditionVoice(el.dataset.id, el.dataset.lang || 'zh');
+        break;
+      }
+      case 'delete-lib-item': {
+        const id = el.dataset.id;
+        const state = api.getState();
+        const next = (state.voiceLibrary || []).filter(x => x.id !== id);
+        api.saveVoiceLibrary(next);
+        render();
+        ctx.notify('音色已从库中删除');
+        break;
+      }
+
       case 'kind': kind = el.dataset.kind; render(); break;
       case 'add-preset':
         currentKind = kind;
