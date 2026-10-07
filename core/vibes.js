@@ -44,7 +44,8 @@ export async function normalizeVibe(raw, fallbackName = 'Vibe') {
     ...(typeof raw.thumbnail === 'string' && /^data:image\/[^;]+;base64,/.test(raw.thumbnail) ? {thumbnail: raw.thumbnail} : {}),
     createdAt: Number(raw.createdAt) > 0 ? Number(raw.createdAt) : Date.now(),
     importInfo: {model: typeof info.model === 'string' && info.model ? info.model : 'nai-diffusion-4-5-full', information_extracted: extracted(info.information_extracted), strength: strength(info.strength)}};
-  doc.id = await sha256(image || firstEncoding(doc));
+  // A file's own id is kept (a vibe whose picture was made small keeps the id of the picture it was made from).
+  doc.id = typeof raw.id === 'string' && /^[0-9a-f]{64}$/.test(raw.id) ? raw.id : await sha256(image || firstEncoding(doc));
   return doc;
 }
 

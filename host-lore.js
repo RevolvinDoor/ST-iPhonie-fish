@@ -4,7 +4,8 @@
 // anything (dry run: no activation events, timers left alone), and returns their text for the phone's own prompt.
 import {cleanTagged} from './core/chat.js';
 
-const LORE_MAX = 12000;
+// The most of it a phone request takes: whole entries only (it used to be cut at 12000 characters, mid-entry).
+const LORE_MAX = 30000;
 
 /**
  * texts: what to scan, oldest first (the phone conversation, recent story, the contacts' names).
@@ -36,8 +37,16 @@ export async function worldInfoFor(context, {texts = [], persona = '', character
         ...(r?.worldInfoDepth || []).flatMap(d => d?.entries || []), ...(r?.worldInfoExamples || []).map(e => e?.content)];
     }
     const seen = new Set(), out = [];
-    for (const part of parts) { const text = cleanTagged(part, cleanTags); if (text && !seen.has(text)) { seen.add(text); out.push(text); } }
-    return out.join('\n\n').slice(0, LORE_MAX);
+    let used = 0;
+    for (const part of parts) {
+      const text = cleanTagged(part, cleanTags);
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      // One entry too long for what is left is skipped; shorter ones after it may still fit.
+      if (used + text.length > LORE_MAX) { if (!out.length) { out.push(text.slice(0, LORE_MAX)); used = LORE_MAX; } continue; }
+      out.push(text); used += text.length + 2;
+    }
+    return out.join('\n\n');
   } catch { return ''; }
 }
 

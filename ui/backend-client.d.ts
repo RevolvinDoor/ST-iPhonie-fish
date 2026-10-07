@@ -22,6 +22,8 @@ export interface Route {
     bindings: Partial<Record<Engine, VoiceBinding>>;
     /** Fixed appearance tags added when this character appears in a picture. */
     appearance?: string;
+    /** The voice was picked by 自动挑音色 (cleared when it is changed by hand), with the voice's name and why. */
+    autoVoice?: boolean; autoName?: string; autoReason?: string;
 }
 export type RouteInput = Pick<Route, 'name'> & Partial<Omit<Route, 'name'>>;
 export type RequestRoute = Pick<Route, 'voice'> & Partial<Omit<Route, 'voice'>>;
@@ -46,8 +48,12 @@ export interface GeneralSettings {
     waveformEnabled: boolean;
     /** Built-in wallpapers move slowly (clouds, stars, bubbles, leaves, fireflies). */
     wallpaperMotion?: boolean;
-    /** Story requests send older replies without voice tags (each line becomes its translation); the newest voiced reply keeps them while voice is on. */
+    /** Story requests send older replies without voice tags (each line becomes its translation). */
     stripVoice?: boolean;
+    /** Keep the newest voiced reply as it is, as an example of the format (off by default). */
+    voiceExample?: boolean;
+    /** 自动挑音色: a character met without a voice gets one picked by the text model (候选池 first). */
+    autoVoice?: boolean;
 }
 export interface Injection {
     position: InjectionPosition;
@@ -76,6 +82,8 @@ export interface Settings {
     enabled: boolean;
     theme: Theme;
     general: GeneralSettings;
+    /** 候选音色池 for 自动挑音色. */
+    voicePool?: VoicePoolEntry[];
     selected: string;
     activePreset: string;
     routes: Route[];
@@ -86,6 +94,7 @@ export interface Settings {
     chat: ChatSettings;
     moments: MomentsSettings;
     calls: CallsSettings;
+    sounds: SoundSettings;
     text: TextSettings;
     /** 向量模型 for 记忆 (key kept as KeyEngine 'embed'). */
     embed: EmbedSettings;
@@ -191,7 +200,7 @@ export interface VoiceTextOptions { mode: 'translation' | 'original' | 'both'; a
 export interface SyncSettings { enabled: boolean; }
 export interface SyncStatus { enabled: boolean; available: boolean; parts: Record<string, string>; busy: boolean; pending: boolean; error: string; lastAt: number; memoryAt: number;
     remote: { savedAt: number; deviceName: string; device: string } | null; lastResult?: { pulled: string[]; pushed: string[]; merged: string[] }; }
-export interface TextPreset { id: string; name: string; url: string; model: string; temperature: number; maxTokens: number; }
+export interface TextPreset { id: string; name: string; url: string; model: string; temperature: number; maxTokens: number; /** 关掉思考 sends enable_thinking: false and thinking: disabled */ thinking?: 'auto' | 'off'; }
 export interface TextSettings { source: 'tavern' | 'custom'; active: string; presets: TextPreset[]; }
 /** 向量模型: an OpenAI-compatible Embeddings API; off = 记忆 searches locally. */
 export interface EmbedSettings { enabled: boolean; url: string; model: string; }
@@ -209,6 +218,12 @@ export interface SpokenLine { role: string; text: string; emotion?: string; tran
 export interface CallState { id: number; name: string; dir: 'in' | 'out'; state: 'ringing' | 'talking' | 'ended'; since: number; answeredAt: number; lines: CallLine[]; thinking: boolean; speaking: boolean; voiced: boolean; error: string; auto: boolean;
     ended: { state: 'answered' | 'missed' | 'declined' | 'cancelled'; by: string; duration: number } | null; }
 export interface CallsSettings { auto: boolean; every: number; dailyMax: number; ring: number; }
+/** 音效: volumes 0..1; vary: each playing a little different; generate: missing sounds made by ElevenLabs, at most `versions` of a name. */
+export interface SoundSettings { enabled: boolean; ambienceVolume: number; sfxVolume: number; vary: boolean; generate: boolean; versions: number; /** 自带音效包 in use */ pack: boolean; /** shipped sounds taken out */ packHidden: string[]; }
+/** A sound in the library (no audio): an ambience is a 底子 (bed, loops) or a 点缀 (dot, now and then). */
+export interface SoundRow { id: string; name: string; type: 'sfx' | 'ambience'; layer: '' | 'bed' | 'dot'; strength: '' | '轻' | '重'; source: 'mine' | 'eleven' | 'pack'; describe: string; seconds: number; mime: string; size: number; at: number; /** the shipped pack: original title and author */ credit?: string; }
+/** A name the story asked for that the library has none of. */
+export interface MissingSound { type: 'sfx' | 'ambience'; name: string; describe: string; count: number; at: number; }
 export interface MomentsSettings { auto: boolean; every: number; dailyMax: number; images: boolean; replyToMe: boolean; }
 /** The user in the chat app. name '' shows the tavern's persona name. */
 export interface ChatProfile { name: string; status: 'online' | 'qme' | 'busy' | 'away' | 'hidden'; statusText: string; signature: string; bubble: 'default' | 'candy' | 'mint' | 'night' | 'ink'; frame: 'none' | 'star' | 'cat' | 'flower' | 'halo'; background: 'none' | 'clouds' | 'stars' | 'grid' | 'sakura'; backgroundPhoto: string; }
@@ -221,11 +236,15 @@ export interface PeekPicture { text: string; tags: string; photoId?: string; sta
 export interface MomentComment { id: string; from: string; to?: string; text: string; at: number; }
 /** author and comment names are 'me' for the user. */
 export interface MomentPost { id: string; author: string; text: string; at: number; source: 'manual' | 'auto' | 'me'; photoId?: string; imageTags?: string; imageState?: 'waiting' | 'done' | 'failed'; imageNote?: string; likes: string[]; comments: MomentComment[]; }
-export interface ChatSettings { presets: ChatPreset[]; activePreset: string; contacts: Contact[]; voiceText: VoiceTextOptions; profile: ChatProfile; /** 特别关心 */ starred: string[];
+/** 表情包: a picture on the web by name (the name is what the model writes). */
+export interface Sticker { name: string; url: string; }
+export interface ChatSettings { /** 表情包 */ stickers?: Sticker[]; presets: ChatPreset[]; activePreset: string; contacts: Contact[]; voiceText: VoiceTextOptions; profile: ChatProfile; /** 特别关心 */ starred: string[];
     /** Avatar choices by name ('me' = the user); names not listed use the tavern's avatar, else the first letter. */
     avatars: Record<string, AvatarChoice>;
     /** One wallet for the whole phone. */
-    wallet: Wallet; }
+    wallet: Wallet;
+    /** 逐条显示回复: an open chat shows a reply's messages one by one, after a typing bubble as long as each message. */
+    pace: boolean; }
 /** 零钱 and its 明细 (newest first), decorations bought ('bubble:aurora'), the user's own shop gifts, gifts taken from characters. */
 export interface Wallet { balance: number; ledger: Array<{ id: string; at: number; amount: number; kind: string; note: string; who: string }>; owned: string[]; gifts: ShopGift[]; received: Array<{ id: string; at: number; from: string; name: string; emoji: string; note: string }>; }
 export interface ShopGift { id: string; name: string; emoji: string; price: number; note: string; /** true for a gift the user added */ own?: boolean; }
@@ -397,7 +416,8 @@ export interface AudioMetadata {
 }
 export interface CachedAudio { key: string; at: number; bytes: number; metadata: AudioMetadata; }
 export interface CacheStats { count: number; bytes: number; available: boolean; }
-export interface LibraryStats { bytes: number; limit: number; notes: number; photos: number; favorites: number; references: number; }
+export interface VoicePoolEntry { engine: 'fish' | 'mini' | 'eleven' | 'mimo'; voice: string; model: string; name: string; gender: 'female' | 'male' | ''; age: 'child' | 'young' | 'adult' | 'old' | ''; style: string; }
+export interface LibraryStats { bytes: number; limit: number; notes: number; photos: number; favorites: number; references: number; vibes: number; /** Bytes by kind: notes, photos, favorites, references, vibes, phone. */ sizes: Record<string, number>; }
 export type LibraryCollection = 'favorites' | 'cache' | 'photos' | 'notes';
 
 export type BackendEvent =
@@ -433,6 +453,10 @@ export interface BackendFacade {
     save(next: Settings, expectedRevision?: number): Settings;
     updateGeneral(patch: Partial<GeneralSettings>): Settings;
     saveRoute(route: RouteInput): Route;
+    /** 候选音色池: the voices 自动挑音色 picks from first. */
+    saveVoicePool(list: VoicePoolEntry[]): VoicePoolEntry[];
+    /** 自动挑音色 for one character again (in the tavern): resolves to the saved route, marked autoVoice. */
+    autoPickVoice?(name: string): Promise<Route>;
     deleteRoute(id: string): Settings;
     /** Returns a changed draft; it does not save the route. */
     switchRouteEngine(route: RouteInput, engine: Engine): Route;
@@ -505,6 +529,8 @@ export interface BackendFacade {
     drawQuote(params?: Partial<DrawParams>): DrawQuote;
     /** Saved vibes (summaries, newest first). */
     listVibes(): VibeSummary[];
+    /** Makes the pictures of saved vibes small (encodings stay): how many changed, and the bytes before and after. */
+    compactVibes(): Promise<{ count: number; before: number; after: number }>;
     /** Imports .naiv4vibe, .naiv4vibebundle, 智绘姬 exports and pictures; groups in the files become groups. */
     importVibes(files: ArrayLike<File>, options?: { names?: boolean }): Promise<{ added: number; updated: number; renamed: number; groups: number; errors: Array<{ name: string; message: string }> }>;
     updateVibe(id: string, patch: { name?: string; strength?: number }): Promise<VibeSummary>;
@@ -564,6 +590,8 @@ export interface BackendFacade {
     addPhoto(value: PhotoInput): Promise<Photo>;
     getPhoto(id: string): Promise<Photo | null>;
     deletePhoto(id: string): Promise<boolean>;
+    /** Deletes several album photos at once; 朋友圈 and 查手机 pictures among them go back to «not drawn». */
+    deletePhotos(ids: string[]): Promise<number>;
     listNotes(): Promise<Note[]>;
     saveNote(value: NoteInput): Promise<Note>;
     deleteNote(id: string): Promise<boolean>;
@@ -571,12 +599,31 @@ export interface BackendFacade {
     savePhone(patch: PhonePatch): Promise<PhonePreferences>;
     libraryStats(): Promise<LibraryStats>;
     /** Album photos made by drawing (the workbench and in-text pictures). */
-    generatedPhotos(): Promise<{ count: number; bytes: number }>;
+    /** The photos the phone drew, by where: 绘图 App (draw), 正文图片 (chat), 查手机 (peek), 朋友圈 (moments). */
+    generatedPhotos(): Promise<{ count: number; bytes: number; sources: Record<'draw' | 'chat' | 'peek' | 'moments' | 'chatapp', { label: string; count: number; bytes: number }> }>;
     /** Deletes those photos from the album; returns how many were deleted. Imported photos stay. */
-    deleteGeneratedPhotos(): Promise<number>;
+    /** Deletes the drawn photos of those sources (all when none); what showed them goes back to «not drawn». */
+    deleteGeneratedPhotos(sources?: Array<'draw' | 'chat' | 'peek' | 'moments' | 'chatapp'>): Promise<number>;
     saveChatPreset(preset: Partial<ChatPreset> & { name: string }): ChatPreset;
     /** 朋友圈 options. */
     saveCalls(patch: Partial<CallsSettings>): CallsSettings;
+    /** 音效 options. */
+    saveSounds(patch: Partial<SoundSettings>): SoundSettings;
+    listSounds(): Promise<SoundRow[]>;
+    soundBlob(id: string): Promise<Blob | null>;
+    /** Adds sounds (the names they answer are no longer missing). */
+    addSounds(list: Array<Partial<Omit<SoundRow, 'id' | 'mime' | 'size' | 'at'>> & { name: string; blob: Blob }>): Promise<SoundRow[]>;
+    updateSound(id: string, patch: Partial<Pick<SoundRow, 'name' | 'type' | 'layer' | 'strength' | 'describe'>>): Promise<SoundRow>;
+    deleteSounds(ids: string[]): Promise<number>;
+    /** 自带音效包: how many names and sounds, how many taken out. */
+    packInfo(): Promise<{ names: number; count: number; hidden: number }>;
+    soundMissing(): Promise<MissingSound[]>;
+    dismissMissing(type: 'sfx' | 'ambience', name: string): Promise<void>;
+    /** ElevenLabs makes the sound from an English description and it is kept. */
+    generateSound(input: { name: string; type: 'sfx' | 'ambience'; describe: string }): Promise<SoundRow>;
+    /** 音效包 (JSON) of these sounds, all when none. */
+    exportSounds(ids?: string[] | null, name?: string): Promise<Blob>;
+    importSounds(file: Blob | string, options?: { source?: 'pack' | 'mine' | 'eleven' }): Promise<{ added: number; skipped: number; name: string }>;
     saveText(patch: TextPatch): TextSettings;
     saveEmbed(patch: Partial<EmbedSettings>): EmbedSettings;
     embedReady(): boolean;
@@ -592,6 +639,8 @@ export interface BackendFacade {
     saveSync(patch: Partial<SyncSettings>): SyncSettings;
     /** Syncs now: takes what changed in the tavern, writes what changed here. */
     syncNow(): Promise<SyncStatus>;
+    /** Deletes the phone's copy in the tavern; resolves to how many files went (0: there was none). */
+    clearSyncFiles(): Promise<number>;
     /** Model ids the custom text API lists (a free connection check); `draft` are options not saved yet. */
     textModels(draft?: TextPatch): Promise<string[]>;
     /** Checks NovelAI or the relay: the drawing route (an empty request, nothing drawn, no Anlas) and the subscription. */
@@ -643,11 +692,14 @@ export interface BackendFacade {
     /** Takes (or returns) what a contact sent: red packet, transfer or gift. Money goes into the wallet, a gift into 收到的礼物. */
     takeSent(threadId: string, messageId: string, accept?: boolean): Promise<ChatThread>;
     shopCatalog(): { premium: Record<'bubble' | 'frame' | 'background', Record<string, [string, number]>>; kinds: Record<string, string>; gifts: ShopGift[]; ledgerKinds: Record<string, string> };
-    saveChatOptions(patch: { voiceText?: Partial<VoiceTextOptions>; profile?: Partial<ChatProfile>; starred?: string[]; /** null: back to the tavern's avatar */ avatars?: Record<string, AvatarChoice | null> }): ChatSettings;
+    saveChatOptions(patch: { pace?: boolean; stickers?: Sticker[]; voiceText?: Partial<VoiceTextOptions>; profile?: Partial<ChatProfile>; starred?: string[]; /** null: back to the tavern's avatar */ avatars?: Record<string, AvatarChoice | null> }): ChatSettings;
     saveContact(contact: Partial<Contact> & { name: string }): Contact;
     deleteContact(id: string): ChatSettings;
     /** Story roles (角色 App) first, then manual contacts. */
-    chatContacts(): ChatContact[];
+    /** This card's contacts; all: every card's (to look someone up by name). */
+    chatContacts(all?: boolean): ChatContact[];
+    /** A role from the 角色 App joins this card's contacts. */
+    addRoleContact(name: string): ChatContact[];
     listThreads(): Promise<ChatThreadSummary[]>;
     getThread(id: string): Promise<ChatThread | null>;
     chatUnread(): Promise<number>;
@@ -687,9 +739,10 @@ export interface BackendAPI extends BackendFacade {
     /** Uploads an album photo to the tavern and attaches it to the message. */
     insertImage(messageId: number, photoId: string): Promise<{ id: number; url: string }>;
     /** Asks the chat model for picture tags describing the latest scene. */
-    suggestPrompt(): Promise<string>;
+    /** people: registered names the model put in the picture (the drawing app adds them with their looks). */
+    suggestPrompt(): Promise<{ prompt: string; people: string[]; /** NovelAI: tokens the line holds, and the room it had */ tokens?: number; budget?: number }>;
     /** 帮我写: a prompt line for a picture the user describes in a few words; cast: names of the people in it. */
-    writePrompt(idea: string, cast?: string[]): Promise<string>;
+    writePrompt(idea: string, cast?: string[]): Promise<{ prompt: string; people: string[]; /** NovelAI: tokens the line holds, and the room it had */ tokens?: number; budget?: number }>;
     /** Pictures stored in the open tavern chat. */
     chatPictureStats(): { count: number };
     /** Plans the pictures of the newest character reply again and queues them. */
@@ -700,6 +753,8 @@ export interface BackendAPI extends BackendFacade {
     takeDraw(): (DrawInput & { tag?: string; seed?: number }) | null;
     /** Generates the contacts' next messages with the tavern's connected model and stores them. */
     chatReply(threadId: string): Promise<ChatThread>;
+    /** Draws a contact's photo from its tags (allowPaid: even when it costs Anlas); resolves to the photo id. */
+    chatDrawPhoto?(threadId: string, messageId: string, allowPaid?: boolean): Promise<string | null>;
     /** Prepares chat messages to be injected once into the next story reply. */
     chatBring(threadId: string, messageIds: string[]): Promise<{ threadId: string; name: string; count: number; text: string }>;
     chatPendingBring(): { threadId: string; name: string; count: number } | null;
@@ -741,7 +796,8 @@ export interface BackendAPI extends BackendFacade {
     forumReply(id: string, replyId: string): Promise<ForumPost>;
     forumBusy(): boolean;
     /** 查手机: looks into a character's phone (a new snapshot). */
-    peekLook(name: string): Promise<PeekSnapshot>;
+    /** keep: 接着上次看 — only what is new since last time, put onto the phone as last seen. */
+    peekLook(name: string, keep?: boolean): Promise<PeekSnapshot>;
     /** 立即整理: writes up what is due in the chat's memory; resolves with how many summaries were written. */
     memoryTidy(threadId: string): Promise<number>;
     memoryStatus(threadId: string): MemoryStatus;

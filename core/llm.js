@@ -5,10 +5,12 @@
 // Each preset's key lives with the other keys (core/keys.js, engine 'llm', one line per preset) and never appears in
 // settings, requests shown to the user, or error messages.
 
-export const TEXT_LIMITS = Object.freeze({maxTokens: [64, 32000], temperature: [0, 2], timeout: 120000});
+// idle: a streamed answer may go this long without sending anything (thinking counts as sending); whole: the longest
+// any request may take; timeout: an answer that is not streamed (it says nothing until it is done).
+export const TEXT_LIMITS = Object.freeze({maxTokens: [64, 32000], temperature: [0, 2], idle: 90000, whole: 600000, timeout: 300000});
 
 export function defaultTextPreset(id = 'default', name = '自定义接口') {
-  return {id, name, url: '', model: '', temperature: 0.9, maxTokens: 1200};
+  return {id, name, url: '', model: '', temperature: 0.9, maxTokens: 1200, thinking: 'auto'};
 }
 export function defaultText() {
   return {source: 'tavern', active: 'default', presets: [defaultTextPreset()]};
@@ -19,7 +21,8 @@ function normalizePreset(value, index) {
   const base = defaultTextPreset();
   return {id: TEXT_PRESET_ID.test(String(value?.id || '')) ? String(value.id) : crypto.randomUUID(), name: String(value?.name || '').trim().slice(0, 40) || '接口 ' + (index + 1),
     url: String(value?.url || '').trim().slice(0, 500), model: String(value?.model || '').trim().slice(0, 200),
-    temperature: Math.round(count(value?.temperature, TEXT_LIMITS.temperature, base.temperature, false) * 100) / 100, maxTokens: count(value?.maxTokens, TEXT_LIMITS.maxTokens, base.maxTokens)};
+    temperature: Math.round(count(value?.temperature, TEXT_LIMITS.temperature, base.temperature, false) * 100) / 100, maxTokens: count(value?.maxTokens, TEXT_LIMITS.maxTokens, base.maxTokens),
+    thinking: value?.thinking === 'off' ? 'off' : 'auto'};
 }
 export function normalizeText(value) {
   const base = defaultText();
@@ -52,7 +55,9 @@ export function asMessages(prompt) {
 
 export function chatBody(text, prompt, responseLength) {
   if (!text.model) throw Error('请先在「引擎 → 文字模型」里填写模型名');
-  return {model: text.model, messages: asMessages(prompt), temperature: text.temperature, max_tokens: Math.min(text.maxTokens, responseLength || text.maxTokens), stream: false};
+  // 关掉思考: the switches the providers that think by default read (硅基流动 and 通义: enable_thinking; 智谱, 火山方舟: thinking).
+  const quiet = text.thinking === 'off' ? {enable_thinking: false, thinking: {type: 'disabled'}} : {};
+  return {model: text.model, messages: asMessages(prompt), temperature: text.temperature, max_tokens: responseLength || text.maxTokens, ...quiet, stream: false};
 }
 
 /** The reply text of a Chat Completions answer (reasoning kept apart by the provider is left out). */
@@ -82,26 +87,33 @@ export function chunkText(json) {
  * Reads a streamed answer (server-sent events) to the end and returns the whole text. Some relays ("假流式" channels)
  * only answer a streamed request: asked without streaming they send back an empty message.
  */
-export async function streamText(response) {
+export async function streamText(response, info = {}) {
   const reader = response.body?.getReader?.();
   const decoder = new TextDecoder();
-  let buffer = '', text = '';
+  // raw: the whole body while no event has come, so an answer that is not a stream at all (plain JSON) can still be read.
+  let buffer = '', text = '', raw = '', events = false;
   const take = block => {
     const data = block.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('');
+    if (data) events = true; else if (!events && raw.length < 4_000_000) raw += block + '\n\n';
     if (!data || data === '[DONE]') return;
     let json; try { json = JSON.parse(data); } catch { return; }
     const message = json?.error?.message || (typeof json?.error === 'string' ? json.error : '');
     if (message) throw Error(String(message).slice(0, 300));
+    info.alive?.();
+    const choice = json?.choices?.[0];
+    if (choice?.delta?.reasoning_content || choice?.delta?.reasoning || json?.candidates?.[0]?.content?.parts?.some?.(p => p?.thought)) info.thought = true;
+    if (choice?.finish_reason) info.finish = choice.finish_reason;
     text += chunkText(json);
   };
-  if (!reader) { for (const block of (await response.text()).split(/\r?\n\r?\n/)) take(block); return text; }
+  const end = () => { info.raw = events ? '' : raw.trim(); return text; };
+  if (!reader) { for (const block of (await response.text()).split(/\r?\n\r?\n/)) take(block); return end(); }
   for (;;) {
     const {done, value} = await reader.read();
     buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
     const blocks = buffer.split(/\r?\n\r?\n/);
     buffer = done ? '' : blocks.pop();
     for (const block of blocks) take(block);
-    if (done) { if (buffer) take(buffer); return text; }
+    if (done) { if (buffer) take(buffer); return end(); }
   }
 }
 
@@ -119,31 +131,79 @@ export function failure(status, body, key = '') {
  * Calls the custom API. fetch is passed in (tests). A network error in a browser is usually the API refusing web
  * pages (CORS) or a wrong address; the message says so.
  */
+const TOO_SLOW = '文字模型：等太久了，接口没有回应';
+/** An answer that is empty because the model spent the whole length thinking (or only thought): say so, do not ask again. */
+const thoughtOnly = finish => Error(finish === 'length'
+  ? '文字模型：模型把能写的长度都用在思考上了，没写出回复。把这个接口的「最长回复」调大，或者打开「关掉思考」'
+  : '文字模型：模型只写了思考，没写回复。可以再试一次，或者打开「关掉思考」');
+/**
+ * Calls the custom API. fetch is passed in (tests). The answer is streamed: a model that thinks for minutes (or writes a
+ * long 查手机) is not cut off as long as something keeps coming; it is only given up after TEXT_LIMITS.idle of silence.
+ * An API that does not stream answers with plain JSON, which is read as it is. An empty streamed answer is asked once
+ * more without streaming (some channels only answer that way); one that is empty because the model only thought is not
+ * asked again (it would be paid twice). A network error in a browser is usually the API refusing web pages (CORS) or a
+ * wrong address; the message says so.
+ */
 export async function customRequest({text, key, prompt, responseLength, fetch: send = globalThis.fetch, signal}) {
   const base = apiBase(text.url), body = chatBody(text, prompt, responseLength);
   const post = async stream => {
-    const timeout = AbortSignal.timeout ? AbortSignal.timeout(TEXT_LIMITS.timeout) : undefined;
+    const idle = new AbortController();
+    let timer = 0;
+    const alive = () => { clearTimeout(timer); timer = setTimeout(() => idle.abort(), stream ? TEXT_LIMITS.idle : TEXT_LIMITS.timeout); };
+    const whole = AbortSignal.timeout ? AbortSignal.timeout(TEXT_LIMITS.whole) : null;
+    const signals = [idle.signal, whole, signal].filter(Boolean);
+    alive();
+    let response;
     try {
-      return await send(base + '/chat/completions', {method: 'POST', headers: {'Content-Type': 'application/json', ...(key ? {Authorization: 'Bearer ' + key} : {})}, body: JSON.stringify({...body, stream}),
-        signal: signal && timeout && AbortSignal.any ? AbortSignal.any([signal, timeout]) : signal || timeout});
+      response = await send(base + '/chat/completions', {method: 'POST', headers: {'Content-Type': 'application/json', ...(key ? {Authorization: 'Bearer ' + key} : {})}, body: JSON.stringify({...body, stream}),
+        signal: signals.length > 1 && AbortSignal.any ? AbortSignal.any(signals) : idle.signal});
     } catch (error) {
-      if (error?.name === 'AbortError' || error?.name === 'TimeoutError') throw Error('文字模型：等太久了，接口没有回应');
+      clearTimeout(timer);
+      if (error?.name === 'AbortError' || error?.name === 'TimeoutError') throw Error(TOO_SLOW);
       throw Error('文字模型：连不上这个接口。可能是地址写错了，或者这个接口不允许网页直接访问（CORS）');
     }
+    /** Reads the answer while the timer keeps watch; clears it whatever happens. */
+    const read = async work => {
+      try { alive(); return await work(alive); }
+      catch (error) { if (error?.name === 'AbortError' || error?.name === 'TimeoutError') throw Error(TOO_SLOW); throw error; }
+      finally { clearTimeout(timer); }
+    };
+    return {response, read};
   };
-  const response = await post(false);
-  const raw = await response.text();
-  if (!response.ok) throw failure(response.status, raw, key);
-  let json;
-  try { json = JSON.parse(raw); } catch { throw Error('文字模型：接口返回的不是 JSON，地址可能填错了'); }
-  let reply = '';
-  try { reply = replyText(json); } catch { /* no text: tried again as a stream below */ }
-  if (reply.trim()) return reply;
-  // An empty answer: a "假流式" channel only answers streamed requests. Asked again as a stream.
-  const streamed = await post(true);
-  if (!streamed.ok) throw failure(streamed.status, await streamed.text(), key);
-  reply = await streamText(streamed);
-  if (!reply.trim()) throw Error('文字模型：接口没有返回内容（普通请求和流式请求都试过了）');
+  /** A plain JSON answer: its text, or why there is none ('' when it is simply empty). */
+  const fromJson = raw => {
+    let json;
+    try { json = JSON.parse(raw); } catch { throw Error('文字模型：接口返回的不是 JSON，地址可能填错了'); }
+    let reply = '';
+    try { reply = replyText(json); } catch { /* no text */ }
+    if (reply.trim()) return reply;
+    const choice = json?.choices?.[0];
+    if (choice?.message?.reasoning_content || choice?.message?.reasoning) throw thoughtOnly(choice.finish_reason);
+    return '';
+  };
+  const first = await post(true);
+  if (!first.response.ok) {
+    const raw = await first.read(() => first.response.text());
+    // An API that refuses streaming: asked the ordinary way.
+    if (!(first.response.status === 400 || first.response.status === 422) || !/stream/i.test(raw)) throw failure(first.response.status, raw, key);
+  } else if (/json/i.test(first.response.headers?.get?.('content-type') || '')) {
+    // Streaming not supported but not refused either: an ordinary answer came back.
+    const reply = fromJson(await first.read(() => first.response.text()));
+    if (reply) return reply;
+  } else {
+    const info = {};
+    const reply = await first.read(alive => streamText(first.response, Object.assign(info, {alive})));
+    if (reply.trim()) return reply;
+    if (info.thought) throw thoughtOnly(info.finish);
+    // Not a stream after all: an ordinary answer that did not say so.
+    if (info.raw) { const plain = fromJson(info.raw); if (plain) return plain; }
+  }
+  // Nothing yet: once more without streaming.
+  const second = await post(false);
+  const raw = await second.read(() => second.response.text());
+  if (!second.response.ok) throw failure(second.response.status, raw, key);
+  const reply = fromJson(raw);
+  if (!reply) throw Error('文字模型：接口没有返回内容（流式请求和普通请求都试过了）');
   return reply;
 }
 
@@ -151,12 +211,18 @@ export async function customRequest({text, key, prompt, responseLength, fetch: s
 export async function listModels({text, key, fetch: send = globalThis.fetch}) {
   const base = apiBase(text.url);
   let response;
+  // Some APIs (火山方舟 among them) have no list of models: the model is written by hand then.
+  const byHand = /volces\.com|volcengine/i.test(base)
+    ? '火山方舟的接口读不出模型列表：在「模型」里直接填模型名（比如 doubao-seed-1-6-250615、deepseek-v3-250324）或推理接入点 ID（ep- 开头），在火山方舟控制台的「在线推理」或「开通管理」里能看到'
+    : '这个接口读不出模型列表：在「模型」里直接填模型名就行（接口的文档或控制台里能找到）';
   try { response = await send(base + '/models', {headers: key ? {Authorization: 'Bearer ' + key} : {}}); }
   catch { throw Error('文字模型：连不上这个接口。可能是地址写错了，或者这个接口不允许网页直接访问（CORS）'); }
   const raw = await response.text();
-  if (!response.ok) throw failure(response.status, raw, key);
+  if (response.status === 404 || response.status === 405) throw Error('文字模型：' + byHand);
+  if (!response.ok) { const error = failure(response.status, raw, key); if (/volces\.com|volcengine/i.test(base) && response.status !== 401) error.message += '。' + byHand; throw error; }
   let json;
-  try { json = JSON.parse(raw); } catch { throw Error('文字模型：接口返回的不是 JSON，地址可能填错了'); }
+  try { json = JSON.parse(raw); } catch { throw Error('文字模型：' + byHand); }
   const list = Array.isArray(json?.data) ? json.data : Array.isArray(json?.models) ? json.models : Array.isArray(json) ? json : [];
+  if (!list.length) throw Error('文字模型：' + byHand);
   return [...new Set(list.map(m => typeof m === 'string' ? m : m?.id || m?.name).filter(Boolean).map(String))].sort().slice(0, 500);
 }

@@ -1,4 +1,6 @@
-import {createView, esc, engines, btn, field, input, select, textArea, heading, help, groupTitle, plate, avatar, languageField, languageName, typedLanguages} from './common.js';
+import {createView, esc, engines, btn, field, input, select, textArea, heading, help, groupTitle, plate, avatar, languageField, languageName, typedLanguages, toggle} from './common.js';
+import {VOICE_GENDERS, VOICE_AGES, poolLine, readPoolFile, poolFile} from '../core/auto-voice.js';
+import {saveFile} from '../download.js';
 import {icon, halo} from './icons.js';
 
 function barcode(seed) {
@@ -23,12 +25,19 @@ export function rolesApp(ctx) {
       return `<button class="role-card" data-action="edit-role" data-id="${esc(r.id)}" data-engine="${engine}">
         <span class="role-top"><span class="role-no">${number(i)}</span>${voiced ? halo() : ''}${avatar(r.name, engine, 54)}</span>
         <span class="role-body"><strong>${esc(r.name)}</strong>${voiced
-          ? `<span>${plate(engines[r.engine])}</span><small>${esc(voiceLabel(r.voice))}<br>${esc(r.language ? languageName(r.language) : '跟随默认语言')}</small>`
+          ? `<span>${plate(engines[r.engine])}</span><small>${esc(voiceLabel(r.voice))}<br>${esc(r.language ? languageName(r.language) : '跟随默认语言')}</small>${r.autoVoice ? '<small class="auto-chip">自动挑的</small>' : ''}`
           : '<small class="unset">待选择音色</small><small>出现在聊天里时会等你配音</small>'}</span></button>`;
     }).join('');
     v.draw(heading('角色', help('给聊天里说话的角色配一个声音。也可以直接点聊天里的声波，遇到没配过的角色会带你来这里。') + btn('add-role', icon('add'), 'round-button', 'aria-label="新增角色"'), `Character · ${String(roles.length).padStart(2, '0')}`)
+      + autoGroup()
       + `<div class="role-grid">${cards}<button class="role-card add" data-action="add-role">${icon('add')}新增角色</button></div>`
       );
+  }
+  /** 自动挑音色: the switch, and the 候选音色池 it picks from first. */
+  function autoGroup() {
+    const state = api.getState(), on = state.general.autoVoice === true, pool = state.voicePool || [];
+    return `<div class="group">${toggle('autoVoice', '自动挑音色', on, '大世界卡里角色多，可以打开这个：新角色第一次说话时，文字模型按 TA 在正文里的样子（角色卡、说过的话、剧情里的描写）挑一个音色填上，标「自动挑的」，不满意随时换或重新挑。\n\n先从「候选音色池」里挑（你信得过的音色，标好男女、年龄和风格）；池子里没有对得上的，再去引擎的音色库里搜（Fish 用公开音色库，MiniMax 用系统音色，ElevenLabs 用你账号里的音色）。挑一次会调用一两次文字模型。')}
+      <button class="list-row" data-action="voice-pool"><span><strong>候选音色池</strong><small>${pool.length ? `${pool.length} 个音色，自动挑音色时先从这里挑` : '还是空的：给角色选好音色后，在角色页点「加入候选池」'}</small></span>${icon('next')}</button></div>`;
   }
 
   function renderEditor() {
@@ -38,6 +47,7 @@ export function rolesApp(ctx) {
     const mimo = r.engine !== 'mimo' ? '' : /voicedesign$/.test(model) ? 'design' : /voiceclone$/.test(model) ? 'clone' : 'preset';
     v.draw(heading(r.id ? '角色配音' : '新增角色', '', 'Voice Route')
       + (pending ? `<div class="banner">${icon('alert')}<span>播放停在「${esc(r.name)}」这里，选好音色后可以继续。</span></div>` : '')
+      + (r.autoVoice && voiced ? `<div class="banner auto-banner">${icon('wave')}<span>这个音色是自动挑的${r.autoReason ? `（${esc(r.autoReason)}）` : ''}。不满意可以从列表换一个，或者${api.autoPickVoice ? '' : '在酒馆里打开小手机后'}「重新挑」。</span>${api.autoPickVoice && r.id ? btn('repick-voice', '重新挑', 'chip-button') : ''}</div>` : '')
       + `<div class="id-card${voiced ? '' : ' none'}" data-engine="${r.engine}">
           <div class="id-top"><span>VOICE ID CARD</span>${plate(saved >= 0 ? number(saved) : 'NEW')}</div>
           <div class="id-main"><span class="id-photo">${halo()}${avatar(r.name || '新', voiced ? r.engine : 'none', 76)}</span>
@@ -54,6 +64,7 @@ export function rolesApp(ctx) {
         ${groupTitle('声音')}
         <div class="group pad" data-engine="${r.engine}">
           <div class="voice-row"><span class="disc">${icon('wave')}</span><div>${voiced ? `<strong>${esc(voiceLabel(r.voice))}</strong><small class="mono">${esc(mimo === 'design' ? '音色设计' : r.voice)}</small>` : '<strong class="unset">还没有选择音色</strong><small>从列表选择，或在下面粘贴音色 ID</small>'}</div>${mimo === 'design' ? '' : btn('pick-voice', '从列表选', 'chip-button')}</div>
+          ${voiced && mimo !== 'design' ? `<div class="actions" style="margin:0 0 8px">${inPool(r) ? '<small class="hint" style="margin:0">这个音色在候选池里</small>' : btn('pool-add', icon('add') + '加入候选池', 'text-button')}</div>` : ''}
           ${mimo === 'design'
             ? field('音色描述', textArea('voice', r.voice, 'rows="3" placeholder="例如：二十岁出头的女生，声音清亮，带点慵懒，说话慢悠悠的"'), '用一到四句话描述：性别年龄、音色质感、情绪语气、语速节奏。不要写混响、回声这类后期效果，也不要写“普通”“正常”这种模糊的词。')
             : field(mimo === 'clone' ? '克隆样本' : '音色 ID', input('voice', r.voice, 'text', `placeholder="${mimo === 'clone' ? '填克隆样本的名字，或从列表选择' : '粘贴音色 ID 或从列表选择'}" autocomplete="off"`))}
@@ -85,6 +96,61 @@ export function rolesApp(ctx) {
   }
 
   const render = () => current ? renderEditor() : renderList();
+  const inPool = r => (api.getState().voicePool || []).some(v => v.engine === r.engine && v.voice === r.voice);
+  /** 加入候选池: the voice with how it sounds (gender, age, style), so it is picked for the right characters. */
+  function addToPool(r) {
+    const d = ctx.dialog('加入候选池', `<p class="help-copy">标好这个音色是什么样的声音，自动挑音色时才会挑给对得上的角色。</p>
+      <div class="group pad">${field('名字', input('pool-name', voiceNames.get(r.voice) || r.name + ' 的音色', 'text', 'maxlength="60"'))}
+      ${field('性别', select('pool-gender', '', [['', '不限'], ...Object.entries(VOICE_GENDERS)]))}
+      ${field('年龄', select('pool-age', '', [['', '不限'], ...Object.entries(VOICE_AGES)]))}
+      ${field('风格', input('pool-style', '', 'text', 'maxlength="120" placeholder="例如：温柔、清亮、元气、低沉、冷淡、播音腔"'))}</div>
+      <div class="actions">${btn('pool-save', '加入', 'primary')}</div>`);
+    d.body.addEventListener('click', e => {
+      if (!e.target.closest('[data-action=pool-save]')) return;
+      const value = k => d.body.querySelector(`[data-field=${k}]`)?.value || '';
+      api.saveVoicePool([...(api.getState().voicePool || []), {engine: r.engine, voice: r.voice, model: r.model || '', name: value('pool-name'), gender: value('pool-gender'), age: value('pool-age'), style: value('pool-style')}]);
+      d.close(); ctx.notify('已加入候选池'); render();
+    });
+  }
+  function poolSheet() {
+    const draw = () => { const pool = api.getState().voicePool || []; return pool.length
+      ? `<div class="group">${pool.map((v, i) => `<div class="list-row" data-engine="${v.engine}"><span>${plate(engines[v.engine])}</span><span style="flex:1;min-width:0"><strong>${esc(v.name)}</strong><small>${esc(poolLine({...v, name: ''}) || '没有标注')}</small></span>${btn('pool-remove', icon('trash'), 'text-button', `data-index="${i}" aria-label="移出候选池"`)}</div>`).join('')}</div>`
+      : '<p class="hint">还没有音色。给角色选好音色后，在角色页点「加入候选池」，标上男女、年龄和风格。</p>'; };
+    const d = ctx.dialog('候选音色池', `<p class="help-copy">自动挑音色时先从这里挑，性别和年龄对得上才会选；都对不上才去音色库里搜。</p>
+      <div class="actions"><label class="secondary file-button">${icon('import')}导入音色池<input type="file" data-pool-file accept=".json,application/json" aria-label="选择音色池文件"></label>${btn('pool-export', icon('download') + '导出', 'secondary')}</div>
+      <p class="hint">可以导入别人分享的音色池文件（ST-iPhonie 导出的，或 FishDialogue 的音色库 JSON）。文件里没写男女和年龄的，按名字和描述猜（少女、大叔、妈妈……），猜不出就留空，可以导入后再看。</p><div data-pool>${draw()}</div>`);
+    // A pool file adds its voices (those already in the pool stay as they are).
+    d.body.addEventListener('change', e => {
+      if (!e.target.matches('[data-pool-file]')) return;
+      const file = e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      file.text().then(text => {
+        const before = api.getState().voicePool || [], read = readPoolFile(text);
+        const after = api.saveVoicePool([...before, ...read]);
+        d.body.querySelector('[data-pool]').innerHTML = draw();
+        if (!current) render();
+        const added = after.length - before.length;
+        ctx.notify(added ? `导入了 ${added} 个音色${read.length > added ? `（${read.length - added} 个已经在池子里）` : ''}` : '这些音色都已经在池子里了');
+      }).catch(error => ctx.notify(error.message, {error: true}));
+    });
+    d.body.addEventListener('click', e => {
+      if (e.target.closest('[data-action=pool-export]')) {
+        e.preventDefault();
+        const pool = api.getState().voicePool || [];
+        if (!pool.length) { ctx.notify('候选池还是空的'); return; }
+        saveFile(ctx.doc, new Blob([poolFile(pool)], {type: 'application/json'}), '候选音色池.json').then(name => ctx.notify('已下载 ' + name)).catch(error => ctx.notify(error.message, {error: true}));
+        return;
+      }
+      const b = e.target.closest('[data-action=pool-remove]');
+      if (!b) return;
+      const pool = [...(api.getState().voicePool || [])];
+      pool.splice(Number(b.dataset.index), 1);
+      api.saveVoicePool(pool);
+      d.body.querySelector('[data-pool]').innerHTML = draw();
+      if (!current) render();
+    });
+  }
 
   function edit(id) {
     const saved = api.getState().routes.find(r => r.id === id);
@@ -105,9 +171,11 @@ export function rolesApp(ctx) {
   v.back = () => { if (!current) return false; current = null; render(); return true; };
   v.refresh = () => { if (!current) render(); };
 
+  v.on('change', '[data-field=autoVoice]', el => { api.updateGeneral({autoVoice: el.checked}); ctx.notify(el.checked ? '新角色第一次说话时会自动挑音色' : '已关闭自动挑音色'); });
   v.on('input', '[data-field]', el => {
     if (!current) return;
     current[el.dataset.field] = el.value;
+    if (el.dataset.field === 'voice') current.autoVoice = false;
     changed();
     if (el.dataset.field === 'name') { const n = v.root.querySelector('[data-id-name]'); if (n) n.textContent = el.value || '新角色'; }
     if (el.dataset.field === 'voice') { const n = v.root.querySelector('[data-id-voice]'); if (n) n.textContent = el.value ? voiceLabel(el.value) : '未选择'; }
@@ -165,6 +233,18 @@ export function rolesApp(ctx) {
       }
       case 'pick-form-voice': {
         pickVoice(el.dataset.form);
+        break;
+      }
+      case 'voice-pool': poolSheet(); break;
+      case 'pool-add': addToPool(current); break;
+      case 'repick-voice': {
+        const name = current.name;
+        await v.busy(el, async () => {
+          el.textContent = '正在挑…';
+          const route = await api.autoPickVoice(name);
+          current = structuredClone(route); drafts.set(route.id, current);
+          render(); ctx.notify(`给「${name}」重新挑了：${route.autoName || route.voice}`);
+        });
         break;
       }
     }
@@ -281,6 +361,7 @@ function _originalPickVoice_unused() {
       if (!b) return;
       if (b.dataset.voice) {
         target.voice = b.dataset.voice;
+        target.autoVoice = false;
         dialog.close();
         if (current === target) { render(); changed(); }
       } else if (b.hasAttribute('data-more')) { b.disabled = true; load(true); }

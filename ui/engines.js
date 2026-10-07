@@ -274,7 +274,7 @@ export function enginesApp(ctx) {
   }
   function renderList() {
     delete v.root.dataset.engine;
-    v.draw(heading('引擎', help('卡片分三个卡包：图像（绘图用的 NovelAI、GPT 生图、ComfyUI，绘图 App 里选用哪个画）、语音（Fish Audio、MiniMax、ElevenLabs、小米 MiMo）、文字（写手机里的字的文字模型，和给聊天记忆找旧聊天的向量模型）。点一张卡片把它抽到这个卡包的最前面，再点一下打开，查看连接和全部参数。ElevenLabs 和 Fish 的卡片上显示剩余额度。\n卡片只显示密钥是否保存，不显示内容；“已保存”不代表鉴权成功。'), 'Wallet · 05')
+    v.draw(heading('引擎', help('卡片分三个卡包：图像（绘图用的 NovelAI、GPT 生图、ComfyUI，绘图 App 里选用哪个画）、语音（Fish Audio、MiniMax、ElevenLabs、小米 MiMo）、文字（写手机里的字的文字模型，和给聊天记忆找旧聊天的向量模型）。点一张卡片把它抽到这个卡包的最前面，再点一下打开，查看连接和全部参数。ElevenLabs 和 Fish 的卡片上显示剩余额度。\n卡片只显示密钥是否保存，不显示内容；“已保存”不代表鉴权成功。'), `Wallet · ${String(GROUPS.reduce((n, g) => n + g.ids.length, 0)).padStart(2, '0')}`)
       + GROUPS.map(g => {
         const [note, count] = pocketNote(g), stack = g.ids.slice().sort((a, b) => order.indexOf(a) - order.indexOf(b));
         return `<section class="card-pocket" data-pocket="${g.id}" data-engine="${stack.at(-1)}" aria-label="${g.title}卡包">
@@ -404,7 +404,8 @@ export function enginesApp(ctx) {
           <div class="combo-menu model-list" data-model-list ${models.length ? '' : 'hidden'}>${models.map(m => `<button type="button" class="combo-chip" data-action="text-pick" data-model="${esc(m)}" aria-pressed="${m === t.model}">${esc(m)}</button>`).join('')}</div>
           <p class="hint" data-text-status></p>
           ${field('温度', input('text-temperature', t.temperature, 'number', 'min="0" max="2" step="0.05"'), '越高越随性，越低越稳定。0.7–1 比较常用。')}
-          ${field('最长回复（tokens）', input('text-maxTokens', t.maxTokens, 'number', 'min="64" max="32000" step="1"'), '一次回复最多写多少。聊天和电话用不了多少，配图规划会按需要取更小的值。')}
+          ${field('思考', select('text-thinking', t.thinking || 'auto', [['auto', '按模型默认'], ['off', '关掉思考']]), '会先思考的模型（GLM、Qwen3、豆包、DeepSeek 思考版……）写手机里的字时可以关掉思考：快很多，也省钱，长度不会被思考用光。插件会发 enable_thinking: false 和 thinking: disabled，大多数接口认其中一个；接口报错不认识这些参数时改回「按模型默认」。')}
+          ${field('最长回复（tokens）', input('text-maxTokens', t.maxTokens, 'number', 'min="64" max="32000" step="1"'), '一次回复最多写多少，聊天、电话、朋友圈用这个。帮我写、从剧情生成和配图规划按各自需要的长度来（够写到 NovelAI 的上限，也给会先思考的模型留出余量）。')}
         </div>` : '')
       + `<div class="savebar"><span class="save-state" data-save-state>${dirty ? '未保存' : '已保存'}</span>${btn('save-text', '保存', 'primary')}</div>`);
   }
@@ -439,7 +440,7 @@ export function enginesApp(ctx) {
     }
     if (engine === 'llm') {
       const key = el.dataset.field.replace(/^text-/, '');
-      if (!['name', 'url', 'model', 'temperature', 'maxTokens'].includes(key)) return;
+      if (!['name', 'url', 'model', 'temperature', 'maxTokens', 'thinking'].includes(key)) return;
       textPreset()[key] = ['temperature', 'maxTokens'].includes(key) ? Number(el.value) : el.value.trim();
       changed();
       return;
@@ -507,7 +508,7 @@ export function enginesApp(ctx) {
       case 'text-preset': if (textDraft.active !== el.dataset.id) { textDraft.active = el.dataset.id; models = []; changed(); dirty = true; render(); } break;
       case 'text-new': {
         const id = crypto.randomUUID(), now = textPreset();
-        textDraft.presets.push({id, name: '接口 ' + (textDraft.presets.length + 1), url: '', model: '', temperature: now.temperature, maxTokens: now.maxTokens});
+        textDraft.presets.push({id, name: '接口 ' + (textDraft.presets.length + 1), url: '', model: '', temperature: now.temperature, maxTokens: now.maxTokens, thinking: now.thinking || 'auto'});
         textDraft.active = id; models = []; changed(); dirty = true; render();
         v.root.querySelector('[data-field=text-name]')?.focus();
         break;

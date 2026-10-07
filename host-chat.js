@@ -2,8 +2,10 @@
 // (generateRaw): the prompt carries the chat preset, each contact's persona or character card, the user's persona,
 // recent story messages and the chat history. Nothing is written into the story unless the user brings a chat
 // into it; that text is injected once, into the next story reply.
-import {buildChatRequest, parseChatReply, bringText, plainStory, activeChatPreset, messageLine, cleanTagged} from './core/chat.js';
+import {buildChatRequest, parseChatReply, bringText, plainStory, activeChatPreset, messageLine, cleanTagged, chatContacts} from './core/chat.js';
 import {worldInfoFor, loreOptions} from './host-lore.js';
+import {pictureInputs} from './core/draw.js';
+import {storyLines} from './core/moments.js';
 
 export function createChatHost({context, settings, backend, notice, memory = null, onCall = () => {}}) {
   const busy = new Map();
@@ -19,20 +21,13 @@ export function createChatHost({context, settings, backend, notice, memory = nul
     return [c.description, c.personality && '性格：' + c.personality].filter(Boolean).join('\n')
       .replaceAll('{{char}}', name).replaceAll('{{user}}', userName()).slice(0, 2000);
   }
-  function story(limit) {
-    const chat = context()?.chat || [], out = [];
-    for (let i = chat.length - 1; i >= 0 && out.length < limit; i--) {
-      const m = chat[i];
-      if (!m || m.is_system) continue;
-      const text = plainStory(m.mes);
-      if (text) out.unshift({name: m.name || (m.is_user ? userName() : '旁白'), text: text.slice(0, 600)});
-    }
-    return out;
-  }
+  // The same recent story as the other apps (core/moments.js storyLines).
+  const story = limit => storyLines(context()?.chat || [], limit, userName());
   function members(thread) {
-    const s = settings(), contacts = backend.contacts();
+    // This card's contact first; a member the card's story has not met is still who they are (voice and all).
+    const s = settings(), contacts = backend.contacts(), all = chatContacts(s);
     return thread.members.map(name => {
-      const c = contacts.find(x => x.name === name);
+      const c = contacts.find(x => x.name === name) || all.find(x => x.name === name);
       return {name, persona: c?.persona || '', card: c?.persona ? '' : card(name), voice: !!c?.voice, language: c?.language || s.general.defaultLanguage};
     });
   }
@@ -55,12 +50,15 @@ export function createChatHost({context, settings, backend, notice, memory = nul
       // 记忆: the written-up older chat, and older messages that match the latest ones.
       const query = thread.messages.filter(m => m.kind !== 'system').slice(-6).map(m => messageLine(m, user)).join('\n');
       const remembered = memory ? (await memory.contextFor(thread, {query}).catch(() => ({text: ''}))).text : '';
-      const prompt = buildChatRequest({preset, thread, members: people, story: recent, user, userPersona: userPersona(), voiceFormat, lore, memory: remembered, earlier: memory?.storyMemory() || ''});
+      const prompt = buildChatRequest({preset, thread, members: people, story: recent, user, userPersona: userPersona(), voiceFormat, lore, memory: remembered, earlier: memory?.storyMemory() || '', images: !!backend.drawReady?.(), stickers: settings().chat.stickers || []});
       const text = cleanTagged(await backend.generateText(ctx, {prompt, trimNames: false}), preset.cleanTags);
-      const items = parseChatReply(text, {members: people, user, voiceFormat, voiceNames: people.filter(p => p.voice).map(p => p.name)});
+      const items = parseChatReply(text, {members: people, user, voiceFormat, voiceNames: people.filter(p => p.voice).map(p => p.name), stickers: settings().chat.stickers || []});
       if (!items.length) throw Error('这次没有收到消息，可以再试一次');
+      const before = new Set((await backend.chats.get(threadId))?.messages.map(m => m.id) || []);
       const saved = await backend.chatMutate(threadId, () => settle(threadId, items));
       memory?.after(threadId);
+      // The new photos with tags are drawn when the free tier covers them; the others wait for 画出来.
+      for (const m of saved?.messages || []) if (!before.has(m.id) && m.kind === 'photo' && m.imageTags && !m.photoId) drawPhoto(threadId, m.id).catch(() => {});
       return saved;
     })().finally(() => { busy.delete(threadId); backend.emit('chat', {threadId, typing: false}); });
     busy.set(threadId, job);
@@ -129,8 +127,28 @@ export function createChatHost({context, settings, backend, notice, memory = nul
     return [entry];
   }
 
+  /** Draws a contact's photo (its tags). Without allowPaid, only when the free tier covers it. */
+  async function drawPhoto(threadId, messageId, {allowPaid = false} = {}) {
+    const m = (await backend.chats.get(threadId))?.messages.find(x => x.id === messageId);
+    if (!m?.imageTags) throw Error('这张照片没有画图用的描述');
+    const set = patch => backend.chatMutate(threadId, () => backend.chats.updateMessage(threadId, messageId, patch));
+    if (!backend.drawReady()) { await set({imageState: 'failed', imageNote: backend.drawMissing()}); return null; }
+    try {
+      // The sender's saved look only when the photo shows a person (a selfie), not a view or a meal.
+      const person = /(\d+(?:girl|boy|other)s?|solo|selfie|portrait|upper body|cowboy shot)/i.test(m.imageTags);
+      const input = pictureInputs(settings(), {prompt: m.imageTags, characters: person ? [m.from] : []}, '');
+      await set({imageState: 'waiting', imageNote: ''});
+      const result = await backend.generateImage({...input, allowPaid, name: `聊天-${m.from}`, key: `chat-photo:${messageId}`, label: `聊天 · ${m.from}`});
+      await set({photoId: result.photoId, imageState: 'done', imageNote: ''});
+      return result.photoId;
+    } catch (error) {
+      await set({imageState: 'failed', imageNote: error.code === 'PAID' ? backend.paidPrompt().note : error.message}).catch(() => {});
+      throw error;
+    }
+  }
+
   return {
-    reply, bring, bringPlan,
+    reply, bring, bringPlan, drawPhoto,
     typing: threadId => busy.has(threadId),
     pendingBring: () => pending && {threadId: pending.threadId, name: pending.name, count: pending.count},
     cancelBring: () => { const threadId = pending?.threadId; pending = null; if (threadId) backend.emit('chat', {threadId, bring: false}); }

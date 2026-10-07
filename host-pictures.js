@@ -10,7 +10,8 @@
 // Redrawing adds a version (the old ones stay for comparison); deleting removes the shown version and its file.
 // When the last version is deleted the record becomes {removed: true, versions: []}, so it is not drawn again
 // automatically. Older records ({url, seed, …}) read as a single version.
-import {parsePictures, pictureInputs, planRequest, insertPlanned, withoutPictures, sameExact, suggestRequest, writeRequest, promptLength, cleanSuggestion} from './core/draw.js';
+import {parsePictures, pictureInputs, planRequest, insertPlanned, withoutPictures, sameExact, suggestRequest, writeRequest, promptLength, readSuggestion, budgetNumbers, fillUpRequest, sameName, sentenceCount} from './core/draw.js';
+import {tokenBudget, loadCounter, countField, tagCost, estimateTokens} from './core/tokens.js';
 import {openImageViewer} from './image-viewer.js';
 import {downloadAction} from './download.js';
 import {plainStory} from './core/chat.js';
@@ -384,18 +385,50 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     // preset, or the custom API. The tavern's quiet generation would carry the whole story preset, and with it a
     // chain of thought or XML template the model then writes out.
     const ctx = context(), chat = ctx.chat || [];
-    const reply = await backend.generateText(ctx, {prompt: suggestRequest(settings(), {before: before(chat.length, 6)}), trimNames: false, responseLength: promptLength(settings())});
-    const line = cleanSuggestion(reply);
-    if (!line) throw Error('模型没有写出提示词，再试一次');
-    return line;
+    const prompt = suggestRequest(settings(), {before: before(chat.length, 6)});
+    const reply = await backend.generateText(ctx, {prompt, trimNames: false, responseLength: promptLength(settings())});
+    const result = readSuggestion(settings(), reply);
+    if (!result.prompt) throw Error('模型没有写出提示词，再试一次');
+    return withCount(result);
+  }
+  /**
+   * A line written up to the NovelAI budget. Models cannot count tokens and often stop at half: the line is counted
+   * with NovelAI's own tokenizer and, while it holds less than three quarters of the room, the model is asked (twice at
+   * most) to add detail. A longer answer that would go over the limit is not taken. {prompt, people, tokens, budget}.
+   */
+  /** The line with how many NovelAI tokens it holds, and the room it had ({tokens, budget}; none without NovelAI). */
+  async function withCount(result, cast = []) { return fillUp(null, result, cast); }
+  async function fillUp(prompt, first, cast = []) {
+    const s = settings(), b = s.draw?.engine === 'nai' ? tokenBudget(s.draw.params?.model) : null;
+    if (!b) return first;
+    let count = estimateTokens;
+    try { count = await loadCounter(b.kind); } catch { /* no tokenizer: estimated */ }
+    const n = budgetNumbers(s);
+    if (!n) return first;
+    // The looks of the people already in 角色 come out of the same room.
+    const looks = s.routes.filter(r => r.appearance?.trim() && cast.some(c => sameName(c, r.name))).reduce((sum, r) => sum + countField(count, r.appearance), 0);
+    const left = Math.max(0, n.left - looks);
+    let result = first, used = countField(count, first.prompt), messages = prompt;
+    for (let round = 0; prompt && round < 2 && used < left * 0.75; round++) {
+      messages = fillUpRequest(messages, {line: result.prompt, people: result.people, used, left, tags: Math.floor((left - used) / tagCost(count)), sentences: sentenceCount(s)});
+      let more;
+      try { more = readSuggestion(s, await backend.generateText(context(), {prompt: messages, trimNames: false, responseLength: promptLength(s)})); } catch { break; }
+      const now = countField(count, more.prompt);
+      if (!more.prompt || now <= used || now > left) break;
+      result = {prompt: more.prompt, people: [...new Set([...result.people, ...more.people])]};
+      used = now;
+    }
+    return {...result, tokens: used, budget: left};
   }
   /** 帮我写: a prompt line for what the user describes (a few words, Chinese is fine). */
   async function writePrompt(idea, cast = []) {
     if (!String(idea || '').trim()) throw Error('先说说想画什么');
-    const reply = await backend.generateText(context(), {prompt: writeRequest(settings(), {idea, cast: (Array.isArray(cast) ? cast : []).map(String).slice(0, 8)}), trimNames: false, responseLength: promptLength(settings())});
-    const line = cleanSuggestion(reply);
-    if (!line) throw Error('模型没有写出提示词，再试一次');
-    return line;
+    const names = (Array.isArray(cast) ? cast : []).map(String).slice(0, 8), prompt = writeRequest(settings(), {idea, cast: names});
+    const reply = await backend.generateText(context(), {prompt, trimNames: false, responseLength: promptLength(settings())});
+    const result = readSuggestion(settings(), reply);
+    if (!result.prompt) throw Error('模型没有写出提示词，再试一次');
+    // Filled up to the limit only when the idea asks for it; otherwise a precise line of whatever length it takes.
+    return /写满|填满|上限|尽量(多|长|详细)|越(多|长)越好|\d{3,4}\s*token/i.test(String(idea)) ? fillUp(prompt, result, names) : withCount(result, names);
   }
   const subscriptionLabel = sub => sub ? `${TIER_NAMES[sub.tier] || '未知档位'} · Anlas ${sub.anlas}` : '';
 

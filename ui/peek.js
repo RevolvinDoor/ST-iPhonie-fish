@@ -76,8 +76,8 @@ export function peekApp(ctx) {
       view: img => openImageViewer({doc: ctx.doc, src: img.src, alt: img.alt, from: img}),
       close: () => { device = null; if (!v.disposed) render().catch(() => {}); }});
   }
-  function look() {
-    const job = api.peekLook(who), name = who;
+  function look(keep = false) {
+    const job = api.peekLook(who, keep), name = who;
     pickUp = true;
     render();
     job.then(() => ctx.notify(`拿到了 ${name} 的手机`)).catch(error => { pickUp = false; ctx.notify(error.message, {error: true}); }).finally(() => render());
@@ -100,8 +100,17 @@ export function peekApp(ctx) {
       }
       case 'peek-pick': { const s = await api.getPeek(who); if (s) pick(s); break; }
       case 'peek-look': {
-        if (await api.getPeek(who) && !await ctx.confirm('再看一次？', `会重新编一份 ${who} 手机里的内容，现在看到的会被换掉。会调用一次模型。`)) break;
-        look(); break;
+        if (!await api.getPeek(who)) { look(); break; }
+        const d = ctx.dialog('再看一次', `<p class="hint">都会调用一次模型。</p><div class="pick-list">
+          <button class="list-row" data-look="keep">${icon('add')}<span><strong>接着上次看</strong><small>上次看到的都留着，只加上这段时间新多出来的聊天、搜索、照片，购物车换成现在的样子</small></span></button>
+          <button class="list-row" data-look="new">${icon('refresh')}<span><strong>重新编一份</strong><small>现在看到的会被换掉</small></span></button></div>`);
+        d.body.addEventListener('click', e => {
+          const b = e.target.closest('[data-look]');
+          if (!b) return;
+          d.close();
+          look(b.dataset.look === 'keep');
+        });
+        break;
       }
       case 'peek-forget': if (await ctx.confirm('忘掉看到的？', `${who} 手机里的这些内容会删掉。`)) { await api.deletePeek(who); await render(); } break;
     }

@@ -115,13 +115,21 @@ export function parseMoments(reply, {names, user = '我', mode = 'posts'}) {
 }
 
 /** Recent story messages as plain lines, for the prompt. */
-export function storyLines(chat, limit, user) {
+// Recent story for the phone's requests: a reply is kept whole up to `each` characters (it used to be cut at 600, so a
+// long reply stopped mid-sentence), and the newest come first until `total` is used up.
+export const STORY_LIMITS = Object.freeze({each: 4000, total: 20000});
+export function storyLines(chat, limit, user, {each = STORY_LIMITS.each, total = STORY_LIMITS.total} = {}) {
   const out = [];
+  let used = 0;
   for (let i = (chat?.length || 0) - 1; i >= 0 && out.length < limit; i--) {
     const m = chat[i];
     if (!m || m.is_system) continue;
-    const said = plainStory(m.mes);
-    if (said) out.unshift({name: m.name || (m.is_user ? user : '旁白'), text: said.slice(0, 600)});
+    let said = plainStory(m.mes);
+    if (!said) continue;
+    if (said.length > each) said = said.slice(0, each) + '……';
+    if (out.length && used + said.length > total) break;
+    used += said.length;
+    out.unshift({name: m.name || (m.is_user ? user : '旁白'), text: said});
   }
   return out;
 }

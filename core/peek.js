@@ -27,7 +27,7 @@ const unsaid = text => String(text).replace(/（[^（）]*）|\([^()]*\)/g, ' ')
  * story and the settings are written for the reader, who sees everything; the phone may only hold what its owner knows,
  * so the model first lists that and writes the rest from it.
  */
-export function buildPeekRequest({preset, person, story = [], user = '我', userPersona = '', history = [], lore = '', images = false, memory = '', earlier = ''}) {
+export function buildPeekRequest({preset, person, story = [], user = '我', userPersona = '', history = [], lore = '', images = false, memory = '', earlier = '', before = null}) {
   const name = person.name;
   const rules = preset.entries.filter(e => e.enabled && e.text.trim() && (e.use || []).includes('peek')).map(e => fill(e.text, {'用户': user, '对象': name}));
   const said = story.map(s => ({...s, text: s.name === user ? unsaid(s.text) : s.text})).filter(s => s.text);
@@ -40,6 +40,7 @@ export function buildPeekRequest({preset, person, story = [], user = '我', user
     earlier.trim() ? `【更早的剧情】（记忆插件整理的长期剧情，也是旁观的记录：${name}只经历了其中一部分）\n${earlier.trim()}` : '',
     said.length ? `【最近的剧情】（旁观的记录：读者看得到全部，${name}只经历了其中一部分）\n${said.map(s => `${s.name}：${s.text}`).join('\n')}` : '',
     memory.trim() ? `${memory.trim()}\n（这是${name}和${user}自己聊过的事，${name}都知道）` : '',
+    before ? `【上次看到的手机】（${name}的手机里本来就有这些，现在都还在；这次不用再写）\n${peekSummary(before)}` : '',
     history.length ? `【${name}和${user}在手机上的聊天】（这是真的，${name}的手机里也有；不用再写这一段）\n${history.map(m => messageLine(m, user)).filter(Boolean).join('\n')}` : '',
     ['【' + name + '知道什么】',
       `手机是${name}自己的，里面只能有${name}知道的事：`,
@@ -57,7 +58,41 @@ export function buildPeekRequest({preset, person, story = [], user = '我', user
       `「【购物车】商品｜价格｜备注」购物车里的东西，2 到 6 件，价格只写数字（元），备注是${name}为什么想买或者买给谁，可以空着；`,
       `${drawn('【壁纸】画面')}${name}的手机壁纸，1 张，竖着的画面。`].join('\n')
   ].filter(Boolean).join('\n\n');
-  return [{role: 'system', content: system}, {role: 'user', content: `${user}拿到了${name}的手机。写出${name}手机里现在有的东西。`}];
+  const ask = before
+    ? `${user}又拿到了${name}的手机。上次看过以后过了一段时间，只写从那以后新多出来的东西：【聊天】1 到 3 段，可以接着上次的对象（用同一个名字，只写新消息），也可以是新的人；【搜索】2 到 6 条新的；【备忘录】新写的或改过的（改过的用原来的标题，写改完的全文），没有就不写；【相册】新拍的 1 到 3 张；【购物车】写现在购物车里的全部东西（已经买了的不写，新想买的写上）；壁纸没换就不写【壁纸】。【知道】照常先写。`
+    : `${user}拿到了${name}的手机。写出${name}手机里现在有的东西。`;
+  return [{role: 'system', content: system}, {role: 'user', content: ask}];
+}
+/** The phone as last seen, short, for 接着上次看. */
+export function peekSummary(p) {
+  const out = [];
+  for (const c of p.chats || []) out.push(`【聊天】${c.with}（最近几句）\n${c.lines.slice(-6).map(l => `${l.from}：${l.text}`).join('\n')}`);
+  if (p.searches?.length) out.push(`【搜索】${p.searches.join('；')}`);
+  for (const n of p.notes || []) out.push(`【备忘录】${n.title}｜${n.text.slice(0, 120)}`);
+  if (p.photos?.length) out.push(`【相册】${p.photos.map(x => x.text).join('；')}`);
+  if (p.cart?.length) out.push(`【购物车】${p.cart.map(x => x.name).join('；')}`);
+  if (p.wallpaper?.text) out.push(`【壁纸】${p.wallpaper.text}`);
+  return out.join('\n');
+}
+/**
+ * 接着上次看: what is new put onto the phone as last seen. A chat with the same person goes on (its newest lines kept);
+ * new searches, notes and photos come first (a note of the same title is the changed one); the cart is as it is now;
+ * the wallpaper stays unless it changed. Drawn photos keep their pictures.
+ */
+export function mergePeek(old, found) {
+  if (!old) return found;
+  const chats = (old.chats || []).map(c => ({...c, lines: [...c.lines]}));
+  for (const c of [...(found.chats || [])].reverse()) {
+    const at = chats.findIndex(x => x.with === c.with);
+    const lines = at >= 0 ? [...chats[at].lines, ...c.lines].slice(-PEEK_LIMITS.lines) : c.lines;
+    if (at >= 0) chats.splice(at, 1);
+    chats.unshift({with: c.with, lines});
+  }
+  const searches = [...new Set([...(found.searches || []), ...(old.searches || [])])].slice(0, PEEK_LIMITS.searches);
+  const notes = [...(found.notes || []), ...(old.notes || []).filter(n => !(found.notes || []).some(x => x.title && x.title === n.title))].slice(0, PEEK_LIMITS.notes);
+  const photos = [...(found.photos || []), ...(old.photos || [])].slice(0, PEEK_LIMITS.photos);
+  return {...found, chats: chats.slice(0, PEEK_LIMITS.chats), searches, notes, photos,
+    cart: found.cart?.length ? found.cart : old.cart || [], wallpaper: found.wallpaper || old.wallpaper || null};
 }
 
 const LINE = /^\s*(?:[-*•]\s*)?[【\[]\s*(聊天|搜索|搜索记录|备忘录|备忘|相册|照片|购物车|购物|壁纸|知道)\s*[】\]]\s*(.*)$/;

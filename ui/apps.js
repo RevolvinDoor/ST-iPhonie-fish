@@ -13,7 +13,8 @@ export const APPS = {
   draw: {name: '绘图', eyebrow: 'NovelAI', colors: ['#c3c3ff', '#6d6ff0', '#ffd46a']},
   chat: {name: '聊天', eyebrow: 'Messages', colors: ['#8fd8ff', '#3d8ff0', '#ff9dbb']},
   forum: {name: '论坛', eyebrow: 'Forum', colors: ['#b8f0d0', '#38b07a', '#ffd36a']},
-  peek: {name: '查手机', eyebrow: 'Peek', colors: ['#ffc6e0', '#c85a9a', '#9fe0ff']}
+  peek: {name: '查手机', eyebrow: 'Peek', colors: ['#ffc6e0', '#c85a9a', '#9fe0ff']},
+  sounds: {name: '音效', eyebrow: 'Ambience', colors: ['#a8e6e0', '#2f9e95', '#ffe08a']}
 };
 
 export const SLOT = null;
@@ -23,7 +24,7 @@ export const SLOT = null;
 export const HOME = {
   pages: [
     ['roles', 'engines', 'presets', 'library', 'gallery', 'notes', 'forum', 'peek'],
-    [SLOT, SLOT, SLOT, SLOT, SLOT, SLOT, SLOT, SLOT]
+    ['sounds', SLOT, SLOT, SLOT, SLOT, SLOT, SLOT, SLOT]
   ],
   dock: ['chat', 'draw', 'listen', 'settings']
 };

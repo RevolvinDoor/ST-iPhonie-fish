@@ -8,7 +8,9 @@ import { normalizeCalls, buildCallRequest } from './call.js';
 import { normalizeText, activeText, customRequest, listModels, streamText, asMessages, TEXT_PRESET_ID } from './llm.js';
 import { normalizeEmbed, embedReady, embedTexts } from './embed.js';
 import { bookId, emptyBook, cleanBook, removeNode } from './memory.js';
-import { normalizeSync, runSync, SYNC_PARTS } from './sync.js';
+import { normalizeSync, runSync, removeSync, SYNC_PARTS } from './sync.js';
+import { normalizePool } from './auto-voice.js';
+import { normalizeSounds, soundRow, readPack, missingKey, soundName, packRows, PACK_FORMAT, SOUND_LIMITS, SOUND_KINDS } from './sounds.js';
 import { decodeMono, encodeWav } from './audio-join.js';
 import { BACKUP_PARTS, PART_STORES, writeBackup, readBackup, sealKeys, openKeys } from './backup.js';
 import { WALLET_LIMITS, PREMIUM, DECOR_KINDS, SHOP_GIFTS, LEDGER_KINDS, premiumOf, decorKey, cents, yuan, shopGifts, normalizeGift, validateGift } from './wallet.js';
@@ -26,7 +28,7 @@ import { DialoguePlayer } from './player.js';
 import { LocalLibrary, PHONE_APPS, PHONE_WALLPAPERS, PHONE_GLYPHS, PHONE_SKINS } from './library.js';
 import { NovelAIClient, relayUrl, FISH_PATHS, NAI_MODELS, NAI_MODEL_NAMES, NAI_SAMPLERS, NAI_SCHEDULES, buildImageRequest, guardParams, isFree, isV5, normalizeDrawParams } from './novelai.js';
 import { PIC_TAG_FORMAT, DEFAULT_DRAW_RULE, DRAW_COUNT_MAX, PRESET_REV as DRAW_PRESET_REV, drawPromptPlan, planRequest, validateDrawPreset, normalizeDraw, defaultDraw, normalizeVibeSettings, applyImageConnection } from './draw.js';
-import { defaultChat, normalizeChatPreset, normalizeContact, validateChatPreset, validateContact, chatContacts, inSpace, activeSpace, buildChatRequest, activeChatPreset, normalizeVoiceText, normalizeProfile , normalizeAvatars } from './chat.js';
+import { normalizeStickers, defaultChat, normalizeChatPreset, normalizeContact, validateChatPreset, validateContact, chatContacts, inSpace, activeSpace, buildChatRequest, activeChatPreset, normalizeVoiceText, normalizeProfile , normalizeAvatars } from './chat.js';
 import { ChatStore, money } from './chats.js';
 import { DrawQueue } from './draw-queue.js';
 import { CloudQueue, KeyHashQueue, newRoomCode, validRoom, sha256Hex } from './cloud-queue.js';
@@ -45,6 +47,24 @@ async function vibeThumbnail(base64) {
         return canvas.toDataURL('image/jpeg', 0.82);
     } catch { return ''; }
 }
+/**
+ * A vibe's picture kept small: the long side at most 1024px, as JPEG. The picture is only sent again to encode it for
+ * another model or 提取信息量 (encodings already made are kept as they are), and a full-size PNG kept as base64 took
+ * 1–2 MB a vibe. Returns the base64 unchanged when it is small already, when this one is not smaller, or without a canvas.
+ */
+async function smallVibeImage(base64) {
+    try {
+        if (!base64 || base64.length < 300 * 1024 || typeof createImageBitmap !== 'function' || !globalThis.document?.createElement) return base64;
+        const bitmap = await createImageBitmap(new Blob([Uint8Array.from(atob(base64), c => c.charCodeAt(0))]));
+        const scale = Math.min(1, 1024 / Math.max(bitmap.width, bitmap.height)), canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(bitmap.width * scale)); canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+        const g = canvas.getContext('2d');
+        g.fillStyle = '#fff'; g.fillRect(0, 0, canvas.width, canvas.height);
+        g.drawImage(bitmap, 0, 0, canvas.width, canvas.height); bitmap.close?.();
+        const small = canvas.toDataURL('image/jpeg', 0.92).replace(/^data:[^,]*,/, '');
+        return small && small.length < base64.length * 0.8 ? small : base64;
+    } catch { return base64; }
+}
 const clone = value => structuredClone(value);
 const engineCheck = engine => { if (!ENGINES.includes(engine)) throw Error('引擎无效'); };
 // Keys cover the voice engines, NovelAI for drawing, and llm (the phone's own text model).
@@ -56,10 +76,19 @@ const message = error => error instanceof TypeError ? '设置格式无效，请�
 // Audio files are named after who said what: 诺亚 - 午安，格林小姐.
 const audioName = (role, said) => [String(role || '').trim(), String(said || '').replace(/\s+/g, ' ').trim().slice(0, 30)].filter(Boolean).join(' - ') || 'ST-iPhonie 语音';
 
+// Where the phone drew an album photo, by the name it gave it: the drawing app (named after the engine), in-text
+// pictures, 查手机 and 朋友圈. Each name ends in the seed (or the time) and the file type.
+const DRAWN_SOURCES = [
+    ['draw', '绘图 App', /^(?:NovelAI|GPT ?生图|ComfyUI)-\d+\.(?:png|jpe?g|webp)$/],
+    ['chat', '正文图片', /^chat-\d+\.(?:png|jpe?g|webp)$/],
+    ['peek', '查手机', /^查手机-.+-\d+\.(?:png|jpe?g|webp)$/],
+    ['moments', '朋友圈', /^朋友圈-.+-\d+\.(?:png|jpe?g|webp)$/],
+    ['chatapp', '聊天图片', /^聊天-.+-\d+\.(?:png|jpe?g|webp)$/],
+];
 export class TTSBackend {
     constructor({ settings, persist = () => {}, notify = () => {}, change = () => {}, unknown = () => {},
         providers = new Providers(), cache, library, keyStore, sink, novelai, chats, indexedDB = globalThis.indexedDB, syncStorage = () => globalThis.localStorage,
-        imageFetch = (...args) => globalThis.fetch(...args), tavernHeaders = () => globalThis.SillyTavern?.getContext?.()?.getRequestHeaders?.() || {} } = {}) {
+        imageFetch = (...args) => globalThis.fetch(...args), soundPack = '', tavernHeaders = () => globalThis.SillyTavern?.getContext?.()?.getRequestHeaders?.() || {} } = {}) {
         this.settings = normalizeSettings(settings);
         validateSettings(this.settings);
         this.persist = persist;
@@ -85,6 +114,11 @@ export class TTSBackend {
         this.apps = new AppStore(this.settings.scope, { indexedDB });
         // 记忆 (core/memory.js): one book per chat, and the vectors of its older messages. A database of its own: big.
         this.memoryStore = new AppStore(this.settings.scope, { indexedDB, database: 'st-iphonie-memory-v1' });
+        // 音效 (core/sounds.js): the sound library and the names the story asked for that it has none of. Its own database: big.
+        this.sounds = new AppStore(this.settings.scope, { indexedDB, database: 'st-iphonie-sounds-v1' });
+        // 自带音效包: the folder of the plugin's sounds (sounds/pack.json lists them); '' when there is none (tests).
+        this.soundPack = soundPack;
+        this.packLoad = null;
         // 向量模型's key (core/embed.js).
         this.embedKey = '';
         // 分区: the tavern's open character card (or group), told by the tavern page (index.js).
@@ -244,7 +278,7 @@ export class TTSBackend {
     updateGeneral(patch) {
         if (!patch || typeof patch !== 'object') throw Error('设置格式无效');
         const next = this.getState();
-        for (const key of ['voiceEnabled', 'cacheEnabled', 'floatingEnabled', 'waveformEnabled', 'wallpaperMotion', 'stripVoice']) if (key in patch) {
+        for (const key of ['voiceEnabled', 'cacheEnabled', 'floatingEnabled', 'waveformEnabled', 'wallpaperMotion', 'stripVoice', 'voiceExample', 'autoVoice']) if (key in patch) {
             if (typeof patch[key] !== 'boolean') throw Error('开关设置无效'); next.general[key] = patch[key];
         }
         if ('defaultLanguage' in patch) {
@@ -262,6 +296,12 @@ export class TTSBackend {
         next.selected = id;
         this.save(next);
         return clone(this.settings.routes.find(row => row.id === id));
+    }
+    /** 候选音色池: the voices 自动挑音色 picks from first. */
+    saveVoicePool(list) {
+        const next = this.getState();
+        next.voicePool = normalizePool(list);
+        return clone(this.save(next).voicePool);
     }
     deleteRoute(id) {
         const route = this.settings.routes.find(row => row.id === id);
@@ -526,6 +566,18 @@ export class TTSBackend {
         this.syncState.pending = true;
         this.syncTimer = setTimeout(() => { this.syncNow().catch(() => {}); }, delay);
     }
+    /** Deletes the phone's copy in the tavern (this device keeps everything); the next sync starts from scratch. */
+    async clearSyncFiles() {
+        this.assertOpen();
+        if (!this.syncFiles) throw Error('在酒馆里打开小手机时才能删除酒馆里的那份');
+        if (this.syncState.running) await this.syncState.running.catch(() => {});
+        clearTimeout(this.syncTimer);
+        const removed = await removeSync(this.syncFiles);
+        this.#syncMemory({});
+        this.syncState = { ...this.syncState, pending: false, error: '', lastAt: 0, remote: null, lastResult: null };
+        this.emit('sync', this.syncStatus());
+        return removed;
+    }
     /** One sync with the tavern: takes what changed there, writes what changed here. */
     async syncNow({ deviceName = '' } = {}) {
         this.assertOpen();
@@ -575,7 +627,7 @@ export class TTSBackend {
         const p = patch && typeof patch === 'object' ? patch : {};
         const text = normalizeText({ ...this.settings.text, ...Object.fromEntries(['source', 'active', 'presets'].filter(key => key in p).map(key => [key, clone(p[key])])) });
         const active = text.presets.find(x => x.id === text.active);
-        for (const key of ['name', 'url', 'model', 'temperature', 'maxTokens']) if (key in p) active[key] = p[key];
+        for (const key of ['name', 'url', 'model', 'temperature', 'maxTokens', 'thinking']) if (key in p) active[key] = p[key];
         return normalizeText(text);
     }
     saveText(patch) {
@@ -932,8 +984,13 @@ export class TTSBackend {
         if (!row) throw Error('这个 Vibe 已经不在了');
         try { return JSON.parse(await row.blob.text()); } catch { throw Error('这个 Vibe 的数据坏了，请删掉重新导入'); }
     }
+    /** Swappable in tests (no canvas there). */
+    shrinkVibeImage(base64) { return smallVibeImage(base64); }
     async storeVibe(doc) {
         if (!doc.thumbnail && doc.image) { const thumb = await vibeThumbnail(doc.image); if (thumb) doc = { ...doc, thumbnail: thumb }; }
+        // The picture is kept small; the vibe keeps its id (taken from the picture it was made from), so groups and
+        // a later import of the same picture still find it.
+        if (doc.image) { const small = await this.shrinkVibeImage(doc.image); if (small !== doc.image) doc = { ...doc, image: small }; }
         const summary = vibeSummary(doc);
         await this.library.saveVibe({ id: doc.id, name: doc.name, meta: summary, blob: new Blob([JSON.stringify(doc)], { type: 'application/json' }) });
         this.vibes.set(doc.id, summary);
@@ -982,6 +1039,23 @@ export class TTSBackend {
         }
         this.emit('draw', { vibes: true });
         return result;
+    }
+    /** Makes the pictures of the vibes saved before small (see smallVibeImage): {count, before, after} in bytes. */
+    async compactVibes() {
+        this.assertOpen();
+        const rows = await this.library.listVibes();
+        let count = 0;
+        for (const row of rows) {
+            const doc = await this.vibeDoc(row.id);
+            if (!doc.image) continue;
+            const small = await this.shrinkVibeImage(doc.image);
+            if (small === doc.image) continue;
+            await this.storeVibe({ ...doc, image: small });
+            count++;
+        }
+        const total = list => list.reduce((n, row) => n + (row.size || 0), 0);
+        this.emit('draw', { vibes: true });
+        return { count, before: total(rows), after: total(await this.library.listVibes()) };
     }
     /** Renames a vibe or sets its own strength (used when it is used alone, and as the default when added to a group). */
     async updateVibe(id, patch = {}) {
@@ -1189,15 +1263,26 @@ export class TTSBackend {
             next.chat.profile = normalizeProfile({ ...next.chat.profile, ...patch.profile });
         }
         if (Array.isArray(patch?.starred)) next.chat.starred = patch.starred;
+        if (patch?.pace !== undefined) next.chat.pace = patch.pace !== false;
+        if (Array.isArray(patch?.stickers)) next.chat.stickers = normalizeStickers(patch.stickers);
         if (patch?.partition !== undefined) { if (!['none', 'card'].includes(patch.partition)) throw Error('分区方式无效'); next.chat.partition = patch.partition; }
         // avatars: {name: choice | null}; null goes back to the tavern's avatar (or the first letter).
         if (patch?.avatars && typeof patch.avatars === 'object') { const merged = { ...next.chat.avatars }; for (const [name, a] of Object.entries(patch.avatars)) { if (a) merged[name] = a; else delete merged[name]; } next.chat.avatars = normalizeAvatars(merged); }
         return this.save(next).chat;
     }
     deleteContact(id) {
-        const next = this.getState();
+        const next = this.getState(), gone = next.chat.contacts.find(c => c.id === id);
         next.chat.contacts = next.chat.contacts.filter(c => c.id !== id);
+        // Its avatar goes with it, unless a role of the same name still uses it.
+        if (gone && !next.routes.some(r => r.name === gone.name) && next.chat.avatars?.[gone.name]) { const avatars = { ...next.chat.avatars }; delete avatars[gone.name]; next.chat.avatars = avatars; }
         return this.save(next).chat;
+    }
+    /** A role from the 角色 App joins this card's contacts (the card's story has not met them yet). */
+    addRoleContact(name) {
+        const route = this.settings.routes.find(r => r.name === name);
+        if (!route) throw Error('角色 App 里没有这个角色');
+        if (this.spaceKey()) this.tagRoles([name], this.spaceKey());
+        return clone(this.contacts());
     }
     previewChatPrompt(preset) {
         const p = validateChatPreset(normalizeChatPreset(clone(preset || activeChatPreset(this.settings.chat))));
@@ -1220,6 +1305,129 @@ export class TTSBackend {
         next.calls = normalizeCalls({ ...next.calls, ...Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key))) });
         return this.save(next).calls;
     }
+    // ---------- 音效 ----------
+    /** {enabled, ambienceVolume, sfxVolume, vary, generate, versions}. */
+    saveSounds(patch) {
+        const next = this.getState(), allowed = ['enabled', 'ambienceVolume', 'sfxVolume', 'vary', 'generate', 'versions', 'pack', 'packHidden'];
+        next.sounds = normalizeSounds({ ...next.sounds, ...Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key))) });
+        return this.save(next).sounds;
+    }
+    /** The shipped pack, read once (none when the plugin has no sounds folder or it cannot be read). */
+    packAll() {
+        if (!this.soundPack) return Promise.resolve([]);
+        this.packLoad ||= this.imageFetch(new URL('pack.json', this.soundPack).href).then(r => r.ok ? r.json() : null).then(pack => packRows(pack, this.soundPack)).catch(() => { this.packLoad = null; return []; });
+        return this.packLoad;
+    }
+    /** The shipped sounds in use: none while the pack is off, and not the ones taken out. */
+    async packSounds() {
+        const s = this.settings.sounds;
+        if (s.pack === false) return [];
+        const hidden = new Set(s.packHidden || []);
+        return (await this.packAll()).filter(r => !hidden.has(r.id));
+    }
+    /** The sound library without the audio: the user's own and ElevenLabs-made ones newest first, then the shipped pack. */
+    async listSounds() { return [...(await this.sounds.list('sound')).map(({ blob, kind, ...row }) => row), ...(await this.packSounds()).map(({ url, ...row }) => row)]; }
+    async soundBlob(id) {
+        if (String(id).startsWith('pack:')) {
+            const row = (await this.packAll()).find(r => r.id === id);
+            if (!row) return null;
+            const r = await this.imageFetch(row.url);
+            if (!r.ok) throw Error('读不到自带的声音（' + r.status + '）');
+            return r.blob();
+        }
+        const row = await this.sounds.get(id); return row?.kind === 'sound' ? row.blob : null;
+    }
+    /** How many of the shipped sounds there are, and how many were taken out. */
+    async packInfo() { const all = await this.packAll(); return { names: new Set(all.map(r => r.type + '|' + r.name)).size, count: all.length, hidden: (this.settings.sounds.packHidden || []).length }; }
+    /** Adds sounds: each {name, type, layer, strength, source, describe, seconds, blob}. The names they answer are no longer missing. */
+    async addSounds(list) {
+        this.assertOpen();
+        const at = Date.now(), rows = (Array.isArray(list) ? list : [list]).map((value, i) => {
+            const row = soundRow(value), blob = value?.blob;
+            if (!row.name) throw Error('给声音起个名字');
+            if (!(blob instanceof Blob) || !blob.size) throw Error(`「${row.name}」不是能用的音频文件`);
+            if (blob.size > SOUND_LIMITS.file) throw Error(`「${row.name}」太大了（单个声音最多 ${SOUND_LIMITS.file / 1024 / 1024} MB）`);
+            const type = String(blob.type || '').toLowerCase();
+            if (type && !type.startsWith('audio/') && !['application/octet-stream', 'video/webm', 'video/ogg'].includes(type)) throw Error(`「${row.name}」不是音频文件`);
+            return { ...row, id: crypto.randomUUID(), kind: 'sound', at: at + i, mime: type.startsWith('audio/') ? type : 'audio/mpeg', size: blob.size, blob };
+        });
+        if (!rows.length) return [];
+        await this.sounds.put(rows);
+        for (const key of new Set(rows.map(r => missingKey(r.type, r.name)))) await this.sounds.remove(key);
+        this.emit('sounds', {});
+        return rows.map(({ blob, kind, ...row }) => row);
+    }
+    /** Renames or re-sorts a sound: name, type, layer, strength, describe. */
+    async updateSound(id, patch = {}) {
+        const allowed = ['name', 'type', 'layer', 'strength', 'describe'];
+        if (String(id).startsWith('pack:')) throw Error('自带的声音不能改：可以删掉它，再自己传一个');
+        const row = await this.sounds.change(id, doc => {
+            if (doc.kind !== 'sound') throw Error('这个声音已经不在了');
+            const next = soundRow({ ...doc, ...Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key))) });
+            if (!next.name) throw Error('给声音起个名字');
+            Object.assign(doc, next);
+        });
+        await this.sounds.remove(missingKey(row.type, row.name));
+        this.emit('sounds', {});
+        const { blob, kind, ...rest } = row;
+        return rest;
+    }
+    async deleteSounds(ids) {
+        const list = [...new Set((Array.isArray(ids) ? ids : [ids]).map(String).filter(Boolean))];
+        // A shipped sound is only taken out of use (it can come back); the others are deleted.
+        const pack = list.filter(id => id.startsWith('pack:'));
+        if (pack.length) this.saveSounds({ packHidden: [...(this.settings.sounds.packHidden || []), ...pack] });
+        for (const id of list) if (!id.startsWith('pack:')) await this.sounds.remove(id);
+        if (list.length) this.emit('sounds', {});
+        return list.length;
+    }
+    /** 缺的声音: {type, name, describe, count, at}, the most recent first. */
+    async soundMissing() { return (await this.sounds.list('missing')).map(({ kind, id, ...row }) => row); }
+    async noteMissing({ type, name, describe = '' } = {}) {
+        name = soundName(name);
+        if (!name || !SOUND_KINDS.includes(type)) return;
+        const id = missingKey(type, name), old = await this.sounds.get(id);
+        await this.sounds.put([{ id, kind: 'missing', type, name, describe: String(describe || old?.describe || '').slice(0, 200), count: (old?.count || 0) + 1, at: Date.now() }], { keep: 60 });
+        this.emit('sounds', { missing: true });
+    }
+    async dismissMissing(type, name) { await this.sounds.remove(missingKey(type, name)); this.emit('sounds', { missing: true }); }
+    /** Has ElevenLabs make a sound from an English description and keeps it (an ambience loops: about 22 seconds). */
+    async generateSound({ name, type = 'sfx', describe = '' } = {}, signal) {
+        this.assertOpen();
+        if (!this.providers.currentKey('eleven')) throw Error('要先在引擎 App 里填 ElevenLabs 的密钥，才能生成音效');
+        const text = String(describe || '').trim();
+        if (!/[a-z]/i.test(text)) throw Error('写一句英文描述（比如 heavy wooden door knock），ElevenLabs 才知道做什么声音');
+        const ambience = type === 'ambience';
+        const blob = await this.providers.soundEffect({ text, loop: ambience, seconds: ambience ? 22 : 0 }, signal);
+        const [row] = await this.addSounds([{ name, type, layer: 'bed', source: 'eleven', describe: text, blob }]);
+        return row;
+    }
+    /** 导出音效包: the chosen sounds (all when none are named) in one file to share. */
+    async exportSounds(ids = null, name = '') {
+        const wanted = Array.isArray(ids) && ids.length ? new Set(ids) : null;
+        // Only the user's own and ElevenLabs-made sounds: everyone has the shipped pack.
+        const rows = (await this.sounds.list('sound')).filter(r => !wanted || wanted.has(r.id)).reverse();
+        if (!rows.length) throw Error('还没有声音可以导出');
+        const sounds = [];
+        for (const r of rows) sounds.push({ ...soundRow(r), mime: r.mime, data: await this.base64(r.blob) });
+        return new Blob([JSON.stringify({ format: PACK_FORMAT, version: 1, name: String(name || '').slice(0, 60), at: Date.now(), sounds })], { type: 'application/json' });
+    }
+    /** 导入音效包: adds the pack's sounds (one already here, same name, kind and size, is skipped). source: who made them (自带 for the shipped pack). */
+    async importSounds(file, { source = '' } = {}) {
+        const pack = readPack(typeof file === 'string' ? file : await file.text());
+        const have = new Set((await this.sounds.list('sound')).map(r => [r.type, r.name, r.layer, r.size].join('|')));
+        const add = [];
+        for (const s of pack.sounds) {
+            let bytes;
+            try { bytes = Uint8Array.from(atob(s.data), c => c.charCodeAt(0)); } catch { continue; }
+            const key = [s.type, s.name, s.layer, bytes.length].join('|');
+            if (have.has(key)) continue;
+            have.add(key);
+            add.push({ ...s, ...(source ? { source } : {}), blob: new Blob([bytes], { type: s.mime }) });
+        }
+        await this.addSounds(add);
+        return { added: add.length, skipped: pack.sounds.length - add.length, name: pack.name };
+    }
     // ---------- 朋友圈 ----------
     /** Moments options: {auto, every, dailyMax, images, replyToMe}. */
     saveMoments(patch) {
@@ -1233,6 +1441,8 @@ export class TTSBackend {
         const next = { key: String(space?.key || '').slice(0, 300), name: String(space?.name || '').slice(0, 80), members: (Array.isArray(space?.members) ? space.members : []).map(String).filter(Boolean).slice(0, 30) };
         if (next.key === this.space.key && next.name === this.space.name && next.members.join('\n') === this.space.members.join('\n')) return;
         this.space = next;
+        // The card's own characters belong to it (so they do not show up in other cards as roles no story has met).
+        if (next.key && next.members.length) this.tagRoles(next.members, next.key);
         this.emit('space', { space: clone(next) });
         if (!this.here()) return;
         this.emit('chat', { threadId: '' }); this.emit('moments', {}); this.emit('forum', {}); this.emit('peek', {});
@@ -1323,17 +1533,57 @@ export class TTSBackend {
         if (!lines.length) throw Error('这条语音没有内容');
         return this.player.start(lines.map(l => ({ role: l.role, emotion: l.emotion || 'calm', text: l.text, translation: l.translation || '' })), () => !this.closed);
     }
-    /** Album photos made by the drawing app or in-text pictures (named NovelAI-<seed>.png / chat-<seed>.png). */
+    /**
+     * Album photos the phone drew, by where they were drawn (told apart by the name generateImage gives them):
+     * {count, bytes, ids, sources: {draw|chat|peek|moments: {label, count, bytes, ids}}}. Imported photos are not here.
+     */
     async generatedPhotos() {
-        const rows = (await this.library.listPhotos()).filter(row => /^(?:NovelAI|chat)-\d+\.png$/.test(row.name));
-        return { count: rows.length, bytes: rows.reduce((n, row) => n + (row.size || 0), 0), ids: rows.map(row => row.id) };
+        const rows = await this.library.listPhotos(), sources = {}, all = [];
+        for (const [key, label, pattern] of DRAWN_SOURCES) {
+            const mine = rows.filter(row => pattern.test(row.name || ''));
+            sources[key] = { label, count: mine.length, bytes: mine.reduce((n, row) => n + (row.size || 0), 0), ids: mine.map(row => row.id) };
+            all.push(...mine);
+        }
+        return { count: all.length, bytes: all.reduce((n, row) => n + (row.size || 0), 0), ids: all.map(row => row.id), sources };
     }
-    async deleteGeneratedPhotos() {
-        const { ids } = await this.generatedPhotos();
-        for (const id of ids) await this.library.deletePhoto(id);
+    /**
+     * Deletes the drawn photos of the given sources (all when none are given). Whatever showed them lets go: a 朋友圈
+     * post's picture and a 查手机 photo go back to «not drawn» (they can be drawn again), an avatar or a chat background
+     * that used one goes back to the default.
+     */
+    async deleteGeneratedPhotos(sources = null) {
+        const found = await this.generatedPhotos();
+        const keys = Array.isArray(sources) && sources.length ? sources.filter(k => found.sources[k]) : Object.keys(found.sources);
+        const gone = new Set(keys.flatMap(k => found.sources[k].ids));
+        for (const id of gone) await this.library.deletePhoto(id);
+        if (gone.size) await this.#forgetPhotos(gone);
         this.emit('library', { collection: 'photos' });
         this.emit('phone', { preferences: await this.getPhone() });
-        return ids.length;
+        return gone.size;
+    }
+    async #forgetPhotos(gone) {
+        let posts = 0;
+        for (const post of await this.moments.list()) {
+            if (!gone.has(post.photoId)) continue;
+            await this.moments.setImage(post.id, post.imageTags ? { photoId: '', imageState: 'failed', imageNote: '配图已清理' } : { photoId: '' });
+            posts++;
+        }
+        if (posts) this.emit('moments', {});
+        // Photos in the phone chats: a drawn one can be drawn again; one of the album goes back to its words.
+        for (const summary of await this.chats.list()) {
+            const thread = await this.chats.get(summary.id);
+            const hit = (thread?.messages || []).filter(m => m.kind === 'photo' && gone.has(m.photoId));
+            for (const m of hit) await this.chats.updateMessage(thread.id, m.id, m.imageTags ? { photoId: '', imageState: 'failed', imageNote: '图片已清理' } : { photoId: '' });
+            if (hit.length) this.emit('chat', { threadId: thread.id });
+        }
+        const snaps = (await this.apps.list('peek')).filter(doc => [...(doc.photos || []), doc.wallpaper].some(p => p && gone.has(p.photoId)));
+        const strip = p => { if (!p || !gone.has(p.photoId)) return p; const { photoId, state, note, ...rest } = p; return rest; };
+        if (snaps.length) await this.appsMutate('peek', () => this.apps.put(snaps.map(doc => ({ ...doc, photos: (doc.photos || []).map(strip), ...(doc.wallpaper ? { wallpaper: strip(doc.wallpaper) } : {}) }))));
+        const next = this.getState(), avatars = { ...next.chat.avatars };
+        let changed = false;
+        for (const [key, a] of Object.entries(avatars)) if (a.kind === 'photo' && gone.has(a.photoId)) { delete avatars[key]; changed = true; }
+        if (gone.has(next.chat.profile.backgroundPhoto)) { next.chat.profile = { ...next.chat.profile, backgroundPhoto: '' }; changed = true; }
+        if (changed) { next.chat.avatars = avatars; this.save(next); }
     }
     /** The shared cloud queue from the drawing settings, or null when it is off or incomplete. */
     cloudQueue() {
@@ -1592,6 +1842,15 @@ export class TTSBackend {
         this.emit('phone', { preferences: { ...phone, theme: this.settings.theme } });
         return { ...phone, theme: this.settings.theme };
     }
+    /** Deletes album photos; whatever showed them lets go (朋友圈 and 查手机 pictures go back to «not drawn»). */
+    async deletePhotos(ids) {
+        const gone = new Set((Array.isArray(ids) ? ids : [ids]).map(String).filter(Boolean));
+        for (const id of gone) await this.library.deletePhoto(id);
+        if (gone.size) await this.#forgetPhotos(gone);
+        this.emit('library', { collection: 'photos' });
+        this.emit('phone', { preferences: await this.getPhone() });
+        return gone.size;
+    }
     async mutateLibrary(collection, method, ...args) {
         const result = await this.library[method](...args.map(clone));
         this.emit('library', { collection });
@@ -1601,7 +1860,7 @@ export class TTSBackend {
     api() {
         const methods = {
             getState: () => this.getState(), getSnapshot: () => this.getSnapshot(), save: (next, revision) => this.save(next, revision),
-            updateGeneral: patch => this.updateGeneral(patch), saveRoute: route => this.saveRoute(route), deleteRoute: id => this.deleteRoute(id),
+            updateGeneral: patch => this.updateGeneral(patch), saveRoute: route => this.saveRoute(route), saveVoicePool: list => this.saveVoicePool(clone(list)), deleteRoute: id => this.deleteRoute(id),
             switchRouteEngine, validRoleName: name => typeof name === 'string' && !!name.trim() && !isPlaceholderRole(name),
             saveConnection: (engine, patch) => this.saveConnection(engine, patch),
             savePreset: preset => this.savePreset(preset), deletePreset: id => this.deletePreset(id), selectPreset: id => this.selectPreset(id),
@@ -1616,7 +1875,7 @@ export class TTSBackend {
             comfyLoras: options => this.comfyLoras(options),
             saveDrawPreset: preset => this.saveDrawPreset(preset), deleteDrawPreset: id => this.deleteDrawPreset(id), previewDrawPrompt: preset => this.previewDrawPrompt(preset),
             naiSubscription: refresh => this.naiSubscription(refresh), naiProbe: () => this.naiProbe(), fishProbe: () => { this.assertOpen(); keyCheck('fish'); return this.providers.probeFish(clone(this.settings.connections.fish)); },
-            listVibes: () => this.listVibes(), importVibes: (files, options) => this.importVibes(files, clone(options || {})), updateVibe: (id, patch) => this.updateVibe(id, clone(patch || {})), deleteVibe: id => this.deleteVibe(id), deleteVibes: ids => this.deleteVibes([...(ids || [])]), exportVibes: target => this.exportVibes(clone(target || {})), vibePlan: model => clone(this.vibePlan(model || this.settings.draw.params.model)), drawQuote: params => this.drawQuote(params),
+            listVibes: () => this.listVibes(), compactVibes: () => this.compactVibes(), importVibes: (files, options) => this.importVibes(files, clone(options || {})), updateVibe: (id, patch) => this.updateVibe(id, clone(patch || {})), deleteVibe: id => this.deleteVibe(id), deleteVibes: ids => this.deleteVibes([...(ids || [])]), exportVibes: target => this.exportVibes(clone(target || {})), vibePlan: model => clone(this.vibePlan(model || this.settings.draw.params.model)), drawQuote: params => this.drawQuote(params),
             generateImage: input => this.generateImage(input).then(({ blob, ...result }) => result),
             drawQueue: () => this.drawQueue.list(), cancelDraw: key => this.drawQueue.cancel(key), cancelAllDraws: () => this.drawQueue.cancelAll(),
             cloudQueueError: () => this.drawQueue.remoteError, testCloudQueue: value => this.testCloudQueue(value), newRoomCode: () => newRoomCode(),
@@ -1637,13 +1896,15 @@ export class TTSBackend {
             getFavorite: id => this.library.getFavorite(id), playFavorite: id => this.playFavorite(id),
             deleteFavorite: id => this.mutateLibrary('favorites', 'deleteFavorite', id),
             listPhotos: () => this.library.listPhotos(), addPhoto: value => this.mutateLibrary('photos', 'addPhoto', value),
-            getPhoto: id => this.library.getPhoto(id), deletePhoto: id => this.mutateLibrary('photos', 'deletePhoto', id),
+            getPhoto: id => this.library.getPhoto(id), deletePhoto: id => this.deletePhotos([id]).then(n => n > 0), deletePhotos: ids => this.deletePhotos(ids),
             listNotes: () => this.library.listNotes(), saveNote: value => this.mutateLibrary('notes', 'saveNote', value), deleteNote: id => this.mutateLibrary('notes', 'deleteNote', id),
             getPhone: () => this.getPhone(), savePhone: patch => this.savePhone(patch), libraryStats: () => this.library.stats(),
-            generatedPhotos: () => this.generatedPhotos().then(({ count, bytes }) => ({ count, bytes })), deleteGeneratedPhotos: () => this.deleteGeneratedPhotos(),
+            generatedPhotos: () => this.generatedPhotos().then(({ count, bytes, sources }) => ({ count, bytes, sources: Object.fromEntries(Object.entries(sources).map(([k, { ids, ...rest }]) => [k, rest])) })), deleteGeneratedPhotos: sources => this.deleteGeneratedPhotos(sources),
             saveMoments: patch => this.saveMoments(clone(patch)), saveCalls: patch => this.saveCalls(clone(patch)),
+            saveSounds: patch => this.saveSounds(clone(patch)), listSounds: () => this.listSounds(), soundBlob: id => this.soundBlob(id), addSounds: list => this.addSounds(list), updateSound: (id, patch) => this.updateSound(id, clone(patch || {})), deleteSounds: ids => this.deleteSounds([...(ids || [])]),
+            packInfo: () => this.packInfo(), soundMissing: () => this.soundMissing(), dismissMissing: (type, name) => this.dismissMissing(type, name), generateSound: input => this.generateSound(clone(input || {})), exportSounds: (ids, name) => this.exportSounds(ids ? [...ids] : null, name), importSounds: (file, options) => this.importSounds(file, clone(options || {})),
             saveText: patch => this.saveText(clone(patch)), setTextKey: (id, key) => this.setTextKey(id, key), clearTextKey: id => this.clearTextKey(id), textKeyHint: id => this.textKeyHint(id), textModels: draft => this.textModels(clone(draft || {})),
-            syncStatus: () => this.syncStatus(), saveSync: patch => this.saveSync(clone(patch)), syncNow: () => this.syncNow().then(() => this.syncStatus()),
+            syncStatus: () => this.syncStatus(), saveSync: patch => this.saveSync(clone(patch)), syncNow: () => this.syncNow().then(() => this.syncStatus()), clearSyncFiles: () => this.clearSyncFiles(),
             listMoments: async () => { const here = this.here(); return (await this.moments.list()).filter(p => inSpace(p, here)); }, getMoment: id => this.moments.get(id),
             postMoment: ({ text, photoId } = {}) => this.momentsMutate(async () => (await this.moments.add([{ author: 'me', source: 'me', text, photoId, space: this.spaceKey() }]))[0]),
             likeMoment: (id, on = true) => this.momentsMutate(() => this.moments.like(id, 'me', on)),
@@ -1669,7 +1930,7 @@ export class TTSBackend {
             saveChatOptions: patch => this.saveChatOptions(clone(patch)),
             wallet: () => this.wallet(), buyDecoration: (kind, key) => this.buyDecoration(kind, key), saveGift: gift => this.saveGift(gift), deleteGift: id => this.deleteGift(id),
             sendPaid: (threadId, message) => this.sendPaid(threadId, message), takeSent: (threadId, messageId, accept) => this.takeSent(threadId, messageId, accept !== false),
-            shopCatalog: () => clone({ premium: PREMIUM, kinds: DECOR_KINDS, gifts: shopGifts(this.settings.chat.wallet), ledgerKinds: LEDGER_KINDS }), saveContact: contact => this.saveContact(contact), deleteContact: id => this.deleteContact(id), chatContacts: () => clone(this.contacts()),
+            shopCatalog: () => clone({ premium: PREMIUM, kinds: DECOR_KINDS, gifts: shopGifts(this.settings.chat.wallet), ledgerKinds: LEDGER_KINDS }), saveContact: contact => this.saveContact(contact), deleteContact: id => this.deleteContact(id), chatContacts: all => clone(all ? chatContacts(this.settings) : this.contacts()), addRoleContact: name => this.addRoleContact(name),
             listThreads: () => this.threads(), getThread: id => this.chats.get(id), chatUnread: async () => (await this.threads()).reduce((n, t) => n + (t.muted ? 0 : t.unread), 0),
             createThread: value => this.chatMutate(null, () => this.chats.create({ ...clone(value), space: this.spaceKey() })),
             updateThread: (id, patch) => this.chatMutate(id, () => this.chats.update(id, clone(patch))),
@@ -1704,6 +1965,7 @@ export class TTSBackend {
         this.moments.close();
         this.apps.close();
         this.memoryStore.close();
+        this.sounds.close();
         this.drawQueue.cancelAll();
         this.closing = Promise.all([this.player.close(), this.cache.close(), this.library.close(), Promise.resolve(this.keyStore.flush?.()).then(() => this.keyStore.close?.())]);
         await this.closing;

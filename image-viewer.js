@@ -14,8 +14,9 @@ const CSS = `
 .sttts-viewer-top .sttts-viewer-count{margin:0 auto;padding:6px 12px;border-radius:999px;background:rgba(20,24,40,.7);font-variant-numeric:tabular-nums;font-weight:700}
 .sttts-viewer-bar{position:absolute;left:50%;bottom:max(14px,env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;align-items:center;gap:2px;padding:4px;border-radius:24px;background:rgba(20,24,40,.8);box-shadow:0 8px 24px rgba(0,0,0,.4);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);max-width:calc(100vw - 24px);flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}
 .sttts-viewer-bar::-webkit-scrollbar{display:none}
-.sttts-viewer-top,.sttts-viewer-bar,.sttts-viewer-info{transition:opacity .2s}
-.sttts-viewer[data-chrome=off] .sttts-viewer-top,.sttts-viewer[data-chrome=off] .sttts-viewer-bar,.sttts-viewer[data-chrome=off] .sttts-viewer-info{opacity:0;pointer-events:none}
+.sttts-viewer-top,.sttts-viewer-bar,.sttts-viewer-info,.sttts-viewer-caption{transition:opacity .2s}
+.sttts-viewer[data-chrome=off] .sttts-viewer-top,.sttts-viewer[data-chrome=off] .sttts-viewer-bar,.sttts-viewer[data-chrome=off] .sttts-viewer-info,.sttts-viewer[data-chrome=off] .sttts-viewer-caption{opacity:0;pointer-events:none}
+.sttts-viewer-caption{position:absolute;left:12px;right:12px;bottom:calc(max(12px,env(safe-area-inset-bottom)) + 66px);max-height:30%;overflow:auto;margin:0;padding:9px 13px;border-radius:14px;background:rgba(20,24,40,.78);color:#fff;font-size:13px;line-height:1.6;white-space:pre-wrap;user-select:text;-webkit-user-select:text}
 /* all:unset makes pointer-events inherit (none from the top bar): buttons say auto themselves, and none while hidden. */
 .sttts-viewer[data-chrome=off] button{pointer-events:none}
 .sttts-viewer button{all:unset;pointer-events:auto;box-sizing:border-box;flex-shrink:0;min-width:40px;height:44px;padding:0 12px;border-radius:999px;display:inline-grid;place-items:center;cursor:pointer;color:#fff;font-weight:700;white-space:nowrap}
@@ -44,11 +45,12 @@ const infoHTML = info => Array.isArray(info)
  * Opens the viewer.
  * from: the element the picture was shown in (its size and place are where the viewer starts).
  * info: details shown under the 参数 button, as [[label, value]] rows or plain text.
+ * caption: words shown over the bottom of the picture (what a chat photo shows); a tap hides them with the bars.
  * gallery: {items: [{src, alt, info}], index, onIndex?(i)} to page through versions with ‹ ›.
  * actions: [{label, danger?, run(index)}] extra buttons; `run` may return a promise; the viewer closes after an
  * action unless it returns false.
  */
-export function openImageViewer({doc = document, src, alt = '', actions = [], from = null, info = null, gallery = null}) {
+export function openImageViewer({doc = document, src, alt = '', actions = [], from = null, info = null, gallery = null, caption = ''}) {
   const win = doc.defaultView;
   if (!doc.getElementById(STYLE_ID)) {
     const style = doc.createElement('style');
@@ -67,7 +69,7 @@ export function openImageViewer({doc = document, src, alt = '', actions = [], fr
   root.setAttribute('aria-label', '查看图片');
   root.innerHTML = `<img alt="">
     <div class="sttts-viewer-top"><button data-v="info" aria-pressed="false" hidden>参数</button>${paged ? '<span class="sttts-viewer-count" aria-live="polite"></span>' : ''}<button class="sttts-viewer-close" data-v="close" aria-label="关闭">×</button></div>
-    <div class="sttts-viewer-info" hidden></div>
+    <div class="sttts-viewer-info" hidden></div>${caption ? `<p class="sttts-viewer-caption">${esc(caption)}</p>` : ''}
     <div class="sttts-viewer-bar">${paged ? '<button data-v="prev" aria-label="上一个版本">‹</button><button data-v="next" aria-label="下一个版本">›</button>' : ''}<button data-v="out" aria-label="缩小">－</button><output aria-live="polite"></output><button data-v="in" aria-label="放大">＋</button><button data-v="home">复原</button><button data-v="fit">适应屏幕</button><button data-v="full">实际像素</button>${actions.map((a, i) => `<button data-action="${i}"${a.danger ? ' data-danger' : ''}></button>`).join('')}</div>`;
   const img = root.querySelector('img'), label = root.querySelector('output'), bar = root.querySelector('.sttts-viewer-bar');
   const panel = root.querySelector('.sttts-viewer-info'), infoButton = root.querySelector('[data-v=info]'), count = root.querySelector('.sttts-viewer-count');
@@ -176,7 +178,7 @@ export function openImageViewer({doc = document, src, alt = '', actions = [], fr
   win.addEventListener('resize', onResize);
   doc.addEventListener('keydown', onKey, true);
 
-  const onChrome = e => e.target.closest('.sttts-viewer-top,.sttts-viewer-bar,.sttts-viewer-info');
+  const onChrome = e => e.target.closest('.sttts-viewer-top,.sttts-viewer-bar,.sttts-viewer-info,.sttts-viewer-caption');
   root.addEventListener('wheel', e => {
     if (onChrome(e)) return;
     e.preventDefault();
@@ -218,6 +220,15 @@ export function openImageViewer({doc = document, src, alt = '', actions = [], fr
     pointers.delete(e.pointerId);
     gesture = null;
     if (!pointers.size) root.removeAttribute('data-dragging');
+    // Several pictures, not zoomed in: a swipe sideways is the one before or after.
+    if (paged && e.type === 'pointerup' && p.moved && !pointers.size && s <= Math.max(base, fit) * 1.05) {
+      const dx = e.clientX - p.x0, dy = e.clientY - p.y0;
+      if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+        const next = index + (dx < 0 ? 1 : -1);
+        if (next >= 0 && next < items.length) { start = null; show(next); } else home(true);
+        return;
+      }
+    }
     if (e.type !== 'pointerup' || !tap) return;
     const r = root.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top, now = Date.now();
     if (lastTap && now - lastTap.t < 320 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 30) {

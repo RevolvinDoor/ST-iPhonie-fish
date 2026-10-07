@@ -109,3 +109,19 @@ export async function runSync({stores, files, memory = {}, device = '', deviceNa
   // The tavern's copy is now what this device holds.
   return {memory: {hashes, savedAt: remote.savedAt}, pulled, pushed, merged, savedAt: remote.savedAt, remote};
 }
+
+/**
+ * Deletes the phone's copy in the tavern: every picture, every part and the manifest (last, so a failed run can be
+ * done again). Returns how many files it removed (0 when there was no copy). What is on this device stays.
+ */
+export async function removeSync(files) {
+  const raw = await files.read(MANIFEST);
+  if (raw === null) return 0;
+  let parts = [], photos = [];
+  try { parts = Object.keys(JSON.parse(raw)?.parts || {}); } catch { /* a broken manifest: the known parts below */ }
+  try { photos = (JSON.parse(await files.read(partFile('photos')) || '[]') || []).map(photoFile); } catch { /* no album index */ }
+  // Removing a file that is not there counts as removed.
+  const names = [...photos, ...[...new Set([...Object.keys(SYNC_PARTS), ...parts])].map(partFile), MANIFEST];
+  for (const name of names) await files.remove(name);
+  return names.length;
+}

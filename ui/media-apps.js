@@ -1,7 +1,7 @@
 import {createView, esc, engines, btn, heading, empty, size, field, input, textArea, groupTitle, avatar} from './common.js';
 import {icon, wave, halo} from './icons.js';
-import {openImageViewer} from '../image-viewer.js';
-import {saveFile, downloadAction} from '../download.js';
+import {openAlbum} from './album-viewer.js';
+import {saveFile} from '../download.js';
 import {decodeMono, joinClips, encodeWav, JOIN_RATE} from '../core/audio-join.js';
 
 const NOTE_COLORS = ['#fff4b0', '#ffd9e6', '#d9ecff', '#e3f5d9', '#efe0ff', '#ffe6cc'];
@@ -61,26 +61,25 @@ export function libraryApp(ctx) {
 
 export function galleryApp(ctx) {
   const {api} = ctx, v = createView(ctx, 'gallery'), urls = new Set();
-  let current = null, epoch = 0;
+  // selecting: the photos ticked while choosing several (null when not choosing); shown: the ids in the grid, in order;
+  // album: the photo open full screen (album-viewer.js), swiped through in the grid's order.
+  let epoch = 0, selecting = null, shown = [], album = null;
   const clear = () => { for (const url of urls) ctx.win.URL.revokeObjectURL(url); urls.clear(); };
   const urlFor = blob => { const url = ctx.win.URL.createObjectURL(blob); urls.add(url); return url; };
   const photoFile = async id => { const photo = await api.getPhoto(id); if (!photo) throw Error('这张照片已经不在了'); return {source: photo.blob, name: photo.name}; };
   const importButton = `<label class="chip-button file-button">${icon('import')}导入<input type="file" data-photo-files multiple accept="image/png,image/jpeg,image/webp,image/avif,image/gif" aria-label="导入照片"></label>`;
   async function render() {
     const ticket = ++epoch;
-    if (current) {
-      const photo = await api.getPhoto(current);
-      if (v.disposed || ticket !== epoch) return;
-      clear();
-      if (!photo) { current = null; return render(); }
-      v.draw(heading('照片', '', 'Photo') + `<button type="button" class="photo-zoom" data-action="zoom" aria-label="放大查看"><img class="photo-full" src="${esc(urlFor(photo.blob))}" alt="${esc(photo.name)}"></button><p class="hint">${esc(photo.name)} · ${size(photo.size)}</p><div class="actions">${btn('wallpaper', icon('image') + '设为壁纸', 'primary')}${btn('download-photo', icon('download') + '下载', 'secondary')}${btn('delete-photo', icon('trash') + '删除', 'danger')}</div>`);
-      return;
-    }
     const rows = await api.listPhotos();
     if (v.disposed || ticket !== epoch) return;
     clear();
-    v.draw(heading('相册', importButton, `Album · ${rows.length}`) + (rows.length
-      ? `<div class="photo-grid">${rows.map(r => `<button data-action="photo" data-id="${esc(r.id)}" aria-label="查看 ${esc(r.name)}"><img loading="lazy" data-photo="${esc(r.id)}" alt="${esc(r.name)}"></button>`).join('')}</div>`
+    shown = rows.map(r => r.id);
+    if (selecting) selecting = new Set([...selecting].filter(id => shown.includes(id)));
+    if (!rows.length) selecting = null;
+    const tools = selecting ? btn('select-cancel', '取消', 'chip-button') : (rows.length ? btn('select', icon('check') + '选择', 'chip-button') : '') + importButton;
+    v.draw(heading('相册', `<span class="gallery-tools">${tools}</span>`, `Album · ${rows.length}`) + (rows.length
+      ? `<div class="photo-grid${selecting ? ' selecting' : ''}">${rows.map(r => `<button data-action="photo" data-id="${esc(r.id)}" aria-label="${selecting ? '选择' : '查看'} ${esc(r.name)}"${selecting ? ` aria-pressed="${selecting.has(r.id)}"` : ''}><img loading="lazy" data-photo="${esc(r.id)}" alt="${esc(r.name)}"></button>`).join('')}</div>`
+        + (selecting ? `<div class="select-bar"><span data-select-count>${countText()}</span>${btn('select-all', allText(), 'text-button')}${btn('select-delete', icon('trash') + '删除', 'danger', selecting.size ? '' : 'disabled')}</div>` : '')
       : empty('留住喜欢的画面', '从本地导入照片，也可以设为手机壁纸。', 'image')));
     for (const row of rows) {
       const photo = await api.getPhoto(row.id);
@@ -88,10 +87,41 @@ export function galleryApp(ctx) {
       if (photo) { const img = [...v.root.querySelectorAll('[data-photo]')].find(el => el.dataset.photo === row.id); if (img) img.src = urlFor(photo.blob); }
     }
   }
-  v.back = () => { if (!current) return false; current = null; render().catch(e => ctx.notify(e.message)); return true; };
+  const countText = () => selecting.size ? `已选 ${selecting.size} 张` : '点照片来选择';
+  const allText = () => selecting.size === shown.length ? '全不选' : '全选';
+  /** Ticks change in place (the grid is not drawn again, which would load every picture again). */
+  function syncSelection() {
+    for (const b of v.root.querySelectorAll('.photo-grid [data-id]')) b.setAttribute('aria-pressed', String(selecting.has(b.dataset.id)));
+    const count = v.root.querySelector('[data-select-count]'), all = v.root.querySelector('[data-action=select-all]'), del = v.root.querySelector('[data-action=select-delete]');
+    if (count) count.textContent = countText();
+    if (all) all.textContent = allText();
+    if (del) del.disabled = !selecting.size;
+  }
+  /** Opens a photo full screen; the others of the grid are a swipe away. */
+  function openPhoto(id) {
+    album?.close();
+    let changed = false;
+    album = openAlbum({ctx, host: v.root.closest('.screen') || ctx.doc.body, ids: shown, index: Math.max(0, shown.indexOf(id)),
+      load: id => api.getPhoto(id),
+      actions: [
+        {key: 'wallpaper', icon: 'image', label: '设为壁纸', run: async id => { await api.savePhone({wallpaper: {kind: 'photo', photoId: id}}); ctx.notify('已设为壁纸'); }},
+        {key: 'download', icon: 'download', label: '下载', run: async id => { const {source, name} = await photoFile(id); await saveAs(ctx, {blob: source, name}); }},
+        {key: 'delete', icon: 'trash', label: '删除', danger: true, run: async id => {
+          if (!await ctx.confirm('删除这张照片？', '使用它的壁纸和图标会恢复默认。')) return;
+          await api.deletePhoto(id); changed = true; ctx.notify('已删除');
+          return 'removed';
+        }}
+      ],
+      onClose: () => { album = null; if (changed) render().catch(e => ctx.notify(e.message)); }});
+  }
+  v.back = () => {
+    if (album) { album.close(); return true; }
+    if (selecting) { selecting = null; render().catch(e => ctx.notify(e.message)); return true; }
+    return false;
+  };
   v.refresh = render;
   const dispose = v.dispose;
-  v.dispose = () => { epoch++; clear(); dispose(); };
+  v.dispose = () => { epoch++; album?.close(); clear(); dispose(); };
   v.on('change', '[data-photo-files]', async el => {
     el.disabled = true;
     try {
@@ -102,19 +132,19 @@ export function galleryApp(ctx) {
   });
   v.on('click', '[data-action]', async el => {
     switch (el.dataset.action) {
-      case 'photo': current = el.dataset.id; await render(); break;
-      case 'zoom': {
-        const img = el.querySelector('img'), id = current;
-        openImageViewer({doc: ctx.doc, src: img.src, alt: img.alt, from: img, actions: [
-          downloadAction(ctx.doc, () => photoFile(id), ctx.notify),
-          {label: '设为壁纸', run: async () => { await api.savePhone({wallpaper: {kind: 'photo', photoId: id}}); ctx.notify('已设为壁纸'); }},
-          {label: '删除', danger: true, run: async () => { if (!await ctx.confirm('删除这张照片？', '使用它的壁纸和图标会恢复默认。')) return false; await api.deletePhoto(id); current = null; await render(); }}
-        ]});
+      case 'photo':
+        if (selecting) { const id = el.dataset.id; if (selecting.has(id)) selecting.delete(id); else selecting.add(id); syncSelection(); break; }
+        openPhoto(el.dataset.id); break;
+      case 'select': selecting = new Set(); await render(); break;
+      case 'select-cancel': selecting = null; await render(); break;
+      case 'select-all': selecting = selecting.size === shown.length ? new Set() : new Set(shown); syncSelection(); break;
+      case 'select-delete': {
+        const ids = [...selecting];
+        if (!ids.length || !await ctx.confirm(`删除这 ${ids.length} 张照片？`, '用它们当的壁纸、图标、头像和聊天背景会恢复默认；朋友圈配图和查手机照片变回「没画」，想要可以再画。')) break;
+        const n = await v.busy(el, () => api.deletePhotos(ids));
+        selecting = null; await render(); ctx.notify(`已删除 ${n} 张`);
         break;
       }
-      case 'wallpaper': await api.savePhone({wallpaper: {kind: 'photo', photoId: current}}); ctx.notify('已设为壁纸'); break;
-      case 'download-photo': { const id = current; await v.busy(el, async () => { const {source, name} = await photoFile(id); await saveAs(ctx, {blob: source, name}); }); break; }
-      case 'delete-photo': if (await ctx.confirm('删除这张照片？', '使用它的壁纸和图标会恢复默认。')) { await api.deletePhoto(current); current = null; await render(); } break;
     }
   });
   render().catch(e => ctx.notify(e.message));

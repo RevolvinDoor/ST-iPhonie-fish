@@ -100,3 +100,15 @@
 #chat .sttts-lint li{margin:3px 0}
 #chat .sttts-lint code{display:block;margin-top:2px;white-space:pre-wrap;word-break:break-all;font-size:.92em;opacity:.8;background:none;padding:0}
 #chat .sttts-lint p{margin:4px 0 0}
+
+/* 音效 chips: where the story put a sound (♪ an effect, ≋ an ambience). Small and faint, so they do not get in the
+   way of reading; a tap plays the sound again (an ambience's chip starts or stops it). */
+#chat [data-sttts-action="sound"]{
+  --sttts-body:var(--SmartThemeBodyColor,currentColor);
+  display:inline-flex;align-items:center;gap:3px;vertical-align:baseline;margin:0 2px;padding:0 7px 0 5px;min-height:0;height:1.45em;
+  font:inherit;font-size:.72em;line-height:1;color:color-mix(in srgb,var(--sttts-body) 55%,transparent);
+  border:0;border-radius:999px;background:color-mix(in srgb,var(--sttts-body) 8%,transparent);box-shadow:none;cursor:pointer;touch-action:manipulation;white-space:nowrap}
+#chat [data-sttts-action="sound"]::before{content:"♪";font-size:1.05em;opacity:.8}
+#chat [data-sttts-action="sound"][data-sttts-kind="ambience"]::before{content:"≋"}
+#chat [data-sttts-action="sound"]:hover{color:var(--sttts-body);background:color-mix(in srgb,var(--sttts-body) 14%,transparent)}
+#chat [data-sttts-action="sound"]:focus-visible{outline:2px solid color-mix(in srgb,var(--sttts-body) 60%,transparent);outline-offset:1px}

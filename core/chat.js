@@ -52,7 +52,7 @@ export function normalizeVoiceText(v = {}) {
 }
 
 export function defaultChat() {
-  return {presets: [{...structuredClone(DEFAULT_PRESET), memory: normalizeMemory()}], activePreset: 'default', contacts: [], voiceText: {...DEFAULT_VOICE_TEXT}, profile: normalizeProfile(), starred: [], avatars: {}, partition: 'none', wallet: defaultWallet()};
+  return {presets: [{...structuredClone(DEFAULT_PRESET), memory: normalizeMemory()}], activePreset: 'default', contacts: [], voiceText: {...DEFAULT_VOICE_TEXT}, profile: normalizeProfile(), starred: [], avatars: {}, partition: 'none', pace: true, wallet: defaultWallet(), stickers: []};
 }
 
 const text = (value, max) => String(value ?? '').slice(0, max);
@@ -139,7 +139,8 @@ export function normalizeProfile(p = {}) {
 export function normalizeAvatars(value) {
   const out = {};
   if (!value || typeof value !== 'object') return out;
-  for (const [name, a] of Object.entries(value).slice(0, CHAT_LIMITS.contacts + 1)) {
+  // Names ('me' for the user) and groups ('g:' + the chat's id).
+  for (const [name, a] of Object.entries(value).slice(0, CHAT_LIMITS.contacts * 2)) {
     const key = text(name, 40).trim();
     if (!key || !a || typeof a !== 'object') continue;
     if (a.kind === 'photo' && a.photoId) out[key] = {kind: 'photo', photoId: text(a.photoId, 512)};
@@ -152,13 +153,45 @@ export function normalizeContact(c = {}) {
   return {id: String(c.id || crypto.randomUUID()), name: text(c.name, 40).trim(), persona: text(c.persona, CHAT_LIMITS.persona), ...(c.space ? {space: text(c.space, 300)} : {})};
 }
 
+// ---------- 表情包 ----------
+// Stickers are pictures on the web, kept by name and address: {name, url}. Names are what the model writes.
+export const STICKER_LIMIT = 300;
+const stickerUrl = value => { const url = String(value ?? '').trim(); return /^https?:\/\/\S+$/i.test(url) && url.length <= 2000 ? url : ''; };
+export const stickerName = value => String(value ?? '').replace(/[\s,，、;；|｜:：<>"'`\[\]【】]+/g, '').slice(0, 20);
+export function normalizeStickers(list) {
+  const out = new Map();
+  for (const s of Array.isArray(list) ? list : []) {
+    const name = stickerName(s?.name), url = stickerUrl(s?.url);
+    if (name && url) { out.delete(name); out.set(name, {name, url}); }
+  }
+  return [...out.values()].slice(-STICKER_LIMIT);
+}
+/**
+ * Stickers pasted as text: 「名字URL, 名字URL」, one per line or separated by commas, with or without a colon or space
+ * between the name and the address. A name again replaces the old one.
+ */
+export function parseStickers(text) {
+  const out = [];
+  for (const m of String(text ?? '').matchAll(/([^\s,，、;；\n]*?)\s*[:：|｜=]?\s*(https?:\/\/[^\s,，、;；"'<>]+)/gi)) {
+    const name = stickerName(m[1]);
+    if (name) out.push({name, url: m[2]});
+  }
+  return normalizeStickers(out);
+}
+/** The sticker a line names: the same name, else one that contains the other (two characters at least). */
+export function findSticker(stickers, name) {
+  const want = stickerName(name);
+  if (!want) return null;
+  return stickers.find(s => s.name === want) || stickers.find(s => Math.min(s.name.length, want.length) >= 2 && (s.name.includes(want) || want.includes(s.name))) || null;
+}
+
 export function normalizeChat(value) {
   const base = defaultChat();
   if (!value || typeof value !== 'object') return base;
   const presets = (Array.isArray(value.presets) && value.presets.length ? value.presets : base.presets).map(normalizeChatPreset);
   const contacts = (Array.isArray(value.contacts) ? value.contacts : []).slice(0, CHAT_LIMITS.contacts).map(normalizeContact).filter(c => c.name);
   const starred = [...new Set((Array.isArray(value.starred) ? value.starred : []).map(n => text(n, 40).trim()).filter(Boolean))].slice(0, CHAT_LIMITS.contacts);
-  return {presets, activePreset: presets.some(p => p.id === value.activePreset) ? value.activePreset : presets[0].id, contacts, voiceText: normalizeVoiceText(value.voiceText), profile: normalizeProfile(value.profile), wallet: normalizeWallet(value.wallet), starred, avatars: normalizeAvatars(value.avatars), partition: value.partition === 'card' ? 'card' : 'none'};
+  return {presets, activePreset: presets.some(p => p.id === value.activePreset) ? value.activePreset : presets[0].id, contacts, voiceText: normalizeVoiceText(value.voiceText), profile: normalizeProfile(value.profile), wallet: normalizeWallet(value.wallet), starred, avatars: normalizeAvatars(value.avatars), partition: value.partition === 'card' ? 'card' : 'none', pace: value.pace !== false, stickers: normalizeStickers(value.stickers)};
 }
 
 export function validateChatPreset(p) {
@@ -189,7 +222,8 @@ export const inSpace = (item, space) => !space?.key || !item?.space || item.spac
 export const activeSpace = (settings, space) => settings.chat?.partition === 'card' && space?.key ? space : null;
 export function chatContacts(settings, space = null) {
   // A card's contacts: its own character(s), the roles that have spoken in its story, and contacts added under it.
-  const here = r => !space?.key || (space.members || []).includes(r.name) || (Array.isArray(r.cards) && r.cards.includes(space.key));
+  // A role no story has met yet (just made in the 角色 App) belongs to every card until one does.
+  const here = r => !space?.key || (space.members || []).includes(r.name) || !(Array.isArray(r.cards) && r.cards.length) || r.cards.includes(space.key);
   const roles = settings.routes.filter(r => !isPlaceholderRole(r.name) && here(r)).map(r => ({name: r.name, source: 'role', voice: !!r.voice, engine: r.voice ? r.engine : 'none', language: r.language || settings.general.defaultLanguage, persona: ''}));
   const manual = settings.chat.contacts.filter(c => !roles.some(r => r.name === c.name) && inSpace(c, space)).map(c => ({name: c.name, source: 'manual', id: c.id, voice: false, engine: 'none', language: '', persona: c.persona}));
   return [...roles, ...manual];
@@ -209,6 +243,7 @@ export function messageLine(m, user) {
     case 'system': return '';
     case 'voice': return `${who}：${quote}[语音] ${m.translation || m.text}`;
     case 'photo': return `${who}：[图片]${m.text ? ' ' + m.text : ''}`;
+    case 'sticker': return `${who}：[表情包] ${m.text}`;
     case 'redpacket': return `${who}：[红包 ¥${m.amount}] ${m.text || DEFAULT_BLESSING}（${m.state === 'opened' ? nameOf(m.openedBy, user) + '已领取' : '还没领取'}）`;
     case 'transfer': return `${who}：[转账 ¥${m.amount}]${m.text ? ' ' + m.text : ''}（${TRANSFER_STATE[m.state] || '待收款'}）`;
     case 'gift': return `${who}：[礼物 ${m.gift?.name || ''}${m.gift?.price ? ' ¥' + yuan(m.gift.price) : ''}]${m.text ? ' ' + m.text : ''}（${m.state === 'accepted' ? '已收下' : m.state === 'returned' ? '被退还了' : '还没收下'}）`;
@@ -229,7 +264,7 @@ const fill = (template, values) => Object.entries(values).reduce((s, [k, v]) => 
  * members: [{name, persona, card, voice, language}] (card: the tavern character card text, when there is one)
  * story: [{name, text}] recent story messages, oldest first.
  */
-export function buildChatRequest({preset, thread, members, story = [], user = '我', userPersona = '', voiceFormat, lore = '', memory = '', earlier = ''}) {
+export function buildChatRequest({preset, thread, members, story = [], user = '我', userPersona = '', voiceFormat, lore = '', memory = '', earlier = '', images = false, stickers = []}) {
   const group = thread.type === 'group';
   const partner = group ? thread.name : members[0]?.name || thread.name;
   const speakers = members.filter(m => m.voice);
@@ -254,8 +289,9 @@ export function buildChatRequest({preset, thread, members, story = [], user = '�
       `只输出新消息，每条消息单独一行，写成「名字：消息内容」。名字只能是：${names}。`,
       `不要写${user}的消息，不要写时间、编号、引号或任何解释。`,
       speakers.length ? `语音消息的整行写成「名字：${voiceFormat}」，标签里的角色填同一个名字；标签里的原文（{文本}）是念出来的话，用这个人的语音语言写（${speakers.map(m => `${m.name}：${languageName(m.language || 'zh')}`).join('，')}），引号里的{译文}写中文。` : '',
-      `需要时也可以像真人一样用手机功能，每种单独一行，偶尔用，别每轮都用：「名字：[图片] 一句话描述拍的照片」「名字：[位置] 地点」「名字：[红包 ¥金额] 祝福语」「名字：[转账 ¥金额] 备注」「名字：[拍一拍]」（拍一拍${user}）；很偶尔（节日、纪念日、道歉、想对${user}好的时候）可以送${user}礼物：「名字：[礼物 物品名] 附言」。`,
+      `需要时也可以像真人一样用手机功能，每种单独一行，偶尔用，别每轮都用：「名字：[图片] 一句话描述拍的照片${images ? '｜画这张照片用的英文 danbooru tag（拍的是什么、构图、光线；拍到自己就写 1girl 或 1boy 和 selfie）' : ''}」「名字：[位置] 地点」「名字：[红包 ¥金额] 祝福语」「名字：[转账 ¥金额] 备注」「名字：[拍一拍]」（拍一拍${user}）；很偶尔（节日、纪念日、道歉、想对${user}好的时候）可以送${user}礼物：「名字：[礼物 物品名] 附言」。`,
       `${user}发来红包或转账时，收下红包单独写一行「名字：[领取红包]」，收下转账写「名字：[收款]」，退还转账写「名字：[退还]」；${user}送来礼物时，收下写「名字：[收下礼物]」，不收写「名字：[退还礼物]」；收不收按人设决定。`,
+      stickers.length ? `可以像真人一样发表情包，单独一行写成「名字：[表情包] 表情包的名字」，合适的时候用，别每条都发；名字只能从这些里选：${stickers.slice(-80).map(s => s.name ?? s).join('、')}。` : '',
       dialing ? `很偶尔可以直接给${user}打语音电话：这一轮最后单独一行写成「名字：[打电话] 为什么打」，大多数回复都不要打。` : '',
       posting ? `很偶尔可以顺手发一条朋友圈，单独一行写成「名字：[朋友圈] 动态内容」；这是发给所有朋友看的动态，不是发给${user}的消息，大多数回复都不要发。` : ''].filter(Boolean).join('\n')
   ].filter(Boolean).join('\n\n');
@@ -270,13 +306,13 @@ export function buildChatRequest({preset, thread, members, story = [], user = '�
 
 const NAME_LINE = /^\s*(?:\*\*)?[[【]?([^\]】:：\n]{1,40}?)[\]】]?(?:\*\*)?\s*[:：]\s*(.*)$/;
 const unquote = s => s.trim().replace(/^[「“"『](.*)[」”"』]$/s, '$1').trim();
-const SPECIAL = /^\s*[[【]\s*(收下礼物|退还礼物|礼物|送礼|图片|照片|位置|定位|红包|转账|拍一拍|领取红包|领取|收下|收款|退还|退回|朋友圈|发朋友圈|动态|打电话|语音通话|来电)\s*([^\]】]*)[\]】]\s*(.*)$/;
+const SPECIAL = /^\s*[[【]\s*(表情包|表情|收下礼物|退还礼物|礼物|送礼|图片|照片|位置|定位|红包|转账|拍一拍|领取红包|领取|收下|收款|退还|退回|朋友圈|发朋友圈|动态|打电话|语音通话|来电)\s*([^\]】]*)[\]】]\s*(.*)$/;
 const LUCKY = ['6.66', '8.88', '5.20', '13.14', '16.80', '1.88'];
 /**
  * A phone-feature line (「[红包 ¥8.88] 祝福」 and the like) as a message; {kind:'claim', action} for taking or returning
  * the user's red packet or transfer. null when the line is ordinary text.
  */
-function special(from, content, {names, user}) {
+function special(from, content, {names, user, stickers = []}) {
   const m = content.match(SPECIAL);
   if (!m) return null;
   const [, what, arg, rest] = m, text = unquote(rest || '').replace(/<[^>]+>/g, '');
@@ -285,7 +321,14 @@ function special(from, content, {names, user}) {
     case '朋友圈': case '发朋友圈': case '动态': { const said = (text || arg.trim()).slice(0, 2000); return said ? {from, kind: 'moment', text: said} : null; }
     // A voice call placed from the chat: the phone rings after this reply.
     case '打电话': case '语音通话': case '来电': return {from, kind: 'call', reason: (text || arg.trim()).slice(0, 200)};
-    case '图片': case '照片': return text || arg.trim() ? {from, kind: 'photo', text: (text || arg.trim()).slice(0, 500)} : null;
+    case '图片': case '照片': {
+      // 「描述｜英文 tag」: the tags draw it when a drawing engine is set up (Chinese words in them are left out).
+      const [said, ...tags] = (text || arg.trim()).split(/[|｜]/);
+      const imageTags = tags.join(',').replace(/[一-鿿]+/g, ' ').split(/[,，]/).map(t => t.replace(/\s+/g, ' ').trim()).filter(Boolean).join(', ').slice(0, 600);
+      return said.trim() ? {from, kind: 'photo', text: said.trim().slice(0, 500), ...(imageTags ? {imageTags} : {})} : null;
+    }
+    // A sticker of the user's collection; a name it does not have stays words.
+    case '表情包': case '表情': { const said = arg.trim() || text, s = findSticker(stickers, said); return s ? {from, kind: 'sticker', text: s.name, url: s.url} : said ? {from, kind: 'text', text: `[${said.slice(0, 20)}]`} : null; }
     case '位置': case '定位': { const place = arg.trim() || text; return place ? {from, kind: 'location', text: place.slice(0, 100)} : null; }
     case '红包': return {from, kind: 'redpacket', amount: money(arg) || LUCKY[[...from + text].length % LUCKY.length], text: text.slice(0, 40) || DEFAULT_BLESSING, state: 'sent'};
     case '转账': { const amount = money(arg); return amount ? {from, kind: 'transfer', amount, text: text.slice(0, 40), state: 'sent'} : null; }
@@ -303,7 +346,7 @@ function special(from, content, {names, user}) {
  * Turns the model's reply into chat messages. Lines look like 「名字：内容」; a voice line holds a voice tag
  * in `voiceFormat`. Voice from someone without a voice becomes a text message with the translation.
  */
-export function parseChatReply(reply, {members, user = '我', voiceFormat, voiceNames = []}) {
+export function parseChatReply(reply, {members, user = '我', voiceFormat, voiceNames = [], stickers = []}) {
   const names = members.map(m => m.name), out = [];
   const body = String(reply || '').replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '').replace(/```[a-z]*\n?|```/g, '');
   for (const raw of body.split(/\r?\n/)) {
@@ -315,7 +358,7 @@ export function parseChatReply(reply, {members, user = '我', voiceFormat, voice
     else if (names.length === 1) from = names[0];
     else if (out.length) from = out.at(-1).from;
     if (!from || !content.trim()) continue;
-    const feature = special(from, content, {names, user});
+    const feature = special(from, content, {names, user, stickers});
     if (feature) { out.push(feature); if (out.length >= 12) break; continue; }
     const voice = voiceFormat ? parseDialogue(content, voiceFormat)[0] : null;
     if (voice) {
@@ -343,6 +386,7 @@ export function plainStory(textValue) {
   return String(textValue || '')
     .replace(/```[\s\S]*?(?:```|$)|<(style|script)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)|<!--[\s\S]*?(?:-->|$)/gi, ' ')
     .replace(/<tts\b[^>]*>[\s\S]*?<\/tts\s*>/gi, '')
+    .replace(/<(sfx|ambience)\b[^>]*>[^<>]*<\/\1\s*>/gi, '')
     .replace(/<img\b[^>]*>[^<]*<\/img\s*>|<img\b[^>]*>/gi, '')
     .replace(/<[^>]+>/g, '')
     .replace(/\s+/g, ' ')

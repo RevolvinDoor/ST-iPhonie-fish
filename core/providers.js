@@ -177,13 +177,26 @@ export class Providers{
   try{this.onSpend?.(request.engine);}catch{}
   if(request.engine==='mimo')return decodeMimo(response,request);
   if(request.engine==='mini')return decodeMini(response,request,this.fetcher,signal);if(response.headers.get('Content-Type')?.includes('json'))throw Error(names[request.engine]+' 未返回音频');return audioBlob(await limitedBytes(response),request);}
+ /** ElevenLabs 音效 (text to sound effects): an English description to an MP3. seconds 0: ElevenLabs picks; loop: an ambience that loops seamlessly. */
+ async soundEffect({text,seconds=0,loop=false},signal=new AbortController().signal){
+  const body={text:String(text||'').slice(0,450),model_id:'eleven_text_to_sound_v2',prompt_influence:.4,...(seconds?{duration_seconds:Math.min(30,Math.max(.5,Number(seconds)))}:{}),...(loop?{loop:true}:{})};
+  if(!body.text.trim())throw Error('音效描述是空的');
+  const url='https://api.elevenlabs.io/v1/sound-generation?output_format=mp3_44100_128',send=()=>this.fetch(url,{method:'POST',headers:{...this.headers('eleven'),'Content-Type':'application/json'},body:JSON.stringify(body)},signal);
+  let response=await send();const count=this.keyPool('eleven')?.count||0;
+  for(let tried=1;!response.ok&&count>1&&tried<count&&KEY_SWITCH.has(response.status);tried++){if(!this.nextKey('eleven'))break;await response.body?.cancel?.().catch(()=>{});response=await send();}
+  if(!response.ok)throw await httpError('eleven',response,'音效生成失败',[this.currentKey('eleven')]);
+  try{this.onSpend?.('eleven');}catch{}
+  const bytes=await limitedBytes(response);if(!bytes.length)throw Error('ElevenLabs 没有返回声音');
+  return new Blob([bytes],{type:'audio/mpeg'});}
  post(request,body,signal){return this.fetch(request.url,{method:'POST',headers:{...this.headers(request.engine),'Content-Type':'application/json'},body:JSON.stringify(body)},signal);}
+ /** What a voice list says about a voice besides its name (description, tags, gender and age, languages), for picking one. */
+ static voiceInfo(engine,v){const list=x=>Array.isArray(x)?x.filter(y=>typeof y==='string'):[];const parts=engine==='fish'?[v.description,list(v.tags).join(' '),list(v.languages).join('/')]:engine==='mini'?[Array.isArray(v.description)?list(v.description).join('；'):v.description]:[Object.values(v.labels&&typeof v.labels==='object'?v.labels:{}).filter(x=>typeof x==='string').join(' '),v.description];return parts.filter(x=>typeof x==='string'&&x.trim()).map(x=>x.trim().replace(/\s+/g,' ')).join(' · ').slice(0,240);}
  async voices(engine,c,{search='',page=0,token=''}={}){
   if(engine==='fish'&&P.fishOpenAI(c))throw Error('这个中转（OpenAI 格式）没有音色列表：在角色的「音色」里直接填 Fish 的音色 ID（fish.audio 网站上音色页面地址里那串字母数字）');
   if(engine==='mimo'){const mode=P.mimoMode(c.model),q=search.trim().toLowerCase();const all=mode==='preset'?P.vocab.MIMO_VOICES.map(([id,name])=>({id,name})):mode==='clone'?c.params.samples.filter(x=>String(x.name).trim()).map(x=>({id:String(x.name).trim(),name:String(x.name).trim()+' · 克隆样本'})):[];
    return {voices:q?all.filter(v=>v.name.toLowerCase().includes(q)):all,more:false,token:'',note:mode==='design'?'音色设计模型没有音色列表：在「音色」一栏写音色描述':mode==='clone'?'克隆样本在 MiMo 引擎里上传':'MiMo 内置音色'};}
   const headers=this.headers(engine);let url,init={headers};if(engine==='fish'){url=new URL(P.fishBase(c)+'/model');url.searchParams.set('page_size','50');url.searchParams.set('page_number',String(page+1));if(search)url.searchParams.set('title',search);}else if(engine==='mini'){url=miniBase(c)+'/v1/get_voice';init={method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({voice_type:'all'})};}else{url=new URL('https://api.elevenlabs.io/v2/voices');url.searchParams.set('page_size','100');if(search)url.searchParams.set('search',search);if(token)url.searchParams.set('next_page_token',token);}
- const response=await this.fetch(String(url),init);if(!response.ok)throw await httpError(engine,response,'音色读取失败',[this.currentKey(engine)],viaRelay(engine,String(url)));const data=await response.json();if(engine==='mini')checkMini(data);const source=engine==='fish'?data.items:engine==='mini'?[...(data.system_voice||[]),...(data.voice_cloning||[]),...(data.voice_generation||[])]:data.voices;if(!Array.isArray(source))throw Error('音色列表格式不符');return {voices:source.map(v=>({id:v._id||v.voice_id,name:v.title||v.voice_name||v.name||v.voice_id})).filter(v=>typeof v.id==='string'),more:engine==='fish'?source.length===50:!!data.has_more,token:data.next_page_token||'',note:engine==='fish'?'已读取公开音色；此结果不能确认密钥有效':'音色列表已读取'};}
+ const response=await this.fetch(String(url),init);if(!response.ok)throw await httpError(engine,response,'音色读取失败',[this.currentKey(engine)],viaRelay(engine,String(url)));const data=await response.json();if(engine==='mini')checkMini(data);const source=engine==='fish'?data.items:engine==='mini'?[...(data.system_voice||[]),...(data.voice_cloning||[]),...(data.voice_generation||[])]:data.voices;if(!Array.isArray(source))throw Error('音色列表格式不符');return {voices:source.map(v=>({id:v._id||v.voice_id,name:v.title||v.voice_name||v.name||v.voice_id,info:Providers.voiceInfo(engine,v),likes:Number(v.like_count)||0})).filter(v=>typeof v.id==='string'),more:engine==='fish'?source.length===50:!!data.has_more,token:data.next_page_token||'',note:engine==='fish'?'已读取公开音色；此结果不能确认密钥有效':'音色列表已读取'};}
  /**
   * What is left on the account. ElevenLabs: {kind:'characters', used, limit, left, resetAt, tier, status} from
   * /v1/user/subscription (credits of the current period). Fish: {kind:'credit', credit, free} from /wallet/self/api-credit.
