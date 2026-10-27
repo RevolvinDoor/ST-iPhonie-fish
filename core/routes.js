@@ -1,68 +1,25 @@
-import { parseSpeakerAndForm, normalizeSpeakerName } from './voice-library.js';
-
-const engines = ['fish', 'mini', 'eleven', 'mimo'];
-
-export function normalizeRoute(value) {
-  const route = structuredClone(value);
-  route.bindings = Object.fromEntries(engines.filter(e => value.bindings?.[e]).map(e => [e, { voice: String(value.bindings[e].voice || ''), model: String(value.bindings[e].model || '') }]));
-  if (engines.includes(route.engine)) {
-    route.voice = String(route.voice ?? route.bindings[route.engine]?.voice ?? '');
-    route.model = String(route.model ?? route.bindings[route.engine]?.model ?? '');
-    route.bindings[route.engine] = { voice: route.voice, model: route.model };
-  }
-  route.forms = {};
-  if (value.forms && typeof value.forms === 'object' && !Array.isArray(value.forms)) {
-    for (const [rawFormName, fData] of Object.entries(value.forms)) {
-      const fName = String(rawFormName || '').trim();
-      if (!fName || typeof fData !== 'object' || !fData) continue;
-      route.forms[fName] = {
-        voice: String(fData.voice || ''),
-        model: String(fData.model || '')
-      };
-    }
-  }
-  return route;
-}
-
-export function resolveVoiceRoute(routes, rawSpeaker, defaultVoice = '') {
-  const raw = String(rawSpeaker || '').trim();
-  if (!raw) return null;
-  const { baseSpeaker, form } = parseSpeakerAndForm(raw);
-  const canonRaw = normalizeSpeakerName(raw);
-  const canonBase = normalizeSpeakerName(baseSpeaker);
-  let route = routes.find(r => normalizeSpeakerName(r.name) === canonRaw) || (canonBase ? routes.find(r => normalizeSpeakerName(r.name) === canonBase) : null);
-  if (route) {
-    const effective = structuredClone(route);
-    if (form && effective.forms && typeof effective.forms === 'object') {
-      const formKey = Object.keys(effective.forms).find(k => normalizeSpeakerName(k) === normalizeSpeakerName(form));
-      if (formKey && effective.forms[formKey]?.voice?.trim()) {
-        effective.voice = effective.forms[formKey].voice.trim();
-        if (effective.forms[formKey].model?.trim()) effective.model = effective.forms[formKey].model.trim();
-        return { route: effective, matched: 'form', form: formKey };
-      }
-    }
-    return { route: effective, matched: route.name === raw ? 'exact' : 'base' };
-  }
-  if (defaultVoice && defaultVoice.trim()) {
-    return { route: { id: 'default-voice', name: raw, engine: 'fish', voice: defaultVoice.trim(), model: '' }, matched: 'default' };
-  }
-  return null;
-}
-
-export function switchRouteEngine(value, engine) {
-  if (!engines.includes(engine)) throw Error('引擎无效');
-  const route = normalizeRoute(value);
-  if (engine === route.engine) return route;
-  route.engine = engine;
-  route.voice = route.bindings[engine]?.voice || '';
-  route.model = route.bindings[engine]?.model || '';
-  return route;
-}
-
-export function removeRoute(settings, id) {
-  const next = structuredClone(settings), index = next.routes.findIndex(r => r.id === id);
-  if (index < 0) return next;
-  next.routes.splice(index, 1);
-  if (next.selected === id) next.selected = next.routes[Math.min(index, next.routes.length - 1)]?.id || '';
-  return next;
-}
+const engines=['fish','mini','eleven','mimo','doubao','custom'];
+export function routeCard(route){return String(route?.card||(Array.isArray(route?.cards)&&route.cards[0])||'').trim().slice(0,300);}
+export function routeForCard(route,cardKey=''){const key=String(cardKey||'').trim(),card=routeCard(route);if(route?.name==='旁白')return !card||card===key;if(!key)return !card;return card===key||(Array.isArray(route?.cards)&&route.cards.includes(key));}
+export function cardRoutes(routes,cardKey=''){return (routes||[]).filter(r=>routeForCard(r,cardKey));}
+export function normalizeRoute(value){const route=structuredClone(value);if(route.aliases!==undefined){const list=cleanAliases(route.aliases,route.name);if(list.length)route.aliases=list;else delete route.aliases;}const card=routeCard(route);if(card){route.card=card;route.cards=[card];}else{delete route.card;delete route.cards;}route.bindings=Object.fromEntries(engines.filter(e=>value.bindings?.[e]).map(e=>[e,{voice:String(value.bindings[e].voice||''),model:String(value.bindings[e].model||'')}]));if(engines.includes(route.engine)){route.voice=String(route.voice??route.bindings[route.engine]?.voice??'');route.model=String(route.model??route.bindings[route.engine]?.model??'');route.bindings[route.engine]={voice:route.voice,model:route.model};}return route;}
+export function switchRouteEngine(value,engine){if(!engines.includes(engine))throw Error('引擎无效');const route=normalizeRoute(value);if(engine===route.engine)return route;route.engine=engine;route.voice=route.bindings[engine]?.voice||'';route.model=route.bindings[engine]?.model||'';return route;}
+export function removeRoute(settings,id){const next=structuredClone(settings),index=next.routes.findIndex(r=>r.id===id);if(index<0)return next;next.routes.splice(index,1);if(next.selected===id)next.selected=next.routes[Math.min(index,next.routes.length-1)]?.id||'';return next;}
+// ---------- 别名 ----------
+// The story calls a role by other names too (夏尔 / 夏尔·凡多姆海恩, a surname alone…): they are one role, one voice.
+const SEP=/[·・•‧．.\s]+/;
+/** A role's other names: typed with commas (or 、 ; and new lines) or as a list; not its own name, each once. */
+export function cleanAliases(value,name=''){const list=(Array.isArray(value)?value:String(value??'').split(/[,，、;；\n]+/)).map(x=>String(x??'').trim().slice(0,40)).filter(Boolean);return [...new Set(list)].filter(x=>x!==String(name||'').trim()).slice(0,20);}
+/**
+ * The role a name in the story means: one named so, else one with it as an 别名, else — for a full name written with a
+ * separator (夏尔·凡多姆海恩) — the one role named as one of its parts, or whose full name has it as a part. Else the name.
+ */
+export function roleName(routes,name,cardKey){const scoped=cardKey===undefined?routes:cardRoutes(routes,cardKey);const n=String(name??'').trim(),list=(scoped||[]).filter(r=>typeof r?.name==='string'&&r.name.trim());if(!n||list.some(r=>r.name===n))return n;
+ const alias=list.find(r=>Array.isArray(r.aliases)&&r.aliases.includes(n));if(alias)return alias.name;
+ const parts=s=>s.split(SEP).filter(p=>p.length>=2),mine=parts(n);
+ const hits=list.filter(r=>{const theirs=parts(r.name);return mine.length>1&&mine.includes(r.name)||theirs.length>1&&theirs.includes(n);});
+ return hits.length===1?hits[0].name:n;}
+/** The role (route) a name in the story means, or undefined. */
+export function findRoute(routes,name,cardKey){const scoped=cardKey===undefined?routes:cardRoutes(routes,cardKey);const n=roleName(scoped,name);return (scoped||[]).find(r=>r.name===n);}
+/** The lines of a reply with their speakers as roles: the 别名 a line was written with becomes the role's name. */
+export function withRoles(routes,lines,cardKey){const scoped=cardKey===undefined?routes:cardRoutes(routes,cardKey);return lines.map(l=>{if(!l.role)return l;const role=roleName(scoped,l.role);return role===l.role?l:{...l,role,said:l.role};});}

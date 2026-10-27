@@ -6,6 +6,10 @@
 //   【热搜】话题                     a trending topic (only when asking for new posts)
 //   【帖子】作者｜标题｜正文          a new post; 作者 is a character's name or a stranger's screen name
 //   【回复】作者：内容                a reply to the post above; 「作者 回复 某人：内容」 answers someone
+//   【网名】真名｜网名                 a screen name made up for a character who had none (kept from then on)
+// Everyone is on the board by a screen name (网名): the user's and the characters' are given (or made up once) and the
+// model writes only those; the answer is read back to the real names, which is how posts are stored.
+import {promptText} from './prompt-rules.js';
 import {isPlaceholderRole} from './protocol.js';
 
 export const FORUM_LIMITS = Object.freeze({posts: 200, replies: 80, perRefresh: 5, hot: 8, title: 60, text: 2000, reply: 500});
@@ -15,43 +19,40 @@ const who = (name, user) => name === 'me' ? user : name;
 const clip = (value, max) => String(value ?? '').slice(0, max);
 const person = value => clip(value, 30).replace(/[|｜]/g, '').trim();
 
-/** A post as the model reads it: author, title, text and the replies under it. */
-export function postLines(post, user, max = 30) {
-  const lines = [`${who(post.author, user)}｜${post.title || '（无标题）'}｜${post.text}`];
-  for (const r of (post.replies || []).slice(-max)) lines.push(`  ${who(r.from, user)}${r.to ? ' 回复 ' + who(r.to, user) : ''}：${r.text}`);
+/** A post as the model reads it: author, title, text and the replies under it. label: the name shown for someone. */
+export function postLines(post, user, max = 30, label = name => who(name, user)) {
+  const lines = [`${label(post.author)}｜${post.title || '（无标题）'}｜${post.text}`];
+  for (const r of (post.replies || []).slice(-max)) lines.push(`  ${label(r.from)}${r.to ? ' 回复 ' + label(r.to) : ''}：${r.text}`);
   return lines.join('\n');
 }
+/** How someone shows on the board: the user's 网名 for 'me', a character's 网名, or the name itself. */
+export const screenName = (handles = {}, user = '我') => name => name === 'me' ? handles.me || user : handles[name] || name;
 
+/** Bounded public feed for phone replies; callers apply the chat's card partition before passing posts. */
+export function forumContext(posts, user = '我', handles = {}) {
+  const label = screenName(handles, user);
+  return (Array.isArray(posts) ? posts : []).slice(0, 12).map(p => postLines({...p, title: clip(p.title, 60), text: clip(p.text, 900), replies: (p.replies || []).slice(-6).map(r => ({...r, text: clip(r.text, 300)}))}, user, 6, label)).join('\n\n').slice(0, 6000);
+}
 /**
  * The request for 论坛, with the chat preset's rules used in 论坛. mode 'posts': new posts and the 热搜;
  * 'react': replies to the user's new post; 'reply': answers to the user's reply. people: [{name, persona, card}].
  */
-export function buildForumRequest({preset, mode = 'posts', people, story = [], user = '我', userPersona = '', recent = [], hot = [], post = null, reply = null, lore = '', earlier = ''}) {
+
+export function buildForumRequest({prompts = {}, preset, mode = 'posts', people, story = [], user = '我', userPersona = '', recent = [], hot = [], post = null, reply = null, lore = '', earlier = '', handles = {}}) {
+  const label = screenName(handles, user), missing = people.filter(p => !handles[p.name]).map(p => p.name);
   const rules = preset.entries.filter(e => e.enabled && e.text.trim() && (e.use || []).includes('forum')).map(e => fill(e.text, {'用户': user}));
-  const system = [
-    rules.join('\n\n'),
-    people.length ? `【论坛里的角色】（他们在论坛上用自己的名字）\n${people.map(p => `- ${p.name}：${(p.persona || p.card || '').trim() || '（没有资料，按剧情里的表现来）'}`).join('\n')}` : '',
-    lore.trim() ? `【世界书】（这些人物和这个世界的设定：人设、口音、方言、说话方式都按这里来）\n${lore.trim()}` : '',
-    userPersona.trim() ? `【${user}】\n${userPersona.trim()}` : '',
-    earlier.trim() ? `【更早的剧情】（记忆插件整理的长期剧情，只作背景参考）\n${earlier.trim()}` : '',
-    story.length ? `【最近的剧情】（只作背景参考）\n${story.map(s => `${s.name}：${s.text}`).join('\n')}` : '',
-    mode === 'posts' && hot.length ? `【之前的热搜】（可以延续，也可以换新的）\n${hot.join('\n')}` : '',
-    mode === 'posts' && recent.length ? `【最近的帖子】（不要重复这些内容）\n${recent.map(p => `${who(p.author, user)}｜${p.title}`).join('\n')}` : '',
-    ['【输出格式】',
-      '每一项单独一行，只能用下面这几种写法，不要写别的文字、编号或解释：',
-      mode === 'posts' ? '「【热搜】话题」现在论坛上的热搜，一个话题一行；' : '',
-      mode === 'posts' ? '「【帖子】作者｜标题｜正文」发一条新帖子，作者写角色的名字或者路人的网名；' : '',
-      '「【回复】作者：内容」回复上面的帖子，回复某人时写「【回复】作者 回复 某人：内容」。',
-      `路人的网名要像真的网友（不要叫「路人甲」），同一个路人前后用同一个网名。不要替${user}发帖或回复。`].filter(Boolean).join('\n')
-  ].filter(Boolean).join('\n\n');
-  let ask;
-  if (mode === 'posts') ask = `论坛刷新了：先写 3 到 6 个热搜话题，再发 1 到 ${preset.posts + 1} 条新帖子，有的是角色发的，有的是路人发的。每条帖子下面跟着几条回复，角色和路人都可以回。`;
-  else if (mode === 'react') ask = `【${user}刚发的帖子】\n${postLines(post, user)}\n\n大家看到了这个帖子：写出路人和角色的回复（一般三到八条，按话题热不热闹来）。只写回复。`;
-  else ask = `【这个帖子】\n${postLines(post, user)}\n\n${user}刚回复：「${reply.text}」${reply.to ? `（回复 ${who(reply.to, user)}）` : ''}\n被回复的人接着回${user}，别的人也可以插话。只写新的回复。`;
+  const now = {'刷新': mode === 'posts', '回应': mode === 'react'};
+  const system = promptText(prompts, 'forum', 'system', {...now, '预设规则': rules.join('\n\n'), '用户': user,
+    '论坛里的角色': people.map(p => `- ${handles[p.name] ? `网名「${handles[p.name]}」，其实是${p.name}` : p.name}：${(p.persona || p.card || '').trim() || '（没有资料，按剧情里的表现来）'}`).join('\n'),
+    '世界书': lore.trim(), '用户设定': userPersona.trim(), '更早的剧情': earlier.trim(), '最近的剧情': story.map(s => `${s.name}：${s.text}`).join('\n'),
+    '热搜': mode === 'posts' ? hot.join('\n') : '', '最近的帖子': mode === 'posts' ? recent.map(p => `${label(p.author)}｜${p.title}`).join('\n') : '',
+    '我的网名': label('me'), '没网名的人': missing.join('、')});
+  const ask = promptText(prompts, 'forum', 'ask', {...now, '用户': user, '帖子数': preset.posts + 1, '我的网名': label('me'),
+    '帖子': mode === 'posts' ? '' : postLines(post, user, 30, label), '回复': mode === 'reply' ? reply.text : '', '回复谁': mode === 'reply' && reply.to ? label(reply.to) : ''});
   return [{role: 'system', content: system}, {role: 'user', content: ask}];
 }
 
-const LINE = /^\s*(?:[-*•]\s*)?[【\[]\s*(热搜|帖子|回复|评论)\s*[】\]]\s*(.*)$/;
+const LINE = /^\s*(?:[-*•]\s*)?[【\[]\s*(热搜|帖子|回复|评论|网名)\s*[】\]]\s*(.*)$/;
 const SAID = /^([^:：\n]{1,30}?)\s*(?:回复\s*([^:：\n]{1,30}?))?\s*[:：]\s*(.+)$/;
 const clean = s => String(s).replace(/<[^>]+>/g, '').trim().replace(/^[「“"](.*)[」”"]$/s, '$1').trim();
 
@@ -59,17 +60,23 @@ const clean = s => String(s).replace(/<[^>]+>/g, '').trim().replace(/^[「“"](
  * The model's answer as {hot: [话题], posts: [{author, title, text, replies}], replies}. Authors are characters or
  * strangers; nobody speaks for the user. Replies outside a post belong to the post being replied to.
  */
-export function parseForum(reply, {user = '我', mode = 'posts'} = {}) {
+export function parseForum(reply, {user = '我', mode = 'posts', handles = {}} = {}) {
   const body = String(reply || '').replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '').replace(/```[a-z]*\n?|```/g, '');
-  const isUser = name => !name || name === user || name === '我' || isPlaceholderRole(name);
-  const target = name => { const n = person(name); return !n ? '' : n === user || n === '我' ? 'me' : n; };
-  const out = {hot: [], posts: [], replies: []};
+  // Screen names back to who they are ('me' for the user's).
+  const back = new Map(Object.entries(handles).map(([name, handle]) => [handle, name]));
+  const real = name => back.get(name) || name;
+  const isUser = name => !name || name === user || name === '我' || real(name) === 'me' || isPlaceholderRole(name);
+  const target = name => { const n = real(person(name)); return !n ? '' : n === user || n === '我' ? 'me' : n; };
+  const out = {hot: [], posts: [], replies: [], names: {}};
   let post = null;
   for (const raw of body.split(/\r?\n/)) {
     const m = raw.match(LINE);
     if (!m) continue;
     const [, kind, rest] = m;
-    if (kind === '热搜') {
+    if (kind === '网名') {
+      const [name, handle] = rest.split(/[|｜]/).map(s => person(clean(s)));
+      if (name && handle && handle !== name && !isUser(name) && !back.has(handle)) { out.names[name] = handle; back.set(handle, name); }
+    } else if (kind === '热搜') {
       const topic = clean(rest).replace(/^#|#$/g, '').trim().slice(0, 40);
       if (mode === 'posts' && topic && out.hot.length < FORUM_LIMITS.hot && !out.hot.includes(topic)) out.hot.push(topic);
     } else if (kind === '帖子') {
@@ -79,12 +86,12 @@ export function parseForum(reply, {user = '我', mode = 'posts'} = {}) {
       // 「作者：正文」 without the bars: no title.
       if (parts.length < 2) { const s = rest.match(SAID); if (!s) continue; parts = [s[1], '', s[3]]; }
       if (parts.length === 2) parts = [parts[0], '', parts[1]];
-      const author = person(parts[0].replace(/[:：]$/, '')), title = clean(parts[1]).slice(0, FORUM_LIMITS.title), text = clean(parts.slice(2).join('｜')).slice(0, FORUM_LIMITS.text);
+      const author = real(person(parts[0].replace(/[:：]$/, ''))), title = clean(parts[1]).slice(0, FORUM_LIMITS.title), text = clean(parts.slice(2).join('｜')).slice(0, FORUM_LIMITS.text);
       if (isUser(author) || !text) continue;
       post = {author, title, text, replies: []};
       out.posts.push(post);
     } else {
-      const s = rest.match(SAID), from = s && person(s[1]);
+      const s = rest.match(SAID), from = s && real(person(s[1]));
       if (!from || isUser(from)) continue;
       const said = clean(s[3]).slice(0, FORUM_LIMITS.reply), list = (post || out).replies;
       if (said && list.length < 20) list.push({from, to: target(s[2]), text: said});

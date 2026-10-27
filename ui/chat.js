@@ -1,14 +1,21 @@
+import {currentDm, chatWindows, currentWindow, groupKey} from '../core/chats.js';
+import {swipeRow, mountSwipeList} from './swipe-list.js';
 import {createView, esc, btn, field, input, textArea, toggle, heading, groupTitle, avatar, avatarPicture, empty, help, copyText} from './common.js';
+import {songOf} from '../core/music.js';
 import {icon} from './icons.js';
+import {fly} from './carry.js';
 import {openImageViewer} from '../image-viewer.js';
-import {saveFile, downloadAction} from '../download.js';
+import {editTags} from '../host-ask.js';
+import {saveFile, downloadAction, shareAction, shareFile, canShareFiles} from '../download.js';
 import {momentsPanel, momentsNew, momentsSeen} from './moments.js';
 import {PROFILE_STATUS, BUBBLES, FRAMES, BACKGROUNDS, parseStickers} from '../core/chat.js';
 import {callSummary} from '../core/call.js';
 import {pendant} from './pendants.js';
 import {memorySheet} from './chat-memory.js';
+import {pictureInputs, photoTags, photoCast} from '../core/draw.js';
 import {chatScene, sceneArt, sceneDark, syncMotion} from './chat-scenes.js';
 import {PREMIUM, yuan} from '../core/wallet.js';
+import {fileTool, fileBody, showFile, filesToMessages} from './chat-files.js';
 
 // Chat app, QQ style: 消息 (conversations, with search, 置顶 and 免打扰), 联系人 (特别关心, friends, groups, profile cards)
 // and 动态 (朋友圈, ui/moments.js). Tapping your own avatar opens 我: name, status, signature and 个性装扮 (chat bubble,
@@ -35,7 +42,7 @@ const patText = m => `${you(m.from)} 拍了拍 ${you(m.target)}`;
 const noticeText = m => you(m.from) + String(m.text).replaceAll('{对方}', you(m.target));
 // Messages drawn as a centred line instead of a bubble.
 const LINE_KINDS = ['system', 'pat', 'notice', 'recall'];
-function preview(m) {
+export function preview(m) {
   if (!m) return '还没有消息';
   switch (m.kind) {
     case 'voice': return `[语音] ${seconds(m)}″`;
@@ -45,6 +52,8 @@ function preview(m) {
     case 'transfer': return '[转账] ¥' + m.amount;
     case 'gift': return '[礼物] ' + (m.gift?.name || '');
     case 'location': return '[位置] ' + m.text;
+    case 'song': return '[音乐] ' + (m.song?.title || '');
+    case 'file': return '[文件] ' + m.name;
     case 'dice': return '[骰子]';
     case 'call': return `[${callSummary(m)}]`;
     case 'pat': return patText(m);
@@ -65,8 +74,13 @@ const KAOMOJI = ['(｡•̀ᴗ-)✧', '(╥﹏╥)', '(๑•̀ㅂ•́)و✧', 
 
 export function chatApp(ctx) {
   const {api} = ctx, v = createView(ctx, 'chat');
+  // 备注: what the user calls a contact, shown in the chat app only (the models keep using the real name).
+  const remarks = () => api.getState().chat.remarks || {};
+  const shown = name => name === 'me' ? name : remarks()[name] || name;
+  const you = who => who === 'me' ? '你' : shown(who);
   // mode: list (the tabs) · thread · profile (a contact's card) · me (the user's card and 个性装扮) · contact-edit
-  let mode = 'list', tab = 'msgs', search = '', searching = false, profileOf = '', threadId = null, thread = null, selecting = null, contactDraft = null, epoch = 0, stick = false;
+  // selecting: the messages picked (null when not picking); pickFor: what for, 'bring' (带进剧情) or 'delete' (多选删除).
+  let mode = 'list', tab = 'msgs', search = '', searching = false, profileOf = '', threadId = null, thread = null, selecting = null, pickFor = 'bring', contactDraft = null, epoch = 0, stick = false;
   let unreadTotal = 0, freshMoments = 0;
   let panel = null, quote = null;
   const drafts = new Map(), live = typeof api.chatReply === 'function';
@@ -75,7 +89,8 @@ export function chatApp(ctx) {
   const voiceText = () => api.getState().chat.voiceText || {mode: 'translation', auto: false};
   /** 转文字 for a voice message: the translation, the original line, or both (original first). */
   function transcriptHTML(m) {
-    const mode = voiceText().mode, original = m.text || '', translation = m.translation || '';
+    // The engine's own marks ([sigh], <whisper>…</whisper>, (laughing), <#0.5#>) are for the voice, not for reading.
+    const mode = voiceText().mode, original = String(m.text || '').replace(/\[[^\]]*\]|<[^>]*>|\((?:[a-z][a-z\s'-]*)\)/gi, '').replace(/\s{2,}/g, ' ').trim(), translation = m.translation || '';
     if (mode === 'original' || !translation) return `<span class="v-text">${esc(original)}</span>`;
     if (mode === 'both' && original && original !== translation) return `<span class="v-text both"><span class="v-orig">${esc(original)}</span><span>${esc(translation)}</span></span>`;
     return `<span class="v-text">${esc(translation)}</span>`;
@@ -103,8 +118,8 @@ export function chatApp(ctx) {
 
   const engine = name => ctx.engineOf(name);
   const groupAvatar = (members, size) => `<span class="group-av" style="--s:${size}px">${members.slice(0, 3).map(m => `<i data-engine="${engine(m)}">${esc(m.slice(0, 1))}</i>`).join('')}</span>`;
-  // A group's own picture when one was chosen ('g:' + its id), else its members' first letters.
-  const threadAvatar = (t, size = 48) => t.type === 'group' ? (avatarPicture('g:' + t.id) ? avatar(t.name, 'none', size, 'g:' + t.id) : groupAvatar(t.members, size)) : avatar(t.members[0], engine(t.members[0]), size);
+  // A group's own picture when one was chosen ('g:' + the group's first window), else its members' first letters.
+  const threadAvatar = (t, size = 48) => t.type === 'group' ? (avatarPicture('g:' + groupKey(t)) ? avatar(t.name, 'none', size, 'g:' + groupKey(t)) : groupAvatar(t.members, size)) : avatar(t.members[0], engine(t.members[0]), size);
   const pendingBring = () => api.chatPendingBring?.() || null;
   const typing = () => !!threadId && !!api.chatTyping?.(threadId);
   // A reply comes in like on a phone: its messages are stored at once (memory, unread counts and other devices see
@@ -149,6 +164,28 @@ export function chatApp(ctx) {
     }, typeTime(m, first));
   }
   const partner = () => thread.type === 'group' ? '群里' : thread.members[0];
+  /**
+   * 带进剧情: 这一次 (pick messages for the next story reply, once) or 一直带着 (the story always knows this chat: its
+   * memory and whatever is not written up yet). Both can be on; what is picked goes in word for word as well.
+   */
+  function bringSheet() {
+    const waiting = pendingBring(), who = thread.type === 'group' ? `群聊「${thread.name}」` : thread.members[0];
+    const d = sheet('带进剧情', `<div class="group">
+        <div class="setting-row"><span>这一次${help('挑几条消息，原样带进下一次正文，用一次就没了。适合刚聊完、想让正文马上接上的一段。再选一次会替换掉之前选的。')}</span>${btn('bring-pick', '选几条', 'chip-button')}</div>
+        ${toggle('story-keep', '一直带着', thread.story === true, `每次写正文都带上你和${who}的聊天（整理好的记忆，加上还没整理的消息），正文一直记得你们在手机上聊过什么。会多占一些正文的字数，只给重要的聊天打开就好。`)}
+      </div>
+      ${waiting ? `<p class="hint">${waiting.threadId === threadId ? '这段聊天' : `和${esc(waiting.name)}的聊天`}有 ${waiting.count} 条等着带进下一次正文 ${btn('bring-cancel', '取消', 'text-button')}</p>` : ''}`, {
+      'bring-pick': () => { d.close(); selecting = new Set(); pickFor = 'bring'; panel = null; render(); },
+      'bring-cancel': async () => { d.close(); await api.chatCancelBring?.(); ctx.notify('已取消，这次不带聊天进正文'); render(); }
+    });
+    d.body.querySelector('[data-field="story-keep"]')?.addEventListener('change', async e => {
+      const on = e.target.checked;
+      try { await api.updateThread(threadId, {story: on}); ctx.notify(on ? `正文会一直记得和${who}的聊天` : '这段聊天不再一直带进正文'); render(); }
+      catch (error) { e.target.checked = !on; ctx.notify(error.message, {error: true}); }
+    });
+  }
+  /** The 带进剧情 count; a choice already waiting is replaced by the new one (only one goes into the story). */
+  const pickedLabel = n => { const before = pickFor === 'bring' && pendingBring(); return `已选 ${n} 条${before ? `（会替换之前选的 ${before.count} 条）` : ''}`; };
 
   // ---------- 消息 ----------
   function convRow(t, me) {
@@ -157,22 +194,28 @@ export function chatApp(ctx) {
     const atMe = t.type === 'group' && t.unread && last && last.from !== 'me' && String(last.text || '').includes('@' + me) ? '<em class="at-me">[有人@我]</em>' : '';
     const badge = t.unread ? `<span class="badge${t.muted ? ' muted' : ''}">${t.unread > 99 ? '99+' : t.unread}</span>` : '';
     const spark = t.type === 'dm' && t.streak >= 3 ? `<span class="spark" title="聊天火花：连续 ${t.streak} 天">🔥${t.streak}</span>` : '';
-    return `<button class="conv${t.pinned ? ' pinned' : ''}" data-action="open" data-id="${esc(t.id)}" data-conv="${esc(t.id)}">${threadAvatar(t, 50)}<span class="grow"><span class="conv-top"><strong>${esc(t.name)}</strong>${t.type === 'group' ? '<span class="tag-s">群</span>' : ''}${spark}<span class="conv-time">${last ? stamp(last.at) : ''}</span></span><span class="conv-bot"><span class="pv">${atMe}${esc(who + preview(last))}</span>${t.muted ? `<span class="mute-ico" aria-label="免打扰">${icon('mute')}</span>` : ''}${badge}</span></span></button>`;
+    return `<button class="conv${t.pinned ? ' pinned' : ''}" data-action="open" data-id="${esc(t.id)}" data-conv="${esc(t.id)}">${threadAvatar(t, 50)}<span class="grow"><span class="conv-top"><strong>${esc(t.type === 'group' ? t.name : shown(t.members[0] || t.name))}</strong>${t.type === 'group' ? '<span class="tag-s">群</span>' : t.label ? `<span class="tag-s">${esc(t.label)}</span>` : ''}${spark}<span class="conv-time">${last ? stamp(last.at) : ''}</span></span><span class="conv-bot"><span class="pv">${atMe}${esc(who + preview(last))}</span>${t.muted ? `<span class="mute-ico" aria-label="免打扰">${icon('mute')}</span>` : ''}${badge}</span></span></button>`;
   }
   async function renderMessages(ticket) {
     const [threads] = await Promise.all([api.listThreads(), counts()]);
     if (v.disposed || ticket !== epoch) return;
     const q = search.trim().toLowerCase(), me = myName();
-    const shown = threads.filter(t => !q || [t.name, ...t.members, preview(t.last)].some(x => String(x || '').toLowerCase().includes(q)));
-    const people = q ? api.chatContacts().filter(c => c.name.toLowerCase().includes(q) && !threads.some(t => t.type === 'dm' && t.members[0] === c.name)) : [];
+    // A chat with someone the user deleted is put away until they are added back.
+    const away = new Set(threads.filter(t => t.type === 'dm' && t.friend?.by === 'me').map(t => t.members[0]));
+    // 聊天窗口: a contact's (or a group's) other chats stay out of the list (a search finds them too); their unread
+    // count goes on the one in use.
+    const inUse = t => currentWindow(threads, t)?.id === t.id;
+    const unreadOf = t => chatWindows(threads, t).reduce((n, x) => n + (x.unread || 0), 0);
+    const rows = threads.filter(t => !(t.type === 'dm' && t.friend?.by === 'me')).filter(t => q ? [t.name, t.label, ...t.members, preview(t.last)].some(x => String(x || '').toLowerCase().includes(q)) : inUse(t)).map(t => ({...t, unread: q ? t.unread : unreadOf(t)}));
+    const people = q ? api.chatContacts().filter(c => c.name.toLowerCase().includes(q) && !away.has(c.name) && !threads.some(t => t.type === 'dm' && t.members[0] === c.name)) : [];
     const bring = pendingBring();
     v.draw(frame(`<header class="qq-top"><button type="button" class="qq-me" data-action="me" aria-label="我的资料和个性装扮">${myAvatar(42)}<span class="qq-me-text"><strong>${esc(me)}</strong><small>${statusLine()}</small></span></button>${btn('plus-menu', icon('add'), 'round-button', 'aria-label="发起聊天、添加联系人"')}</header>
       <label class="qq-search">${icon('search')}<input data-field="chat-search" type="search" value="${esc(search)}" placeholder="搜索聊天和联系人" aria-label="搜索" autocomplete="off"></label>`
       + (bring ? `<div class="banner bring-banner">${icon('book')}<span>和${esc(bring.name)}的 ${bring.count} 条消息会带进下一次正文</span>${btn('cancel-bring', '取消', 'chip-button')}</div>` : '')
       + (live ? '' : '<div class="banner">' + icon('alert') + '<span>在酒馆里打开小手机时，联系人才会回复。</span></div>')
-      + (shown.length ? `<div class="conv-list qq-list">${shown.map(t => convRow(t, me)).join('')}</div>` : q ? '' : empty('还没有聊天', '点右上角的加号，和角色私聊，或者拉一个群。联系人来自角色 App，也可以手动添加。', 'chat'))
-      + (people.length ? groupTitle('联系人') + `<div class="group">${people.map(c => `<button class="list-row" data-action="dm-open" data-name="${esc(c.name)}">${avatar(c.name, c.engine, 40)}<span><strong>${esc(c.name)}</strong><small>发消息</small></span>${icon('next')}</button>`).join('')}</div>` : '')
-      + (q && !shown.length && !people.length ? `<p class="hint">没有找到「${esc(search)}」</p>` : '')));
+      + (rows.length ? `<div class="conv-list qq-list">${rows.map(t => convRow(t, me)).join('')}</div>` : q ? '' : empty('还没有聊天', '点右上角的加号，和角色私聊，或者拉一个群。联系人来自角色 App，也可以手动添加。', 'chat'))
+      + (people.length ? groupTitle('联系人') + `<div class="group">${people.map(c => `<button class="list-row" data-action="dm-open" data-name="${esc(c.name)}">${avatar(c.name, c.engine, 40)}<span><strong>${esc(shown(c.name))}</strong><small>发消息</small></span>${icon('next')}</button>`).join('')}</div>` : '')
+      + (q && !rows.length && !people.length ? `<p class="hint">没有找到「${esc(search)}」</p>` : '')));
     if (searching) { const box = v.root.querySelector('[data-field=chat-search]'); box?.focus({preventScroll: true}); box?.setSelectionRange?.(box.value.length, box.value.length); }
   }
 
@@ -180,12 +223,15 @@ export function chatApp(ctx) {
   async function renderContactsTab(ticket) {
     const [threads] = await Promise.all([api.listThreads(), counts()]);
     if (v.disposed || ticket !== epoch) return;
-    const contacts = api.chatContacts(), stars = starred(), groups = threads.filter(t => t.type === 'group');
+    const cut = threads.filter(t => t.type === 'dm' && t.friend?.by === 'me'), away = new Set(cut.map(t => t.members[0]));
+    const contacts = api.chatContacts().filter(c => !away.has(c.name)), stars = starred(), groups = threads.filter(t => t.type === 'group' && currentWindow(threads, t)?.id === t.id);
+    const asks = cut.reduce((n, t) => n + (t.friend.requests?.length ? 1 : 0), 0);
     const row = c => `<button class="list-row" data-action="profile" data-name="${esc(c.name)}">${avatar(c.name, c.engine, 42)}<span><strong>${esc(c.name)}</strong><small>${esc(signatureOf(c))}</small></span>${stars.includes(c.name) ? '<span class="star-mark" aria-label="特别关心">★</span>' : icon('next')}</button>`;
     const special = contacts.filter(c => stars.includes(c.name));
     v.draw(frame(heading('联系人', btn('contact-add', icon('add'), 'round-button', 'aria-label="添加联系人"'), 'Contacts')
+      + (cut.length ? `<div class="group"><button class="list-row" data-action="new-friends"><i class="friend-ico" aria-hidden="true">${icon('person')}</i><span><strong>新的朋友</strong><small>${asks ? `${asks} 个好友申请` : `删掉的好友（${cut.length}）可以在这里加回来`}</small></span>${asks ? `<b class="badge friend-badge">${asks}</b>` : icon('next')}</button></div>` : '')
       + (special.length ? groupTitle('特别关心') + `<div class="group">${special.map(row).join('')}</div>` : '')
-      + groupTitle(`好友 · ${contacts.length}`, help('角色 App 里的角色会自动出现在这里（开了「按角色卡分开」时，在别的故事里出场过的角色只在那张卡里；可以点右上角的「＋」把他们加进来）。剧情之外的人（同学、店员、网友……）也在「＋」里手动添加，写上人设就能聊。'))
+      + groupTitle(`好友 · ${contacts.length}`, help('角色 App 里的角色会自动出现在这里。开了「按角色卡分开」时，只有这张卡的角色、在这张卡的剧情里说过话或被提到的角色，以及在这张卡里加的联系人；别的角色点右上角的「＋」加进来。剧情之外的人（同学、店员、网友……）也在「＋」里手动添加，写上人设就能聊。'))
       + (contacts.length ? `<div class="group">${contacts.map(row).join('')}</div>` : '<p class="hint">还没有好友。</p>')
       + (groups.length ? groupTitle(`群聊 · ${groups.length}`) + `<div class="group">${groups.map(t => `<button class="list-row" data-action="open" data-id="${esc(t.id)}">${threadAvatar(t, 42)}<span><strong>${esc(t.name)}</strong><small>${t.members.length} 人</small></span>${icon('next')}</button>`).join('')}</div>` : '')));
   }
@@ -216,29 +262,78 @@ export function chatApp(ctx) {
     const c = api.chatContacts().find(x => x.name === profileOf) || api.chatContacts(true).find(x => x.name === profileOf);
     if (!c) { mode = 'list'; return render(); }
     const star = starred().includes(c.name), manual = c.source === 'manual' && api.getState().chat.contacts.find(x => x.name === c.name);
-    v.draw(`<div class="qq-card" data-engine="${c.engine}"><span class="qq-card-cover" aria-hidden="true"></span>${avatar(c.name, c.engine, 84)}<h2>${esc(c.name)}</h2><p>${esc(signatureOf(c))}</p>
+    v.draw(`<div class="qq-card" data-engine="${c.engine}"><span class="qq-card-cover" aria-hidden="true"></span>${avatar(c.name, c.engine, 84)}<h2>${esc(shown(c.name))}</h2>${shown(c.name) !== c.name ? `<p class="qq-card-real">昵称：${esc(c.name)}</p>` : ''}<p>${esc(signatureOf(c))}</p>
         <div class="qq-card-tags"><span class="chip">${c.source === 'role' ? '角色' : '手动联系人'}</span>${c.voice ? '<span class="chip">能发语音</span>' : ''}${star ? '<span class="chip">★ 特别关心</span>' : ''}</div></div>
       <div class="actions">${btn('profile-chat', icon('chat') + '发消息', 'primary')}${api.callDial ? btn('profile-call', icon('phone') + '打电话', 'secondary') : ''}${btn('profile-moments', icon('moments') + 'TA 的动态', 'secondary')}</div>
-      <div class="group">${btn('avatar-pick', `${icon('image')}<span><strong>换头像</strong><small>${esc(avatarState(c.name))}</small></span>`, 'list-row', `data-key="${esc(c.name)}"`)}${btn('star', `<span>${star ? '★ 取消特别关心' : '☆ 设为特别关心'}</span>`, 'list-row')}${manual ? `<button class="list-row" data-action="contact-edit" data-id="${esc(manual.id)}">${icon('edit')}<span><strong>编辑资料和人设</strong></span></button>` : ''}</div>`);
+      <div class="group">${btn('remark', `${icon('edit')}<span><strong>设置备注</strong><small>${esc(remarks()[c.name] || '只有你看得到，聊天里显示这个名字')}</small></span>`, 'list-row')}${btn('avatar-pick', `${icon('image')}<span><strong>换头像</strong><small>${esc(avatarState(c.name))}</small></span>`, 'list-row', `data-key="${esc(c.name)}"`)}${btn('star', `<span>${star ? '★ 取消特别关心' : '☆ 设为特别关心'}</span>`, 'list-row')}${manual ? `<button class="list-row" data-action="contact-edit" data-id="${esc(manual.id)}">${icon('edit')}<span><strong>编辑资料和人设</strong></span></button>` : ''}</div>
+      <div class="actions">${btn('unfriend', '删除好友', 'danger')}</div>`);
+    listeningOf(c.name).then(song => { const box = v.root.querySelector('.qq-card'); if (!song || !box || profileOf !== c.name || mode !== 'profile') return; box.insertAdjacentHTML('beforeend', `<button type="button" class="qq-listening" data-action="play-song" data-title="${esc(song.title)}" data-artist="${esc(song.artist)}">${icon('music')}<span>最近在听：${esc(song.title)}${song.artist ? ' - ' + esc(song.artist) : ''}</span></button>`); }).catch(() => {});
   }
-  /** 我: name, status, signature, and 个性装扮. */
-  function renderMe() {
-    const p = profile();
-    // The free looks, then the shop's: a bought one is put on like a free one; one not bought yet shows its price.
+  /** 新的朋友: contacts the user deleted, with what they sent since (好友申请); 添加 brings them and the chat back. */
+  async function renderFriends(ticket) {
+    const cut = (await api.listThreads()).filter(t => t.type === 'dm' && t.friend?.by === 'me');
+    if (v.disposed || ticket !== epoch) return;
+    if (!cut.length) { mode = 'list'; tab = 'contacts'; return render(); }
+    v.draw(heading('新的朋友', '', 'New Friends')
+      + `<p class="hint">删掉的好友在这里。TA 们这段时间发来的消息会变成好友申请；点「添加」就加回来，聊天记录和申请里的话都会回到聊天里。</p>`
+      + `<div class="group">${cut.map(t => { const name = t.members[0], asks = t.friend.requests || [], last = asks.at(-1); return `<div class="list-row friend-row">${avatar(name, engine(name), 42)}<span><strong>${esc(shown(name))}</strong><small>${last ? `${asks.length > 1 ? `${asks.length} 条申请 · ` : ''}「${esc(last.text)}」` : '已删除 · 还没有发来申请'}</small></span>${btn('refriend', asks.length ? '通过' : '添加', 'chip-button', `data-id="${esc(t.id)}" aria-label="把 ${esc(name)} 加回好友"`)}</div>`; }).join('')}</div>`);
+  }
+  /** 最近在听: the last song this contact shared in your private chat. */
+  async function listeningOf(name) {
+    const t = currentDm(await api.listThreads(), name);
+    if (!t) return null;
+    return (await api.getThread(t.id))?.messages.findLast(m => m.kind === 'song' && m.from === name)?.song || null;
+  }
+  /** The looks of one kind (气泡, 挂件, 背景): the free ones, then the shop's (one not bought yet shows its price). */
+  function decoChips(key, list, value) {
     const w = api.wallet();
-    const chips = (key, list, value) => `<div class="deco-row">${[...Object.entries(list).map(([k, l]) => [k, l, null]), ...Object.entries(PREMIUM[key] || {}).map(([k, [l, price]]) => [k, l, price])].map(([k, l, price]) => { const owned = price === null || w.owned.includes(key + ':' + k); return `<button type="button" class="deco${price === null ? '' : ' premium'}" data-action="${owned ? 'me-set' : 'me-buy'}" data-key="${key}" data-value="${k}" data-name="${esc(l)}" data-price="${price ?? 0}" data-${key}="${k}" aria-pressed="${value === k}"><span class="deco-sample" aria-hidden="true">${key === 'frame' ? `<span class="me-av" style="--s:36px"><span class="avatar none" style="--s:36px"></span>${pendant(k)}</span>` : key === 'background' ? sceneArt(k) : ''}</span><span>${l}</span>${price === null ? '' : `<small class="deco-price">${owned ? '已拥有' : '¥' + price}</small>`}</button>`; }).join('')}</div>`;
+    return `<div class="deco-row">${[...Object.entries(list).map(([k, l]) => [k, l, null]), ...Object.entries(PREMIUM[key] || {}).map(([k, [l, price]]) => [k, l, price])].map(([k, l, price]) => { const owned = price === null || w.owned.includes(key + ':' + k); return `<button type="button" class="deco${price === null ? '' : ' premium'}" data-action="${owned ? 'me-set' : 'me-buy'}" data-key="${key}" data-value="${k}" data-name="${esc(l)}" data-price="${price ?? 0}" data-${key}="${k}" aria-pressed="${value === k}"><span class="deco-sample" aria-hidden="true">${key === 'frame' ? `<span class="me-av" style="--s:36px"><span class="avatar none" style="--s:36px"></span>${pendant(k)}</span>` : key === 'background' ? sceneArt(k) : ''}</span><span>${l}</span>${price === null ? '' : `<small class="deco-price">${owned ? '已拥有' : '¥' + price}</small>`}</button>`; }).join('')}</div>`;
+  }
+  const DECOS = {bubble: ['聊天气泡', BUBBLES], frame: ['头像挂件', FRAMES], background: ['聊天背景', BACKGROUNDS]};
+  const decoName = key => { const p = profile(), [, list] = DECOS[key]; if (key === 'background' && p.backgroundPhoto) return '相册里的照片'; return list[p[key]] || PREMIUM[key]?.[p[key]]?.[0] || p[key]; };
+  /** 我: the card (tap the picture to change it), name and signature, and one row each for the rest. */
+  function renderMe() {
+    const p = profile(), w = api.wallet();
     v.draw(heading('我', '', 'Me')
-      + `<div class="qq-card me" data-bubble="${esc(p.bubble)}"><span class="qq-card-cover" aria-hidden="true"></span>${myAvatar(84)}<h2>${esc(myName())}</h2><p>${esc(p.signature || '还没有个性签名')}</p><div class="qq-card-tags"><span class="chip">${statusLine()}</span></div></div>`
-      + `<div class="group pad"><div class="field"><span>头像</span><div class="actions" style="margin:0">${btn('avatar-pick', icon('image') + '换头像', 'secondary', 'data-key="me"')}</div><small class="hint">${esc(avatarState('me'))}</small></div>${field('名字', input('me-name', p.name, 'text', `maxlength="40" placeholder="${esc(api.userName?.() || '我')}（跟随酒馆里的用户名）"`))}${field('个性签名', input('me-signature', p.signature, 'text', 'maxlength="80" placeholder="写一句话"'))}
-        <div class="field"><span>状态</span><div class="deco-row">${Object.entries(PROFILE_STATUS).map(([k, l]) => `<button type="button" class="status-chip" data-action="me-set" data-key="status" data-value="${k}" aria-pressed="${p.status === k}"><i class="qq-dot" data-status="${k}"></i>${l}</button>`).join('')}</div></div>
-        ${field('自定义状态', input('me-statusText', p.statusText, 'text', 'maxlength="20" placeholder="例如：摸鱼中、在听歌"'))}</div>`
+      + `<div class="qq-card me" data-bubble="${esc(p.bubble)}"><span class="qq-card-cover" aria-hidden="true"></span><button type="button" class="me-pic" data-action="avatar-pick" data-key="me" aria-label="换头像（${esc(avatarState('me'))}）">${myAvatar(84)}<span class="me-pic-edit" aria-hidden="true">${icon('image')}</span></button><h2>${esc(myName())}</h2><p>${esc(p.signature || '还没有个性签名')}</p><div class="qq-card-tags"><span class="chip">${statusLine()}</span></div></div>`
+      + `<div class="group pad">${field('名字', input('me-name', p.name, 'text', `maxlength="40" placeholder="${esc(api.userName?.() || '我')}（跟随酒馆里的用户名）"`))}${field('个性签名', input('me-signature', p.signature, 'text', 'maxlength="80" placeholder="写一句话"'))}</div>
+        <div class="group"><button class="list-row" data-action="me-status"><span><strong>状态</strong><small>${statusLine()}</small></span>${icon('next')}</button></div>`
       + groupTitle('钱包与商城')
       + `<div class="group"><button class="list-row" data-action="me-wallet">${icon('wallet')}<span><strong>钱包</strong><small>零钱 ¥${esc(yuan(w.balance))} · 明细和收到的礼物</small></span>${icon('next')}</button><button class="list-row" data-action="me-shop">${icon('shop')}<span><strong>商城</strong><small>更好看的气泡、挂件、背景，送给角色的礼物</small></span>${icon('next')}</button></div>`
       + groupTitle('个性装扮')
-      + `<div class="group pad"><div class="field"><span>聊天气泡</span>${chips('bubble', BUBBLES, p.bubble)}</div><div class="field"><span>头像挂件</span>${chips('frame', FRAMES, p.frame)}</div><div class="field"><span>聊天背景</span>${chips('background', BACKGROUNDS, p.background)}</div>
-        <div class="actions" style="margin-top:0">${btn('me-bg-photo', icon('image') + (p.backgroundPhoto ? '换一张照片当背景' : '用相册里的照片当背景'), 'secondary')}${p.backgroundPhoto ? btn('me-bg-clear', '不用照片', 'text-button') : ''}</div></div>`
+      + `<div class="group">${Object.entries(DECOS).map(([key, [label]]) => `<button class="list-row" data-action="me-deco" data-key="${key}"><span><strong>${label}</strong><small>${esc(decoName(key))}</small></span>${icon('next')}</button>`).join('')}</div>`
       + groupTitle('聊天设置')
       + `<div class="group"><button class="list-row" data-action="me-voice">${icon('book')}<span><strong>语音消息</strong><small>转文字显示什么、要不要自动转</small></span>${icon('next')}</button><button class="list-row" data-action="me-calls">${icon('phone')}<span><strong>来电</strong><small>角色会不会自己打来、响铃多久</small></span>${icon('next')}</button><button class="list-row" data-action="me-presets">${icon('edit')}<span><strong>聊天预设</strong><small>怎么回消息、朋友圈怎么发、电话里怎么说</small></span>${icon('next')}</button></div>`);
+  }
+  /** 状态: the five, and a few words of one's own. */
+  function statusSheet() {
+    const draw = () => { const p = profile(); return `<div class="deco-row">${Object.entries(PROFILE_STATUS).map(([k, l]) => `<button type="button" class="status-chip" data-action="me-set" data-key="status" data-value="${k}" aria-pressed="${p.status === k}"><i class="qq-dot" data-status="${k}"></i>${l}</button>`).join('')}</div>
+      ${field('自定义状态', input('me-statusText', p.statusText, 'text', 'maxlength="20" placeholder="例如：摸鱼中、在听歌"'))}`; };
+    const d = ctx.dialog('状态', draw());
+    d.body.addEventListener('click', e => { const b = e.target.closest('[data-action=me-set]'); if (!b) return; api.saveChatOptions({profile: {status: b.dataset.value}}); d.body.innerHTML = draw(); render(); });
+    d.body.addEventListener('change', e => { if (e.target.dataset.field !== 'me-statusText') return; try { api.saveChatOptions({profile: {statusText: e.target.value}}); render(); } catch (error) { ctx.notify(error.message, {error: true}); } });
+  }
+  /** 个性装扮 of one kind in a sheet: tap to put one on, buy one from the shop; the background can be a photo. */
+  function decoSheet(key) {
+    const [label, list] = DECOS[key];
+    const draw = () => { const p = profile(); return decoChips(key, list, p[key]) + (key === 'background' ? `<div class="actions">${btn('me-bg-photo', icon('image') + (p.backgroundPhoto ? '换一张照片当背景' : '用相册里的照片当背景'), 'secondary')}${p.backgroundPhoto ? btn('me-bg-clear', '不用照片', 'text-button') : ''}</div>` : ''); };
+    const d = ctx.dialog(label, draw());
+    d.body.addEventListener('click', async e => {
+      const b = e.target.closest('[data-action]');
+      if (!b) return;
+      const action = b.dataset.action;
+      try {
+        if (action === 'me-set') { api.saveChatOptions({profile: {[key]: b.dataset.value}}); d.body.innerHTML = draw(); render(); }
+        if (action === 'me-buy') {
+          const left = api.wallet().balance, price = Number(b.dataset.price);
+          if (!await ctx.confirm(`买下「${b.dataset.name}」？`, `¥${price}，零钱还有 ¥${yuan(left)}。买下以后一直能用。`)) return;
+          api.buyDecoration(key, b.dataset.value); api.saveChatOptions({profile: {[key]: b.dataset.value}});
+          render(); ctx.notify('买下并换上了');
+        }
+        if (action === 'me-bg-photo') { d.close(); await pickBackground(); }
+        if (action === 'me-bg-clear') { api.saveChatOptions({profile: {backgroundPhoto: ''}}); d.body.innerHTML = draw(); render(); }
+      } catch (error) { ctx.notify(error.message, {error: true}); }
+    });
   }
 
   // ---------- Thread ----------
@@ -249,6 +344,7 @@ export function chatApp(ctx) {
       case 'photo': return m.photoId
         ? `<button class="chat-photo" data-action="photo" ${mid} aria-label="查看照片"><img data-chat-photo="${esc(m.photoId)}" alt="${esc(m.text || '照片')}"></button>`
         : `<button class="chat-photo described" data-action="message" ${mid}><span class="ph-art">${icon('image')}</span><span class="ph-cap">${esc(m.text)}</span></button>${photoNote(m)}`;
+      case 'file': return fileBody(m, mid);
       // A sticker: the picture without a bubble; its name when the picture cannot be loaded.
       case 'sticker': return `<button class="chat-sticker" data-action="sticker" ${mid} aria-label="表情包：${esc(m.text)}" data-name="[${esc(m.text)}]">${m.url ? `<img src="${esc(m.url)}" alt="${esc(m.text)}" loading="lazy" referrerpolicy="no-referrer" draggable="false">` : ''}</button>`;
       case 'redpacket': {
@@ -269,13 +365,15 @@ export function chatApp(ctx) {
         const fresh = Date.now() - m.at < 1500;
         return `<button class="dice-msg${fresh ? ' rolling' : ''}" data-action="message" ${mid} data-face="${esc(m.text)}" aria-label="骰子 ${esc(m.text)} 点">${Array.from({length: 9}, (_, i) => `<i${PIPS[m.text]?.includes(i) ? ' class="on"' : ''}></i>`).join('')}</button>`;
       }
+      case 'song': return `<button class="song-card" data-action="song" ${mid} aria-label="播放 ${esc(m.song?.title || '')}"><span class="sg-disc" aria-hidden="true">${icon('music')}</span><span class="sg-text"><strong>${esc(m.song?.title || '')}</strong><small>${esc(m.song?.artist || '')}</small>${m.text ? `<em>${esc(m.text)}</em>` : ''}</span><span class="sg-play" aria-hidden="true">${icon('play', true)}</span></button>`;
       case 'call': return `<button class="call-msg${m.state === 'answered' ? '' : ' missed'}" data-action="call-log" ${mid}>${icon('phone', true)}<span>${esc(callSummary(m))}</span></button>`;
       default: return `<button class="chat-bubble" data-action="message" ${mid}>${esc(m.text)}</button>`;
     }
   }
   function lineHTML(m) {
     const mid = `data-mid="${esc(m.id)}"`;
-    if (m.kind === 'system') return `<div class="sys">${icon('book')}${esc(m.text)}</div>`;
+    // 「N 条消息会带进下一次正文」is the line under the chat while a choice waits; older versions also wrote it in as a note.
+    if (m.kind === 'system') return /^\d+ 条消息会带进下一次正文$/.test(m.text || '') ? '' : `<div class="sys">${icon('book')}${esc(m.text)}</div>`;
     if (m.kind === 'pat') return `<div class="note-line" ${mid}>${esc(patText(m))}</div>`;
     if (m.kind === 'notice') return `<div class="note-line" ${mid}>${/红包/.test(m.text) ? '<span class="pk-dot" aria-hidden="true"></span>' : ''}${esc(noticeText(m))}</div>`;
     const again = m.from === 'me' && recalled.has(m.id) ? btn('re-edit', '重新编辑', 'text-button', mid) : '';
@@ -291,7 +389,8 @@ export function chatApp(ctx) {
   }
   /** Under a contact's described photo: drawing it now, or 画出来 (it was not free, or it failed). */
   function photoNote(m) {
-    if (!m.imageTags || !api.chatDrawPhoto) return '';
+    // A photo described without tags can be drawn too: its words are turned into tags first (host-chat.js drawPhoto).
+    if (!api.chatDrawPhoto || !(m.imageTags || m.text?.trim())) return '';
     if (m.imageState === 'waiting') return '<span class="ph-note">正在画……</span>';
     if (!api.drawReady?.()) return '';
     return `<button type="button" class="ph-note ph-draw" data-action="photo-draw" data-mid="${esc(m.id)}">${esc(m.imageState === 'failed' && m.imageNote ? m.imageNote + ' · ' : '')}画出来</button>`;
@@ -301,12 +400,12 @@ export function chatApp(ctx) {
     if (LINE_KINDS.includes(m.kind)) return day + lineHTML(m);
     const me = m.from === 'me', group = thread.type === 'group', picked = selecting?.has(m.id);
     const quoted = m.quote ? `<span class="m-quote">${esc(you(m.quote.from))}：${esc(m.quote.text)}</span>` : '';
-    return day + (picked && m.id === edges.first ? rangeBar('start') : '') + `<div class="msg${me ? ' me' : ''}${m.id === pace.fresh ? ' fresh' : ''}" data-engine="${me ? 'none' : engine(m.from)}" data-kind="${m.kind}" data-mid="${esc(m.id)}"${picked ? ' data-picked' : ''}>${selecting ? '<span class="pick" aria-hidden="true"></span>' : ''}${me ? `<span class="me-side">${myAvatar(34)}</span>` : `<span class="pat-target" data-pat="${esc(m.from)}" title="双击拍一拍">${avatar(m.from, engine(m.from), 34)}</span>`}<div class="m-body">${group && !me ? `<span class="m-name">${esc(m.from)}</span>` : ''}${bodyHTML(m)}${quoted}</div></div>` + (picked && m.id === edges.last ? rangeBar('end') : '');
+    return day + (picked && m.id === edges.first ? rangeBar('start') : '') + `<div class="msg${me ? ' me' : ''}${m.id === pace.fresh ? ' fresh' : ''}" data-engine="${me ? 'none' : engine(m.from)}" data-kind="${m.kind}" data-mid="${esc(m.id)}"${picked ? ' data-picked' : ''}>${selecting ? '<span class="pick" aria-hidden="true"></span>' : ''}${me ? `<span class="me-side">${myAvatar(34)}</span>` : `<span class="pat-target" data-pat="${esc(m.from)}" title="双击拍一拍">${avatar(m.from, engine(m.from), 34)}</span>`}<div class="m-body">${group && !me ? `<span class="m-name">${esc(shown(m.from))}</span>` : ''}${bodyHTML(m)}${quoted}</div></div>` + (picked && m.id === edges.last ? rangeBar('end') : '');
   }
   function toolsHTML() {
     const group = thread.type === 'group';
     const tools = [['photo', 'image', '照片'], ['emoji', 'smile', '表情'], ['redpacket', 'packet', '红包'], ...(group ? [] : [['transfer', 'swap', '转账'], ['gift', 'gift', '礼物']]),
-      ['location', 'pin', '位置'], ['pat', 'hand', '拍一拍'], ['dice', 'dice', '骰子']];
+      ['file', 'file', '文件'], ['location', 'pin', '位置'], ['song', 'music', '分享歌'], ['pat', 'hand', '拍一拍'], ['dice', 'dice', '骰子']];
     const tabs = `<div class="emoji-tabs" role="tablist">${[['emoji', '表情'], ['stickers', '表情包']].map(([k, t]) => `<button type="button" role="tab" data-action="panel-${k}" aria-selected="${panel === k}">${t}</button>`).join('')}</div>`;
     if (panel === 'stickers') {
       const list = api.getState().chat.stickers || [];
@@ -319,8 +418,13 @@ export function chatApp(ctx) {
       <div class="emoji-grid">${EMOJI.map(e => `<button data-action="emoji-pick" data-emoji="${e}" aria-label="${e}">${e}</button>`).join('')}</div>
       <div class="kao-row">${KAOMOJI.map(e => `<button data-action="emoji-pick" data-emoji="${esc(e)}">${esc(e)}</button>`).join('')}</div>
       <div class="panel-foot">${btn('panel-tools', icon('back') + '更多功能', 'text-button')}${btn('emoji-del', icon('backspace'), 'round-button', 'aria-label="删除一个字"')}</div></div>`;
-    return `<div class="chat-panel" role="group" aria-label="更多功能"><div class="tool-grid">${tools.map(([action, glyph, label]) =>
-      `<button class="tool" data-action="tool-${action}"><span class="tool-ico" data-tool="${action}">${icon(glyph)}</span><span>${label}</span></button>`).join('')}</div></div>`;
+    // Pages of 8 (two rows), swiped sideways like WeChat's; the dots show the page and switch it on a tap.
+    const pages = [];
+    for (let i = 0; i < tools.length; i += 8) pages.push(tools.slice(i, i + 8));
+    const page = list => `<div class="tool-grid">${list.map(([action, glyph, label]) => action === 'file' ? fileTool() :
+      `<button class="tool" data-action="tool-${action}"><span class="tool-ico" data-tool="${action}">${icon(glyph)}</span><span>${label}</span></button>`).join('')}</div>`;
+    return `<div class="chat-panel" role="group" aria-label="更多功能"><div class="tool-pages">${pages.map(page).join('')}</div>${pages.length > 1
+      ? `<div class="tool-dots">${pages.map((_, i) => `<button type="button" data-action="tool-page" data-page="${i}" aria-label="第 ${i + 1} 页" aria-current="${i === 0}"></button>`).join('')}</div>` : ''}</div>`;
   }
   function composerHTML() {
     const group = thread.type === 'group';
@@ -330,8 +434,9 @@ export function chatApp(ctx) {
       ${panel ? toolsHTML() : ''}</div>`;
   }
   async function renderThread(ticket) {
-    thread = await api.getThread(threadId);
+    const loaded = await api.getThread(threadId);
     if (v.disposed || ticket !== epoch) return;
+    thread = loaded;
     if (!thread) { mode = 'list'; threadId = null; return render(); }
     if (thread.unread) api.markThreadRead(threadId).catch(() => {});
     const group = thread.type === 'group', contacts = api.chatContacts(true);
@@ -346,14 +451,17 @@ export function chatApp(ctx) {
     edges = selecting?.size ? pickEdges() : {};
     const look = profile();
     const bg = look.backgroundPhoto ? 'photo' : look.background, scene = chatScene(bg);
-    v.draw(`<div class="chat-thread${selecting ? ' selecting' : ''}" data-bubble="${esc(look.bubble)}" data-bg="${esc(bg)}"${scene ? ` data-scene data-tone="${sceneDark(bg) ? 'dark' : 'light'}"` : ''}>
-      <div class="th-head" data-engine="${group ? 'none' : engine(thread.members[0])}">${threadAvatar(thread, 38)}<div class="th-title"><strong>${esc(thread.name)}</strong><small>${esc(sub)}</small></div>
-        ${btn('bring', selecting ? '取消' : icon('book') + '<span class="bring-label">带进剧情</span>', 'chip-button', selecting ? '' : 'aria-label="带进剧情" title="带进剧情"')}${!group && api.callDial ? btn('call', icon('phone'), 'round-button call-go', 'aria-label="语音通话"') : ''}${btn('thread-menu', icon('more'), 'round-button', 'aria-label="更多"')}</div>
+    drawThread(`<div class="chat-thread${selecting ? ' selecting' : ''}" data-thread="${esc(threadId)}" data-bubble="${esc(look.bubble)}" data-bg="${esc(bg)}"${scene ? ` data-scene data-tone="${sceneDark(bg) ? 'dark' : 'light'}"` : ''}>
+      <div class="th-head" data-engine="${group ? 'none' : engine(thread.members[0])}">${threadAvatar(thread, 38)}<div class="th-title"><strong>${esc(group ? thread.name : shown(thread.members[0] || thread.name))}</strong><small>${esc(sub)}</small></div>
+        ${btn('bring', selecting ? '取消' : icon('book') + `<span class="bring-label">${thread.story ? '一直带着' : '带进剧情'}</span>`, 'chip-button', selecting ? '' : `aria-label="带进剧情" title="${thread.story ? '正文一直记得这段聊天' : '带进剧情'}"${thread.story ? ' data-on' : ''}`)}${!group && api.callDial ? btn('call', icon('phone'), 'round-button call-go', 'aria-label="语音通话"') : ''}${btn('thread-menu', icon('more'), 'round-button', 'aria-label="更多"')}</div>
       <div class="msgs-wrap">${scene}<div class="msgs" role="log" aria-live="polite" data-keep-scroll="msgs-${esc(threadId)}">${list.length ? list.map((m, i) => messageHTML(m, i, list)).join('') : `<p class="chat-empty">${live ? '发几条消息都行，发完点右下角的气泡按钮让对方回复；输入框空着时发送键就会变成它。也可以直接点它，让对方先开口。' : '在酒馆里打开小手机时，联系人才会回复。'}</p>`}
         ${bring?.threadId === threadId ? `<div class="sys">${icon('book')}${bring.count} 条消息会带进下一次正文 ${btn('cancel-bring', '取消', 'text-button')}</div>` : ''}
         ${typer !== null ? `<div class="msg typing-row" data-engine="${typer ? engine(typer) : 'none'}">${avatar(typer || '…', typer ? engine(typer) : 'none', 34)}<div class="m-body"><div class="chat-bubble typing" aria-label="对方正在输入"><i></i><i></i><i></i></div></div></div>` : ''}</div></div>
+      ${!group && thread.friend ? `<div class="friend-cut" role="status">${icon('alert')}<span>${thread.friend.by === 'me' ? `你已删除了${esc(thread.members[0])}` : `${esc(thread.members[0])}已把你从好友里删除了`}</span>${thread.friend.by === 'me' ? btn('refriend', '加回好友', 'chip-button', `data-id="${esc(thread.id)}"`) : btn('ask-friend', '发送好友申请', 'chip-button')}</div>` : ''}
       ${selecting
-        ? `<div class="bring-bar"><span>${selecting.size ? `已选 ${selecting.size} 条` : '点一条消息开始，再拖上下的条条多选'}</span>${btn('bring-go', '带进下一次正文', 'primary', selecting.size ? '' : 'disabled')}</div>`
+        ? (pickFor === 'delete'
+          ? `<div class="bring-bar pick-delete"><span>${selecting.size ? pickedLabel(selecting.size) : '点一条消息开始，再拖上下的条条多选'}</span>${btn('pick-up', '到最早', 'text-button', selecting.size ? '' : 'disabled')}${btn('pick-down', '到最新', 'text-button', selecting.size ? '' : 'disabled')}${btn('delete-go', icon('trash') + '删除', 'danger', selecting.size ? '' : 'disabled')}</div>`
+          : `<div class="bring-bar"><span>${selecting.size ? pickedLabel(selecting.size) : '点一条消息开始，再拖上下的条条多选'}</span>${btn('bring-go', '带进下一次正文', 'primary', selecting.size ? '' : 'disabled')}</div>`)
         : composerHTML()}
     </div>`);
     const msgs = v.root.querySelector('.msgs');
@@ -365,6 +473,38 @@ export function chatApp(ctx) {
     paintVoices();
     paintPhotos();
     if (look.backgroundPhoto) photoURL(look.backgroundPhoto).then(url => { const box = v.root.querySelector('.msgs'); if (box && url) box.style.backgroundImage = `url("${url}")`; });
+  }
+  // A thread is drawn again often while the user may be typing (each message of a reply shows on its own, the typing
+  // dots come and go). The message box itself stays: a new one would put the caret at the start and break off a word
+  // the input method is still putting together. Everything around it is drawn anew.
+  function drawThread(html) {
+    const old = v.root.querySelector('.chat-thread'), box = old?.querySelector('[data-field=draft]');
+    const template = ctx.doc.createElement('template');
+    template.innerHTML = html;
+    const fresh = template.content.querySelector('.chat-thread'), freshBox = fresh?.querySelector('[data-field=draft]');
+    if (!old || !box || !freshBox || old.dataset.thread !== fresh.dataset.thread || old.parentElement !== v.root) return v.draw(html);
+    const y = v.root.scrollTop, inner = new Map([...old.querySelectorAll('[data-keep-scroll]')].map(el => [el.dataset.keepScroll, el.scrollTop]));
+    for (const name of old.getAttributeNames()) if (!fresh.hasAttribute(name)) old.removeAttribute(name);
+    for (const name of fresh.getAttributeNames()) old.setAttribute(name, fresh.getAttribute(name));
+    // From the box outwards: each level gets the new children around the one that holds the box.
+    const keep = [box.parentElement, box.parentElement?.parentElement], put = [freshBox.parentElement, freshBox.parentElement?.parentElement];
+    if (keep[1]?.parentElement !== old || put[1]?.parentElement !== fresh) return v.draw(html);
+    around(old, keep[1], fresh, put[1]);
+    around(keep[1], keep[0], put[1], put[0]);
+    around(keep[0], box, put[0], freshBox);
+    const text = drafts.get(threadId) || '';
+    if (box.value !== text) box.value = text;
+    for (const el of old.querySelectorAll('[data-keep-scroll]')) if (inner.has(el.dataset.keepScroll)) el.scrollTop = inner.get(el.dataset.keepScroll);
+    v.root.scrollTop = y;
+  }
+  /** `parent` takes `from`'s children, except that `keep` stays where it is, in the place of `instead`. */
+  function around(parent, keep, from, instead) {
+    for (const node of [...parent.childNodes]) if (node !== keep) node.remove();
+    let after = false;
+    for (const node of [...from.childNodes]) {
+      if (node === instead) { after = true; continue; }
+      if (after) parent.append(node); else keep.before(node);
+    }
   }
   // Opens or closes the + panel in place, so the message box keeps its text and focus.
   function syncPanel() {
@@ -392,6 +532,50 @@ export function chatApp(ctx) {
       el.querySelector('.v-ico').innerHTML = state === 'generating' ? icon('spin') : icon(state === 'playing' ? 'pause' : 'play', true);
     }
   }
+  async function photoViewer(message, img) {
+    const id = threadId, mid = message.id;
+    const versions = [];
+    for (const photoId of [...new Set([...(message.imageVersions || []), message.photoId].filter(Boolean))]) {
+      const photo = await api.getPhoto(photoId);
+      if (photo) versions.push({photoId, photo, src: await photoURL(photoId)});
+    }
+    if (v.disposed || threadId !== id || !versions.length) return;
+    const current = async () => (await api.getThread(id))?.messages.find(m => m.id === mid);
+    const request = m => {
+      const names = [...api.getState().routes.map(r => r.name), api.userName?.() || myName()];
+      const tags = photoTags({text: m.text, tags: m.imageTags, owner: m.from, names});
+      return {...pictureInputs(api.getState(), {prompt: tags, characters: photoCast({text: m.text, tags, owner: m.from, names})}), tag: tags};
+    };
+    const draw = async tags => {
+      const m = await current(); if (!m) throw Error('这条消息已不存在');
+      const paid = api.drawQuote?.().free === false, ask = api.paidPrompt?.();
+      if (paid && ask && !await ctx.confirm(ask.title, ask.text)) return false;
+      if (tags !== undefined) await api.updateChatMessage(id, mid, {imageTags: tags});
+      await api.chatDrawPhoto(id, mid, paid);
+    };
+    // 改提示词再画 the way the story's pictures are: 看中文, and saying in words how to change it.
+    const rewrite = async () => {
+      const m = await current(); if (!m) throw Error('这条消息已不存在');
+      const tags = await editTags({doc: ctx.doc, text: m.imageTags || '', ask: (text, mode, wish) => api.tagText ? api.tagText(text, mode, wish) : Promise.reject(Error('看中文和改要在酒馆里用')),
+        about: '这张照片用的英文 tag。改了以后重画也用它；之前画的几版还在，可以左右滑着比。'});
+      if (!tags?.trim()) return false;
+      await draw(tags.trim());
+    };
+    let viewer;
+    const safe = fn => async i => { viewer?.close(); try { return await fn(i); } catch (error) { ctx.notify(error.message, {error: true}); return false; } };
+    viewer = openImageViewer({doc: ctx.doc, from: img, caption: message.text || '',
+      gallery: {items: versions.map(v => ({src: v.src, alt: message.text || '', info: v.photo.info})), index: Math.max(0, versions.findIndex(v => v.photoId === message.photoId)),
+        onIndex: i => api.updateChatMessage(id, mid, {photoId: versions[i].photoId}).catch(error => ctx.notify(error.message))},
+      actions: [downloadAction(ctx.doc, i => ({source: versions[i].photo.blob, name: versions[i].photo.name}), ctx.notify),
+        ...(message.imageTags && api.chatDrawPhoto ? [
+          {label: '重画', run: safe(() => draw())},
+          {label: '改提示词再画', run: safe(rewrite)},
+          {label: '在绘图中打开', run: safe(async i => { const m = await current(); if (m) ctx.openDraw({...request(m), seed: Number(versions[i].photo.info?.find(row => row[0] === '种子')?.[1])}); })}
+        ] : []),
+        {label: '删除这版', danger: true, run: safe(async i => { if (!await ctx.confirm('删除这版图片？')) return false; await api.deletePhoto(versions[i].photoId); })},
+        {label: '消息选项', run: safe(() => messageMenu(message))}]});
+  }
+
   // Album photos sent in the chat; each picture is read once and kept while the app is open.
   async function photoURL(id) {
     if (!photoURLs.has(id)) {
@@ -408,17 +592,22 @@ export function chatApp(ctx) {
     }
   }
 
+  // Leaving a list (消息 or 联系人) for a chat, a profile or a form remembers where it was; coming back to the same tab puts it there again.
+  let shownMode = 'list', left = null;
   function render() {
     const ticket = ++epoch;
+    if (shownMode === 'list' && mode !== 'list') left = {tab, top: v.root.scrollTop};
+    const back = shownMode !== 'list' && mode === 'list' && left?.tab === tab ? left.top : null;
+    shownMode = mode;
     v.root.classList.toggle('chat-mode', mode === 'thread');
     v.root.classList.toggle('qq-mode', mode === 'list');
     if (mode === 'thread') return renderThread(ticket);
     if (mode === 'profile') return renderProfile();
     if (mode === 'me') return renderMe();
     if (mode === 'contact-edit') return renderContactForm();
-    if (tab === 'contacts') return renderContactsTab(ticket);
-    if (tab === 'moments') return counts().then(() => { if (ticket === epoch) return moments.render(); });
-    return renderMessages(ticket);
+    if (mode === 'friends') return renderFriends(ticket);
+    const done = tab === 'contacts' ? renderContactsTab(ticket) : tab === 'moments' ? counts().then(() => { if (ticket === epoch) return moments.render(); }) : renderMessages(ticket);
+    return back === null ? done : Promise.resolve(done).then(() => { if (ticket === epoch) v.root.scrollTop = back; });
   }
   function open(id) {
     threadId = id; mode = 'thread'; selecting = null; stick = true; panel = null; quote = null;
@@ -487,7 +676,7 @@ export function chatApp(ctx) {
     const d = sheet('发送照片', `<div class="photo-grid pick-photos">${rows.map(r => `<button data-action="pick-photo" data-id="${esc(r.id)}" aria-pressed="false" aria-label="选择 ${esc(r.name)}"><img data-photo="${esc(r.id)}" alt="${esc(r.name)}"></button>`).join('')}</div>
       ${rows.length ? '' : '<p class="help-copy">相册里还没有照片，可以直接从本地选一张。</p>'}
       <div class="actions"><label class="secondary file-button">${icon('import')}从本地选<input type="file" data-chat-file accept="image/png,image/jpeg,image/webp,image/avif,image/gif" aria-label="从本地选照片"></label></div>
-      ${field('照片说明', input('caption', '', 'text', 'maxlength="200" placeholder="比如：下班路上的晚霞"'), '对方看不到图片本身，只看得到这句说明。写清楚照片里有什么，对方才好接话。')}
+      ${field('照片说明', input('caption', '', 'text', 'maxlength="200" placeholder="比如：下班路上的晚霞"'), '现在的模型看不到图片本身，只看得到这句说明，写清楚照片里有什么，对方才好接话。\n\n想让对方直接看图：用能识图的模型（比如 Gemini、Claude、GPT-4o 这类），并在酒馆的「AI 回复配置」里打开「发送内联媒体」；用小手机自己的文字连接时，只要模型能识图就行。')}
       <div class="actions">${btn('photo-send', icon('send') + '发送', 'primary', 'disabled')}</div>`, {
       'pick-photo': b => {
         chosen = b.dataset.id;
@@ -502,6 +691,7 @@ export function chatApp(ctx) {
       }
     });
     d.onClose(() => { for (const url of local) ctx.win.URL.revokeObjectURL(url); });
+    api.chatSeesPictures?.().then(yes => { const box = d.body.querySelector('[data-field=caption]'), info = box?.closest('.field')?.querySelector('.info'); if (!yes || !box) return; box.placeholder = '可以不写，对方看得到照片'; info?.setAttribute('data-help', '现在的模型能看图，对方会直接看到这张照片；说明可以不写，写了就当作你配的话。'); }).catch(() => {});
     d.body.addEventListener('change', e => {
       const file = e.target.closest('[data-chat-file]')?.files?.[0];
       if (!file) return;
@@ -550,6 +740,25 @@ export function chatApp(ctx) {
         const detail = value(d, 'detail');
         d.close();
         await post([{from: 'me', kind: 'location', text, detail}]);
+      }
+    });
+  }
+  /** 分享歌: what is playing, a song of the 歌单, or any song typed in; it shows as a card they can play too. */
+  async function shareSong() {
+    const playing = (() => { try { const t = api.musicStatus?.()?.track; return t?.title && t.from !== 'bgm' ? t : null; } catch { return null; } })();
+    const mine = (await api.listSongs?.().catch(() => []) || []).filter(x => x.title).slice(0, 60);
+    const name = s => s.artist ? `${s.title} - ${s.artist}` : s.title;
+    const row = (s, note = '') => `<button type="button" class="list-row" data-action="song-pick" data-title="${esc(s.title)}" data-artist="${esc(s.artist || '')}">${icon('music')}<span><strong>${esc(s.title)}</strong><small>${esc([s.artist, note].filter(Boolean).join(' · '))}</small></span></button>`;
+    const d = sheet('分享歌', `${field('歌', input('song', playing ? name(playing) : '', 'text', 'maxlength="200" placeholder="歌名 - 歌手，比如：晴天 - 周杰伦"'))}${field('想说的话', input('note', '', 'text', 'maxlength="200" placeholder="可以不写"'))}
+      <div class="actions">${btn('song-send', icon('send') + '发送', 'primary')}</div>
+      ${playing || mine.length ? `<div class="pick-list">${playing ? row(playing, '正在听') : ''}${mine.map(s => row(s)).join('')}</div>` : '<p class="hint">「音乐」里的歌单和正在听的歌会列在这里；也可以直接写歌名。</p>'}`, {
+      'song-pick': b => { const box = d.body.querySelector('[data-field=song]'); box.value = name({title: b.dataset.title, artist: b.dataset.artist}); box.focus(); },
+      'song-send': async () => {
+        const song = songOf(value(d, 'song'));
+        if (!song.title) throw Error('写一下歌名');
+        const text = value(d, 'note');
+        d.close();
+        await post([{from: 'me', kind: 'song', song, ...(text ? {text} : {})}]);
       }
     });
   }
@@ -753,9 +962,9 @@ export function chatApp(ctx) {
     const shown = m.kind === 'voice' ? (m.translation || m.text) : m.kind === 'dice' ? `骰子 ${m.text} 点` : ['redpacket', 'transfer', 'gift'].includes(m.kind) ? preview(m) : quoteText(m);
     const voice = m.kind === 'voice', open = voice && (voiceText().auto || transcribed.has(m.id));
     const d = sheet('消息', `${voice ? '' : `<p class="help-copy">${esc(shown)}</p>`}
-      ${voice ? `<div class="actions">${btn('transcribe', icon('book') + (open ? '收起文字' : '转文字'), 'primary')}${btn('download', icon('download') + '下载语音', 'secondary')}</div>` : ''}
+      ${voice ? `<div class="actions">${btn('transcribe', icon('book') + (open ? '收起文字' : '转文字'), 'primary')}${btn('download', icon('download') + '下载语音', 'secondary')}${canShareFiles(ctx.win) ? btn('share', icon('share') + '分享', 'secondary') : ''}</div>` : ''}
       <div class="actions">${quotable(m) ? btn('quote', icon('reply') + '引用', 'secondary') : ''}${copyable ? btn('copy', icon('copy') + '复制', 'secondary') : ''}</div>
-      <div class="actions">${canRecall ? btn('recall', icon('undo') + '撤回', 'secondary') : ''}${btn('delete', icon('trash') + '删除', 'danger')}</div>
+      <div class="actions">${canRecall ? btn('recall', icon('undo') + '撤回', 'secondary') : ''}${btn('pick-delete', icon('check') + '多选删除', 'secondary')}${btn('delete', icon('trash') + '删除', 'danger')}</div>
       ${last && live ? `<div class="actions">${btn('reroll', icon('refresh') + '重新回复这一轮', 'secondary')}</div>` : ''}`, {
       transcribe: () => {
         d.close();
@@ -764,6 +973,7 @@ export function chatApp(ctx) {
         render();
       },
       download: async () => { d.close(); const {blob, name} = await api.audioFile({line: lineOf(m)}); ctx.notify('已下载 ' + await saveFile(ctx.doc, blob, name)); },
+      share: async () => { d.close(); const {blob, name} = await api.audioFile({line: lineOf(m)}); await shareFile(ctx.doc, blob, name); },
       quote: () => { d.close(); quote = {from: m.from, text: quoteText(m).slice(0, 200)}; panel = null; render(); },
       copy: async () => { d.close(); ctx.notify(await copyText(ctx.win, m.kind === 'voice' ? m.text : quoteText(m)) ? '已复制' : '这个浏览器不让复制，可以长按文字手动复制'); },
       recall: async () => {
@@ -772,6 +982,8 @@ export function chatApp(ctx) {
         await api.updateChatMessage(threadId, m.id, {recall: true});
       },
       delete: async () => { d.close(); await api.deleteChatMessages(threadId, [m.id]); },
+      // Picking like 带进剧情: this one first, then tap others or drag the bars (到最早 / 到最新 take in all on that side).
+      'pick-delete': () => { d.close(); selecting = new Set(LINE_KINDS.includes(m.kind) ? [] : [m.id]); pickFor = 'delete'; panel = null; quote = null; render(); },
       reroll: async () => { d.close(); await reroll(); }
     });
   }
@@ -782,20 +994,21 @@ export function chatApp(ctx) {
     if (drop.length) await api.deleteChatMessages(threadId, drop);
     requestReply();
   }
-  function newChat() {
+  /** 发起私聊: one row per contact; 发起群聊 (group): tick who comes in, a name if wanted. */
+  function newChat(group = false) {
     const contacts = api.chatContacts();
-    const d = ctx.dialog('新建聊天', contacts.length
-      ? `${groupTitle('私聊')}<div class="pick-list">${contacts.map(c => `<button class="list-row" data-new-dm="${esc(c.name)}">${avatar(c.name, c.engine, 36)}<span><strong>${esc(c.name)}</strong><small>${c.source === 'role' ? (c.voice ? '角色 · 能发语音' : '角色 · 只发文字') : '手动联系人'}</small></span>${icon('next')}</button>`).join('')}</div>
-        ${contacts.length > 1 ? `${groupTitle('群聊')}<div class="pick-list">${contacts.map(c => `<label class="setting-row"><span>${avatar(c.name, c.engine, 28)}${esc(c.name)}</span><input class="switch" type="checkbox" data-member="${esc(c.name)}" aria-label="拉 ${esc(c.name)} 进群"></label>`).join('')}</div>
-          ${field('群名', input('group-name', '', 'text', 'maxlength="40" placeholder="可以不填"'))}<div class="actions">${btn('create-group', icon('group') + '建群', 'primary')}</div>` : ''}
-        <div class="actions">${btn('manage-contacts', icon('person') + '管理联系人', 'text-button')}</div>`
-      : `<p class="help-copy">还没有联系人。在角色 App 里新增角色，或者手动添加一个联系人。</p><div class="actions">${btn('manage-contacts', icon('add') + '添加联系人', 'primary')}</div>`);
+    const d = ctx.dialog(group ? '发起群聊' : '发起私聊', !contacts.length
+      ? `<p class="help-copy">还没有联系人。在角色 App 里新增角色，或者手动添加一个联系人。</p><div class="actions">${btn('manage-contacts', icon('add') + '添加联系人', 'primary')}</div>`
+      : group
+      ? `<div class="pick-list">${contacts.map(c => `<label class="setting-row"><span>${avatar(c.name, c.engine, 28)}${esc(shown(c.name))}</span><input class="switch" type="checkbox" data-member="${esc(c.name)}" aria-label="拉 ${esc(c.name)} 进群"></label>`).join('')}</div>
+        ${field('群名', input('group-name', '', 'text', 'maxlength="40" placeholder="可以不填"'))}<div class="actions">${btn('create-group', icon('group') + '建群', 'primary')}</div>`
+      : `<div class="pick-list">${contacts.map(c => `<button class="list-row" data-new-dm="${esc(c.name)}">${avatar(c.name, c.engine, 36)}<span><strong>${esc(shown(c.name))}</strong><small>${c.source === 'role' ? (c.voice ? '角色 · 能发语音' : '角色 · 只发文字') : '手动联系人'}</small></span>${icon('next')}</button>`).join('')}</div>`);
     d.body.addEventListener('click', e => {
       const b = e.target.closest('button');
       if (!b) return;
       ctx.win.Promise.resolve().then(async () => {
         if (b.dataset.newDm) {
-          const existing = (await api.listThreads()).find(t => t.type === 'dm' && t.members[0] === b.dataset.newDm);
+          const existing = currentDm(await api.listThreads(), b.dataset.newDm);
           const t = existing || await api.createThread({type: 'dm', members: [b.dataset.newDm]});
           d.close(); open(t.id);
         }
@@ -807,6 +1020,58 @@ export function chatApp(ctx) {
         if (b.dataset.action === 'manage-contacts') { d.close(); mode = 'list'; tab = 'contacts'; contactDraft = null; render(); }
       }).catch(error => ctx.notify(error.message));
     });
+  }
+  /**
+   * 聊天窗口 with one contact or one group, like the tavern's chats: each its own messages and memory. A tap opens one
+   * (and makes it the one in use: the list shows it, replies and calls go to it); 新开 starts an empty one; each can be
+   * renamed or deleted. Deleting a contact's last one leaves the contact, without a chat; a group's last one, the group.
+   */
+  async function windowsSheet(base) {
+    const group = base.type === 'group', name = base.members[0];
+    const d = ctx.dialog(group ? `「${base.name}」的聊天窗口` : `和${shown(name)}的聊天窗口`, '<p class="hint">正在读取……</p>', {add: '新开一个窗口'});
+    let swipe = null;
+    const paint = async () => {
+      const list = chatWindows(await api.listThreads(), base);
+      if (!d.live) return;
+      const when = at => at ? new Date(at).toLocaleString('zh-CN', {hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : '';
+      // A tap opens one; swiped left 改名 / 删除.
+      d.body.innerHTML = `<div class="pick-list" data-window-list>${list.map((t, i) => swipeRow(t.id, `<div class="list-row">${icon(i === 0 ? 'check' : 'chat')}<span><strong>${esc(t.label || (t.last ? preview(t.last) : '空的窗口'))}</strong><small>${i === 0 ? '正在用 · ' : ''}${t.count} 条${t.last ? ' · ' + when(t.last.at) : ''}</small></span></div>`,
+        [{key: 'rename', label: '改名', icon: 'edit'}, {key: 'delete', label: '删除', icon: 'trash', danger: true}], {label: t.label || ''})).join('')}</div>`;
+      swipe?.dispose();
+      swipe = mountSwipeList(d.body.querySelector('[data-window-list]'), {ctx,
+        onTap: id => run(async () => { d.close(); await api.updateThread(id, {open: true}); open(id); }),
+        onAction: (key, id) => run(() => key === 'rename' ? rename(id) : drop(id))});
+    };
+    const run = task => ctx.win.Promise.resolve().then(task).catch(error => ctx.notify(error.message, {error: true}));
+    const rename = async id => {
+      const t = (await api.listThreads()).find(x => x.id === id);
+      const r = ctx.dialog('窗口的名字', `${field('名字', input('window-label', t?.label || '', 'text', 'maxlength="40" placeholder="比如：第二周目、平行世界"'))}<div class="actions">${btn('window-label-save', '保存', 'primary')}</div>`);
+      r.body.addEventListener('click', async ev => { if (!ev.target.closest('[data-action=window-label-save]')) return; await api.updateThread(id, {label: r.body.querySelector('[data-field=window-label]').value}); r.close(); render(); windowsSheet(base); });
+    };
+    const drop = async id => {
+      const last = chatWindows(await api.listThreads(), base).length <= 1;
+      if (!await ctx.confirm(last && group ? '删除这个群聊？' : '删除这个聊天窗口？', last && group ? '这是群里最后一个窗口，删掉后这个群就没有了。' : '这个窗口里的聊天记录和记忆会删掉，别的窗口不受影响。')) return windowsSheet(base);
+      // Whether it was open is read first: a redraw after the delete leaves a missing chat for the list.
+      const wasOpen = id === threadId;
+      await api.deleteThread(id);
+      const next = currentWindow(await api.listThreads(), base);
+      if (!next && group) forgetGroupAvatar(base);
+      if (wasOpen) { if (next) open(next.id); else { mode = 'list'; threadId = null; render(); } }
+      else render();
+      if (next) windowsSheet(base);
+    };
+    d.onClose(() => swipe?.dispose());
+    // 「＋」 works at once, also before the list is read.
+    d.overlay.addEventListener('click', e => {
+      if (!e.target.closest('[data-sheet-add]')) return;
+      run(async () => {
+        d.close();
+        const now = chatWindows(await api.listThreads(), base)[0] || base;
+        const t = await api.createThread(group ? {type: 'group', members: now.members, name: now.name, windowOf: groupKey(base)} : {type: 'dm', members: [name]});
+        open(t.id); ctx.notify('新开了一个聊天窗口');
+      });
+    });
+    await paint();
   }
   /** Options for voice messages in every chat: what 转文字 shows, and whether it happens by itself. */
   function voiceTextSheet() {
@@ -868,6 +1133,7 @@ export function chatApp(ctx) {
       try { api.saveCalls({[key]: key === 'auto' ? e.target.checked : Number(e.target.value)}); d.body.querySelector('.calls-body').innerHTML = draw(); } catch (error) { ctx.notify(error.message); }
     });
   }
+  /** 主动发消息: characters text the user from the story, and (if wanted) now and then on their own. */
   /** A finished call: what was said, the voice message of a missed call, and calling back. */
   function callLog(m) {
     const name = m.from === 'me' ? thread.members[0] : m.from, who = l => l.from === 'me' ? '你' : l.from;
@@ -896,23 +1162,22 @@ export function chatApp(ctx) {
         if (action === 'pin') await api.updateThread(id, {pinned: !t.pinned});
         if (action === 'mute') await api.updateThread(id, {muted: !t.muted});
         if (action === 'read') await api.markThreadRead(id);
-        if (action === 'delete' && await ctx.confirm('删除这段聊天？', '聊天记录会一起删除，联系人不受影响。')) await api.deleteThread(id);
+        if (action === 'delete' && await ctx.confirm('删除这段聊天？', '聊天记录会一起删除，联系人不受影响。')) { await api.deleteThread(id); if (t.type === 'group' && !currentWindow(await api.listThreads(), t)) forgetGroupAvatar(t); }
         render();
       }).catch(error => ctx.notify(error.message));
     });
   }
   function plusMenu() {
     const d = ctx.dialog('发起', `<div class="pick-list">
-      <button class="list-row" data-menu="chat">${icon('chat')}<span><strong>发起聊天</strong><small>私聊，或者拉几个人建群</small></span></button>
-      <button class="list-row" data-menu="contact">${icon('person')}<span><strong>添加联系人</strong><small>剧情之外的人，写上人设就能聊</small></span></button>
-      <button class="list-row" data-menu="me">${icon('smile')}<span><strong>个性装扮</strong><small>气泡、头像挂件、聊天背景、状态</small></span></button></div>`);
+      <button class="list-row" data-menu="chat">${icon('chat')}<span><strong>发起私聊</strong></span></button>
+      ${api.chatContacts().length > 1 ? `<button class="list-row" data-menu="group">${icon('group')}<span><strong>发起群聊</strong></span></button>` : ''}
+      <button class="list-row" data-menu="contact">${icon('person')}<span><strong>添加联系人</strong><small>剧情之外的人，写上人设就能聊</small></span></button></div>`);
     d.body.addEventListener('click', e => {
       const action = e.target.closest('[data-menu]')?.dataset.menu;
       if (!action) return;
       d.close();
-      if (action === 'chat') newChat();
+      if (action === 'chat' || action === 'group') newChat(action === 'group');
       if (action === 'contact') { contactDraft = {name: '', persona: ''}; mode = 'contact-edit'; render(); }
-      if (action === 'me') { mode = 'me'; render(); }
     });
   }
   async function pickBackground() {
@@ -928,8 +1193,10 @@ export function chatApp(ctx) {
       render();
     });
   }
+  /** A group's own picture goes with its last window. */
+  function forgetGroupAvatar(t) { if (api.getState().chat.avatars?.['g:' + groupKey(t)]) api.saveChatOptions({avatars: {['g:' + groupKey(t)]: null}}); }
   async function openDm(name) {
-    const existing = (await api.listThreads()).find(t => t.type === 'dm' && t.members[0] === name);
+    const existing = currentDm(await api.listThreads(), name);
     const t = existing || await api.createThread({type: 'dm', members: [name]});
     open(t.id);
   }
@@ -938,11 +1205,11 @@ export function chatApp(ctx) {
     const d = ctx.dialog(thread.name, `<div class="pick-list">
       ${live ? `<button class="list-row" data-menu="reroll">${icon('refresh')}<span><strong>重新回复最后一轮</strong></span></button>` : ''}
       ${group ? `<button class="list-row" data-menu="rename">${icon('edit')}<span><strong>改群名</strong></span></button><button class="list-row" data-menu="group-avatar">${icon('image')}<span><strong>换群头像</strong><small>从相册选一张或上传，也可以换回成员拼的头像</small></span></button>` : ''}
+      <button class="list-row" data-menu="windows">${icon('layers')}<span><strong>聊天窗口</strong><small>${group ? '这个群' : '和' + esc(shown(thread.members[0]))}开好几个聊天，切换、新开、删除</small></span></button>
       <button class="list-row" data-menu="memory">${icon('book')}<span><strong>记忆</strong><small>更早的聊天整理成的摘要和总结，可以改</small></span></button>
       <button class="list-row" data-menu="voice-text">${icon('book')}<span><strong>语音消息</strong><small>转文字显示什么、要不要自动转</small></span></button>
       <button class="list-row" data-menu="pace">${icon('chat')}<span><strong>逐条显示回复：${api.getState().chat.pace !== false ? '开' : '关'}</strong><small>对方的消息像真人打字一样一条条出来；关掉就一次全显示</small></span></button>
-      <button class="list-row" data-menu="clear">${icon('trash')}<span><strong>清空聊天记录</strong></span></button>
-      <button class="list-row" data-menu="delete">${icon('close')}<span><strong>删除这段聊天</strong></span></button></div>`);
+</div>`);
     d.body.addEventListener('click', e => {
       const action = e.target.closest('[data-menu]')?.dataset.menu;
       if (!action) return;
@@ -951,21 +1218,43 @@ export function chatApp(ctx) {
         if (action === 'reroll') await reroll();
         if (action === 'rename') {
           const r = ctx.dialog('改群名', `${field('群名', input('rename', thread.name, 'text', 'maxlength="40"'))}<div class="actions">${btn('rename-save', '保存', 'primary')}</div>`);
-          r.body.addEventListener('click', ev => { if (ev.target.closest('[data-action=rename-save]')) { const name = r.body.querySelector('[data-field=rename]').value; r.close(); api.updateThread(threadId, {name}).catch(err => ctx.notify(err.message)); } });
+          // The group's name is every window's.
+          const base = thread;
+          r.body.addEventListener('click', ev => { if (ev.target.closest('[data-action=rename-save]')) { const name = r.body.querySelector('[data-field=rename]').value; r.close(); api.listThreads().then(list => Promise.all(chatWindows(list, base).map(t => api.updateThread(t.id, {name})))).catch(err => ctx.notify(err.message)); } });
         }
         if (action === 'voice-text') voiceTextSheet();
-        if (action === 'group-avatar') await avatarSheet('g:' + threadId, {title: `${thread.name} 的群头像`, reset: '用成员拼的头像'});
+        if (action === 'group-avatar') await avatarSheet('g:' + groupKey(thread), {title: `${thread.name} 的群头像`, reset: '用成员拼的头像'});
         if (action === 'pace') { const on = api.getState().chat.pace === false; api.saveChatOptions({pace: on}); if (!on) { ctx.win.clearTimeout(pace.timer); pace.timer = 0; pace.queue = []; pace.hidden.clear(); render(); } ctx.notify(on ? '对方的消息会一条条出来' : '对方的消息会一次全显示'); }
         if (action === 'memory') memorySheet(ctx, {threadId, title: thread.name});
-        if (action === 'clear' && await ctx.confirm('清空聊天记录？', '这段聊天会保留，消息全部删除。')) await api.deleteChatMessages(threadId, thread.messages.map(m => m.id));
-        if (action === 'delete' && await ctx.confirm('删除这段聊天？', '聊天记录会一起删除，联系人不受影响。')) { if (api.getState().chat.avatars?.['g:' + threadId]) api.saveChatOptions({avatars: {['g:' + threadId]: null}}); await api.deleteThread(threadId); mode = 'list'; threadId = null; render(); }
+        if (action === 'windows') await windowsSheet(thread);
       }).catch(error => ctx.notify(error.message));
     });
   }
 
   v.on('input', '[data-field=draft]', el => { drafts.set(threadId, el.value); syncSend(); });
-  v.on('input', '[data-field=chat-search]', el => { search = el.value; searching = true; render(); });
+  // The + panel's page dots follow the swipe (scroll does not bubble: heard on the way down).
+  v.root.addEventListener('scroll', e => {
+    const box = e.target;
+    if (!box.classList?.contains('tool-pages')) return;
+    const at = Math.round(box.scrollLeft / Math.max(1, box.clientWidth));
+    for (const dot of box.parentElement.querySelectorAll('[data-action=tool-page]')) dot.setAttribute('aria-current', String(Number(dot.dataset.page) === at));
+  }, true);
+  // While the input method is still putting a word together, the list waits for the word.
+  v.on('input', '[data-field=chat-search]', (el, e) => { search = el.value; searching = true; if (!e.isComposing) render(); });
+  v.on('compositionend', '[data-field=chat-search]', el => { search = el.value; searching = true; render(); });
   v.on('focusout', '[data-field=chat-search]', () => { searching = false; });
+  // 文件: pictures are sent as photos, documents by their words (ui/chat-files.js).
+  v.on('change', '[data-chat-files]', async el => {
+    const files = [...(el.files || [])];
+    el.value = '';
+    if (!files.length) return;
+    panel = null; syncPanel();
+    try {
+      const {messages, cut} = await filesToMessages(api, files);
+      if (messages.length) await post(messages);
+      if (cut.length) ctx.notify(`${cut.join('、')} 太长，只发了前面一部分`);
+    } catch (error) { ctx.notify(error.message); }
+  });
   v.on('change', '[data-field^=me-]', el => {
     const key = el.dataset.field.slice(3);
     try { api.saveChatOptions({profile: {[key]: el.value}}); render(); } catch (error) { ctx.notify(error.message, {error: true}); }
@@ -1008,7 +1297,7 @@ export function chatApp(ctx) {
       if (first && start) first.before(start);
       if (last && end) last.after(end);
       const label = v.root.querySelector('.bring-bar span');
-      if (label) label.textContent = `已选 ${picked.size} 条`;
+      if (label) label.textContent = pickedLabel(picked.size);
     }
     // Near the top or bottom edge the list scrolls on its own, so a long stretch can be taken in one drag.
     function scroll() {
@@ -1077,7 +1366,12 @@ export function chatApp(ctx) {
         if (tab !== el.dataset.tab) { v.root.dataset.switching = el.dataset.tab; ctx.win.clearTimeout(switchTimer); switchTimer = ctx.win.setTimeout(() => delete v.root.dataset.switching, 420); }
         tab = el.dataset.tab; search = ''; if (tab === 'moments') moments.only(''); v.root.scrollTop = 0; render(); break;
       }
-      case 'open': open(el.dataset.id); break;
+      case 'open': {
+        // The contact's picture in the list flies up to the top of the chat (ui/carry.js).
+        const from = el.firstElementChild?.getBoundingClientRect();
+        Promise.resolve(open(el.dataset.id)).then(() => fly(ctx.win, v.root.querySelector('.th-head')?.firstElementChild, from, {duration: 360, easing: 'soft'}));
+        break;
+      }
       case 'new-chat': newChat(); break;
       case 'plus-menu': plusMenu(); break;
       case 'me': mode = 'me'; render(); break;
@@ -1090,6 +1384,8 @@ export function chatApp(ctx) {
         render(); ctx.notify('买下并换上了');
         break;
       }
+      case 'me-status': statusSheet(); break;
+      case 'me-deco': decoSheet(el.dataset.key); break;
       case 'me-wallet': openWallet(); break;
       case 'me-shop': openShop(); break;
       case 'me-bg-photo': await pickBackground(); break;
@@ -1104,6 +1400,45 @@ export function chatApp(ctx) {
       case 'dm-open': await openDm(el.dataset.name); break;
       case 'profile': profileOf = el.dataset.name; mode = 'profile'; render(); break;
       case 'profile-chat': await openDm(profileOf); break;
+      case 'song': { const m = thread?.messages.find(x => x.id === el.dataset.mid); if (m?.song) { ctx.notify(`正在找「${m.song.title}」……`); api.musicPlay?.({...m.song, from: 'share'}).catch(error => ctx.notify(error.message, {error: true})); } break; }
+      case 'play-song': api.musicPlay?.({title: el.dataset.title, artist: el.dataset.artist, from: 'share'}).catch(error => ctx.notify(error.message, {error: true})); break;
+      case 'unfriend': {
+        const name = profileOf;
+        if (!await ctx.confirm(`删除好友「${name}」？`, `和 TA 的聊天会从消息列表收起来（记录还在），TA 也不在好友列表里了。之后 TA 给你发的消息会变成好友申请，在「联系人 → 新的朋友」里随时可以加回来。`)) break;
+        try { await api.unfriend(name); ctx.notify(`已删除好友 ${name}`); mode = 'list'; tab = 'contacts'; render(); }
+        catch (error) { ctx.notify(error.message, {error: true}); }
+        break;
+      }
+      case 'new-friends': mode = 'friends'; render(); break;
+      case 'remark': {
+        const name = profileOf, d = ctx.dialog('设置备注', `<div class="group pad">${field('备注', input('remark', remarks()[name] || '', 'text', `maxlength="20" placeholder="${esc(name)}"`), '只改你这边显示的名字（聊天列表、聊天、联系人）；角色那边还是用 TA 的名字，不会知道你给 TA 起了什么备注。空着就是不用备注。')}
+          <div class="actions">${btn('remark-save', '保存', 'primary')}</div></div>`);
+        d.body.addEventListener('click', e => {
+          if (!e.target.closest('[data-action=remark-save]')) return;
+          const value = d.body.querySelector('[data-field=remark]').value.trim();
+          try { api.saveChatOptions({remarks: {[name]: value || null}}); d.close(); ctx.notify(value ? `备注改成「${value}」` : '不用备注了'); render(); } catch (error) { ctx.notify(error.message, {error: true}); }
+        });
+        break;
+      }
+      case 'refriend': {
+        try { const t = await api.refriend(el.dataset.id); ctx.notify(`已把 ${t.members[0]} 加回好友`); if (mode === 'thread') render(); else open(t.id); }
+        catch (error) { ctx.notify(error.message, {error: true}); }
+        break;
+      }
+      case 'ask-friend': {
+        if (!live) { ctx.notify('在酒馆里打开小手机时才能发好友申请'); break; }
+        const id = threadId, name = thread?.members[0] || '';
+        const d = ctx.dialog('发送好友申请', `<div class="group pad">${field('验证消息', input('ask-text', `我是${myName()}`, 'text', 'maxlength="100"'), `${esc(name)}会按 TA 的性格和你们现在的关系决定通不通过。`)}</div><div class="actions">${btn('ask-go', '发送', 'primary')}</div>`);
+        d.body.addEventListener('click', e => {
+          if (!e.target.closest('[data-action=ask-go]')) return;
+          const text = d.body.querySelector('[data-field=ask-text]')?.value.trim() || '';
+          d.close();
+          const job = api.chatAskFriend(id, text);
+          if (mode === 'thread' && threadId === id) render();
+          job.then(r => ctx.notify(r.accepted ? `${name}通过了你的好友申请` : `${name}没有通过你的好友申请`)).catch(error => ctx.notify(error.message, {error: true}));
+        });
+        break;
+      }
       case 'profile-moments': mode = 'list'; tab = 'moments'; moments.only(profileOf); render(); break;
       case 'star': {
         const list = starred(), on = !list.includes(profileOf);
@@ -1136,6 +1471,8 @@ export function chatApp(ctx) {
       case 'tool-transfer': panel = null; syncPanel(); sendTransfer(); break;
       case 'tool-gift': panel = null; syncPanel(); sendGift(); break;
       case 'tool-location': panel = null; syncPanel(); sendLocation(); break;
+      case 'tool-song': panel = null; syncPanel(); await shareSong(); break;
+      case 'tool-page': { const box = el.closest('.chat-panel')?.querySelector('.tool-pages'); box?.scrollTo({left: Number(el.dataset.page) * box.clientWidth, behavior: 'smooth'}); break; }
       case 'tool-pat': panel = null; syncPanel(); await choosePat(); break;
       case 'tool-dice': panel = null; syncPanel(); await rollDice(); break;
       case 'quote-off': quote = null; render(); break;
@@ -1150,10 +1487,10 @@ export function chatApp(ctx) {
       case 'photo': {
         const m = find(), img = el.querySelector('img');
         if (!m || !img?.src) break;
-        // What the photo shows (the words it was drawn from) is told only once it is opened.
-        openImageViewer({doc: ctx.doc, src: img.src, alt: img.alt, from: img, caption: m.text || '', actions: [downloadAction(ctx.doc, () => ({source: img.src, name: `${m.from === 'me' ? '我' : m.from} 的照片`}), ctx.notify), {label: '消息选项', run: () => messageMenu(m)}]});
+        await photoViewer(m, img);
         break;
       }
+      case 'file': { const m = find(); if (m) showFile(ctx, m); break; }
       case 'packet': { const m = find(); if (m) openPacket(m); break; }
       case 'transfer': { const m = find(); if (m) openTransfer(m); break; }
       case 'gift': { const m = find(); if (m) openGift(m); break; }
@@ -1173,17 +1510,38 @@ export function chatApp(ctx) {
         api.chatDrawPhoto(threadId, el.dataset.mid, paid).catch(error => ctx.notify(error.message, {error: true}));
         break;
       }
-      case 'bring': selecting = selecting ? null : new Set(); panel = null; render(); break;
+      case 'bring': if (selecting) { selecting = null; render(); } else bringSheet(); break;
       case 'bring-go': {
         const count = selecting.size;
         if (!live) throw Error('在酒馆里打开小手机时才能带进剧情');
-        await api.chatBring(threadId, [...selecting]);
+        const done = await api.chatBring(threadId, [...selecting]);
         selecting = null;
-        ctx.notify(`下一次正文会带上这 ${count} 条消息`);
+        ctx.notify(`下一次正文会带上这 ${count} 条消息${done?.replaced ? `（之前选的 ${done.replaced} 条不带了）` : ''}${count > 60 ? '。选得比较多，模型可能抓不住重点，挑关键的几段效果更好；想让正文一直记得手机里聊过的事，可以打开「预设 → 聊天 → 记忆 → 正文也带上手机里的事」' : ''}`);
         render();
         break;
       }
-      case 'cancel-bring': api.chatCancelBring?.(); ctx.notify('已取消'); render(); break;
+      case 'cancel-bring': await api.chatCancelBring?.(); ctx.notify('已取消，这次不带聊天进正文'); render(); break;
+      case 'pick-up': case 'pick-down': {
+        // Everything from the picked ones to the first (or the latest) message.
+        const ids = thread.messages.filter(m => !LINE_KINDS.includes(m.kind)).map(m => m.id), at = ids.map((id, i) => selecting.has(id) ? i : -1).filter(i => i >= 0);
+        if (!at.length) break;
+        const [from, to] = action === 'pick-up' ? [0, at.at(-1)] : [at[0], ids.length - 1];
+        selecting = new Set(ids.slice(from, to + 1));
+        render();
+        break;
+      }
+      case 'delete-go': {
+        const picked = thread.messages.map((m, i) => selecting.has(m.id) ? i : -1).filter(i => i >= 0);
+        if (!picked.length) break;
+        // The notes between them (拍一拍, 撤回, system lines) go with them.
+        const ids = thread.messages.filter((m, i) => selecting.has(m.id) || (LINE_KINDS.includes(m.kind) && i > picked[0] && i < picked.at(-1))).map(m => m.id);
+        if (!await ctx.confirm(`删除这 ${selecting.size} 条消息？`, '删掉后聊天记录里就没有了，TA 之后也不会再看到这些。')) break;
+        await api.deleteChatMessages(threadId, ids);
+        selecting = null;
+        ctx.notify(`删除了 ${ids.length} 条消息`);
+        render();
+        break;
+      }
       case 'contact-add': addContact(); break;
       case 'contact-edit': contactDraft = structuredClone(api.getState().chat.contacts.find(c => c.id === el.dataset.id)); mode = 'contact-edit'; render(); break;
       case 'contact-cancel': contactDraft = null; mode = 'list'; render(); break;
@@ -1206,19 +1564,29 @@ export function chatApp(ctx) {
   v.back = () => {
     if (mode === 'thread' && panel) { panel = null; syncPanel(); return true; }
     if (mode === 'thread' && selecting) { selecting = null; render(); return true; }
-    if (mode !== 'list') { mode = 'list'; threadId = null; selecting = null; quote = null; contactDraft = null; render(); return true; }
+    if (mode !== 'list') {
+      // From a chat: its picture flies back down into its row.
+      const was = mode === 'thread' ? threadId : null, from = was ? v.root.querySelector('.th-head')?.firstElementChild?.getBoundingClientRect() : null;
+      mode = 'list'; threadId = null; selecting = null; quote = null; contactDraft = null;
+      Promise.resolve(render()).then(() => { if (from) fly(ctx.win, v.root.querySelector(`.conv[data-conv="${was}"]`)?.firstElementChild, from, {duration: 320, easing: 'bounce'}); });
+      return true;
+    }
     if (tab !== 'msgs') { tab = 'msgs'; render(); return true; }
     return false;
   };
   v.refresh = () => render();
   v.onAvatars = () => render();
   v.openThread = open;
+  /** The chat on screen (null on the lists). */
+  v.showing = () => mode === 'thread' ? threadId : null;
   v.onChat = event => {
     if (mode === 'list' && tab !== 'moments') return render();
     if (mode === 'thread' && (!event.threadId || event.threadId === threadId)) return render();
   };
   v.onPlayback = () => { if (mode === 'thread') paintVoices(); };
   v.onMoments = () => { if (mode === 'list') render(); };
+  /** 动态, from the tavern page's 动态小窗. */
+  v.showMoments = () => { mode = 'list'; tab = 'moments'; threadId = null; search = ''; moments.only(''); v.root.scrollTop = 0; render(); };
   const dispose = v.dispose;
   v.dispose = () => { ctx.win.clearTimeout(pace.timer); moments.dispose(); for (const url of photoURLs.values()) if (url) ctx.win.URL.revokeObjectURL(url); photoURLs.clear(); dispose(); };
   render();

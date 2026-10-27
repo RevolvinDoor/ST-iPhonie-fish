@@ -1,13 +1,17 @@
-import {createView, esc, engines, btn, field, input, select, textArea, toggle, heading, help, groupTitle, plate} from './common.js';
+import {createView, esc, engines, btn, field, input, select, textArea, toggle, heading, help, groupTitle, plate, menu} from './common.js';
 
 const TIERS = {0: '未订阅', 1: 'Tablet', 2: 'Scroll', 3: 'Opus'};
 import {icon, spark} from './icons.js';
+import {swipeRow, mountSwipeList} from './swipe-list.js';
+import {fly} from './carry.js';
+import {CUSTOM_TEMPLATES, voicesFromFolder, shortLanguage, customHint} from '../core/custom-voice.js';
 
 export function enginesApp(ctx) {
   const {api} = ctx, v = createView(ctx, 'engines'), drafts = new Map();
   let engine = null, dirty = false, subscription = null, subscriptionError = '', subscriptionStatus = 0, textDraft = null, models = [], subscriptionLoad = 0;
   // ComfyUI: what the last connection check found ({models, samplers, schedulers} or {error}), and the tavern's workflows.
   let comfyInfo = null, comfyRequest = 0;
+  let gptList = [], gptStatus = '', gptRequest = 0;
   // The wallet is a stack: the last card is the one in front. A tap on another card draws it to the front; a tap on
   // the front card opens it.
   // The cards come in three pockets: 图像 (the drawing engines), 语音 (the voice engines), 文字 (text and vector models).
@@ -72,17 +76,20 @@ export function enginesApp(ctx) {
       ? [['SOURCE', custom ? 'CUSTOM API' : 'TAVERN'], ['MODEL', custom ? t.presets.find(p => p.id === t.active)?.model || '未填写' : '跟随酒馆']]
       : nai
       ? [['TIER', subscription ? TIERS[subscription.tier] || '未知' : '—'], ['ANLAS', subscription ? String(subscription.anlas) : '—']]
+      : id === 'custom'
+        ? [['API', (api.getState().connections.custom.params.url || '').replace(/^https?:\/\//, '').split('/')[0] || '未填写'], ['VOICES', (api.getState().connections.custom.params.voices || []).length + ' 个']]
       : PRICED.includes(id) && saved
         ? [['MODEL', api.getState().connections[id].model], [id === 'eleven' ? 'CREDITS' : 'BALANCE', balanceText(id)]]
         : [['MODEL', api.getState().connections[id].model], ['ROLES', api.getState().routes.filter(r => r.engine === id && r.voice).length + ' 个角色']];
     const front = frontOf(id) === id;
     const attrs = tag === 'button' ? `data-action="engine" data-engine="${id}" aria-label="${name}，${front ? '点一下打开' : '点一下抽到最前面'}"` : `data-engine="${id}"`;
     const dots = comfy ? '' : `•••• •••• •••• ${api.keyHint?.(id) || '••••'}`;
-    const number = vector ? (em.enabled ? (saved ? dots : '未绑定密钥 · 本地接口可以不填') : '没开 · 记忆用本地检索') : comfy ? d.comfy.url.replace(/^https?:\/\//, '') : llm ? (custom ? (saved ? dots : '未绑定密钥 · 点卡片去填写') : '用酒馆当前连接的模型') : saved ? dots : '未绑定密钥 · 点卡片去填写';
+    const ownApi = id === 'custom' ? (api.getState().connections.custom.params.url || '').replace(/^https?:\/\//, '') : '';
+    const number = id === 'custom' ? (ownApi || '还没填接口地址 · 点卡片去填写') : vector ? (em.enabled ? (saved ? dots : '未绑定密钥 · 本地接口可以不填') : '没开 · 记忆用本地检索') : comfy ? d.comfy.url.replace(/^https?:\/\//, '') : llm ? (custom ? (saved ? dots : '未绑定密钥 · 点卡片去填写') : '用酒馆当前连接的模型') : saved ? dots : '未绑定密钥 · 点卡片去填写';
     return `<${tag} class="bank-card${tag === 'div' ? ' detail-card' : ''}" ${attrs}>${spark()}
       <span class="card-top"><span class="card-name">${name}</span><span class="card-kind">${IMAGE.includes(id) ? 'IMAGE' : llm ? 'TEXT' : vector ? 'VECTOR' : 'VOICE'}${icon('nfc')}</span></span>
       <span class="card-chip"></span>
-      <span class="card-number${number.startsWith('•') || comfy ? '' : ' none'}${comfy ? ' address' : ''}">${number}</span>
+      <span class="card-number${number.startsWith('•') || comfy || ownApi ? '' : ' none'}${comfy || ownApi ? ' address' : ''}">${number}</span>
       <span class="card-bottom">${fields.map(([k, value]) => `<span><span class="k">${k}</span><span class="v">${esc(value)}</span></span>`).join('')}<span class="card-brand">ST-iPhonie</span></span></${tag}>`;
   }
 
@@ -107,53 +114,69 @@ export function enginesApp(ctx) {
     catch (error) { if (load !== subscriptionLoad) return; subscription = null; subscriptionError = error.message; subscriptionStatus = error.status || 0; }
     if (!v.disposed && (engine === null || engine === 'nai')) {
       // A balance response may arrive while the user is typing the new connection.
-      const fields = [...v.root.querySelectorAll('[data-field]')].filter(el => el.type !== 'checkbox').map(el => [el.dataset.field, el.value, el.type]);
+      const fields = [...v.root.querySelectorAll('[data-field]')].filter(el => el.type !== 'checkbox').map(el => [el.dataset.field, el.value, el.classList.contains('secret-visible')]);
       render();
-      for (const [name, value, type] of fields) { const el = v.root.querySelector(`[data-field="${name}"]`); if (el) { el.value = value; if (name === 'key') el.type = type; } }
+      for (const [name, value, visible] of fields) { const el = v.root.querySelector(`[data-field="${name}"]`); if (el) { el.value = value; if (name === 'key') el.classList.toggle('secret-visible', visible); } }
     }
   }
 
-  function imageConnections(id) {
+  // A key box: what is saved shows as a hint inside it (never the key), the eye shows what is typed, and the key is saved
+  // once the box is left; clearing it is in the page's 「⋯」.
+  const keyBox = (label, saved, placeholder, info) => field(label, `<div class="key-box">${textArea('key', '', `rows="1" class="api-secret" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore placeholder="${esc(saved ? '已保存 •••• ' + saved + ' · 填新的会替换' : placeholder)}"`)}${btn('reveal-key', icon('eye'), 'key-eye', 'aria-label="显示密钥"')}</div>`, info);
+  /** The 「⋯」 on an engine page. */
+  const moreButton = () => btn('engine-more', icon('more'), 'round-button', 'aria-label="更多"');
+  /** Which saved connection (name, address, key) the image engine uses: a row, when there is more than one. */
+  function imageConnectionRow(id) {
     const list = api.imageConnectionList(id), current = list.find(p => p.current);
-    return groupTitle('已存连接', help('每组连接分别保存名称、地址和密钥。点名称就切换，之后出图用选中的这一组；不会自动换到别的中转。新建时密钥留空，避免把上一家的密钥发到新地址。'))
-      + `<div class="group pad"><div class="text-presets">${list.map(p => `<button type="button" class="combo-chip" data-action="image-connection" data-id="${esc(p.id)}" aria-pressed="${p.current}">${esc(p.name)} · ${p.configured ? '•••• ' + esc(p.tail || '已存') : '未填密钥'}</button>`).join('')}${btn('image-new', icon('add') + '新建', 'chip-button')}</div>
-        ${field('连接名称', input('image-name', current.name, 'text', 'maxlength="60"'))}
-        <div class="key-actions">${btn('image-save', '保存这组连接', 'primary')}${list.length > 1 ? btn('image-delete', '删除这组', 'danger') : ''}</div>
-        <p class="hint" style="padding:0">保存会一起记住下方填写的地址和密钥；密钥留空会保留原来的。</p></div>`;
+    return list.length > 1 ? `<div class="setting-row"><span>在用的连接${help('每组连接分别保存名称、地址和密钥，出图用选中的这一组。新建、切换、改名、删除在右上角「⋯」里。')}</span>${btn('image-connections', esc(current.name) + icon('next'), 'chip-button')}</div>` : '';
   }
   function imageSaved() {
     subscriptionLoad++; subscription = null; subscriptionError = ''; subscriptionStatus = 0;
+    resetGptModels();
     render(); if (engine === 'nai' && api.keyStatus('nai')) loadSubscription(true);
   }
-  function saveImageForm() {
-    const read = name => v.root.querySelector(`[data-field="${name}"]`)?.value;
+  /**
+   * Saves one thing typed on an image engine page (key or address) into the connection in use. The page is drawn again
+   * a moment later: the box was left for another one, which has the cursor by then and keeps it.
+   */
+  function saveImageField(patch, note) {
     const id = api.getState().draw.connections[engine].active;
-    api.saveImageConnection(engine, {id, name: read('image-name'), key: read('key'), url: read(engine === 'nai' ? 'relay' : 'gpt-url'), ...(engine === 'gpt' ? {model: read('gpt-model')} : {})});
-    imageSaved(); ctx.notify('这组连接已保存');
+    api.saveImageConnection(engine, {id, ...patch});
+    ctx.notify(note); later(imageSaved);
   }
-  async function leaveImageForm() {
-    const list = api.imageConnectionList(engine), current = list.find(p => p.current), read = name => v.root.querySelector(`[data-field="${name}"]`)?.value;
-    const changed = read('image-name') !== current.name || !!read('key')?.trim() || read(engine === 'nai' ? 'relay' : 'gpt-url') !== current.url || (engine === 'gpt' && read('gpt-model') !== current.model);
-    return !changed || await ctx.confirm('放弃未保存的修改？', '这组连接的名称、地址或密钥还没保存。返回后先点「保存这组连接」就能保留。');
+  const later = fn => ctx.win.setTimeout(() => { if (!v.disposed) fn(); }, 0);
+  /** The image engine's saved connections: a tap uses one; swiped left 改名 / 删除; 「＋」 makes a new one. */
+  function imageConnectionMenu() {
+    const list = api.imageConnectionList(engine);
+    const d = ctx.dialog('连接', `<div class="pick-list" data-conn-list>${list.map(p => swipeRow(p.id, `<div class="list-row">${icon(p.current ? 'check' : 'next')}<span><strong>${esc(p.name)}</strong><small>${esc((p.url || (engine === 'nai' ? '直连 NovelAI' : '直连 OpenAI')) + ' · ' + (p.configured ? '•••• ' + (p.tail || '已存') : '未填密钥'))}</small></span></div>`,
+      [{key: 'rename', label: '改名', icon: 'edit'}, ...(list.length > 1 ? [{key: 'delete', label: '删除', icon: 'trash', danger: true}] : [])], {label: p.name})).join('')}</div>`, {add: '新建一组连接'});
+    const swipe = mountSwipeList(d.body.querySelector('[data-conn-list]'), {ctx,
+      onTap: id => { d.close(); if (id !== list.find(p => p.current)?.id) { api.selectImageConnection(engine, id); imageSaved(); ctx.notify('已切换生图连接'); } },
+      onAction: async (key, id) => {
+        const p = list.find(x => x.id === id);
+        if (!p) return;
+        if (key === 'rename') {
+          d.close();
+          const r = ctx.dialog('改名', `${field('连接名称', input('image-name', p.name, 'text', 'maxlength="60"'))}<div class="actions">${btn('image-rename', '保存', 'primary')}</div>`);
+          r.body.addEventListener('click', e => { if (!e.target.closest('[data-action=image-rename]')) return; const name = r.body.querySelector('[data-field=image-name]').value; try { api.saveImageConnection(engine, {id: p.id, name}); r.close(); imageSaved(); } catch (error) { ctx.notify(error.message, {error: true}); } });
+          return;
+        }
+        if (key === 'delete') { d.close(); if (await ctx.confirm('删除这组连接？', `「${p.name}」的地址和密钥会一起删掉，其他组保留。`)) { api.deleteImageConnection(engine, p.id); imageSaved(); ctx.notify('已删除这组连接'); } }
+      }});
+    d.onClose(() => swipe.dispose());
+    d.overlay.addEventListener('click', e => { if (!e.target.closest('[data-sheet-add]')) return; d.close(); api.saveImageConnection(engine); imageSaved(); ctx.notify('已新建连接，请填写地址和密钥'); });
   }
 
   function renderNovelAI() {
     const saved = api.keyStatus('nai'), d = api.getState().draw;
     v.root.dataset.engine = 'nai';
-    v.draw(heading('NovelAI', '', 'Image Card')
+    v.draw(heading('NovelAI', moreButton(), 'Image Card')
       + card('nai', 'div')
-      + imageConnections('nai')
-      + groupTitle('连接')
-      + `<div class="group pad">
-          <div class="setting-row"><span>密钥</span><span class="key-state ${saved ? 'ok' : 'no'}">${saved ? `已保存${api.keyHint?.(engine) ? '，末尾 ' + esc(api.keyHint(engine)) : ''}` : '还没有填写'}</span></div>
-          ${field(d.relay.url ? '中转密钥' : 'Persistent API Token', input('key', '', 'password', `autocomplete="off" placeholder="${saved ? '已保存，填写新的可替换' : d.relay.url ? '填中转要求的密钥' : '在 NovelAI 账户设置里获取，以 pst- 开头'}"`), d.relay.url ? '用了中转时，填中转要求的密钥（可能就是 NovelAI 的 pst- 密钥，也可能是中转自己发的）。密钥只保存在当前浏览器和酒馆地址。' : '插件直接连接 NovelAI，不经过酒馆。密钥只保存在当前浏览器和酒馆地址。')}
-          <div class="key-actions">${btn('save-key', icon('key') + '保存密钥', 'primary')}${btn('reveal-key', '显示', 'secondary')}${btn('clear-key', '清除', 'danger')}</div>
-        </div>`
-      + groupTitle('中转', help('自己搭的 NovelAI 中转。中转的路径要和官方一样：出图 /ai/generate-image，查订阅 /user/subscription；插件把请求原样发到「中转地址 + 路径」。留空就直连 NovelAI。\n\n中转要允许跨域（CORS）；酒馆用 HTTPS 打开时，中转也要用 HTTPS。'))
-      + `<div class="group pad">
+      + groupTitle('连接', help('自己搭的 NovelAI 中转：路径要和官方一样（出图 /ai/generate-image，查订阅 /user/subscription），插件把请求原样发到「中转地址 + 路径」。留空就直连 NovelAI。\n\n中转要允许跨域（CORS）；酒馆用 HTTPS 打开时，中转也要用 HTTPS。填完点一下别处就保存了。'))
+      + `<div class="group pad">${imageConnectionRow('nai')}
+          ${keyBox(d.relay.url ? '中转密钥' : 'Persistent API Token', saved && (api.keyHint?.('nai') || '已保存'), d.relay.url ? '填中转要求的密钥' : '在 NovelAI 账户设置里获取，以 pst- 开头', d.relay.url ? '用了中转时，填中转要求的密钥（可能就是 NovelAI 的 pst- 密钥，也可能是中转自己发的）。密钥只保存在当前浏览器和酒馆地址。' : '插件直接连接 NovelAI，不经过酒馆。密钥只保存在当前浏览器和酒馆地址。')}
           ${field('中转地址', input('relay', d.relay.url, 'url', 'autocomplete="off" placeholder="留空直连，例如 https://nai.example.com"'))}
           ${d.relay.url ? toggle('relayOpus', '读不到订阅时按 Opus 算', d.relay.assumeOpus, '中转不转发查订阅的接口时打开：28 步、1024×1024 以内的非 V5 小图当作免费，可以自动出图。V5 的免费额度读不到，仍然会先问。账号不是 Opus 时，这些图会扣 Anlas。') : ''}
-          <div class="key-actions">${btn('save-relay', d.relay.url ? '保存中转' : '使用中转', 'primary')}${d.relay.url ? btn('test-relay', icon('refresh') + '测试连接', 'secondary', saved ? '' : 'disabled') : ''}</div>
         </div>`
       + groupTitle('订阅', btn('refresh-subscription', icon('refresh') + '刷新', 'chip-button', saved ? '' : 'disabled'))
       + `<div class="group">
@@ -161,49 +184,51 @@ export function enginesApp(ctx) {
           <div class="setting-row"><span>Anlas 余额</span><strong>${subscription ? subscription.anlas : '—'}</strong></div>
           <div class="setting-row"><span>免费小图</span><small>${subscription ? (subscription.unlimited ? 'V4.5 及更早：无限（28 步、1024×1024 以内）' : subscription.active ? '仅 Opus 可用：每张图都会扣 Anlas' : '订阅未生效：每张图都会扣 Anlas') : '—'}</small></div>
           ${subscription?.unlimited ? `<div class="setting-row"><span>V5 免费额度</span><small>${subscription.usage ? (subscription.usage.negative || subscription.usage.percent < 2 ? `${subscription.usage.percent}% · 已用完，会扣 Anlas` : `还剩 ${subscription.usage.percent}%，会慢慢恢复`) : '未读到'}</small></div>` : ''}
-        </div>${relayNoSubscription() ? `<p class="hint">这个中转不转发查订阅（插件请求的是「中转地址/user/subscription」），出图不受影响。${d.relay.assumeOpus ? '已经按 Opus 算，小图会自动出。' : '想让新回复自动出图，打开上面的「读不到订阅时按 Opus 算」。'}点「测试连接」可以单独检查出图接口。</p>` : subscriptionError ? `<p class="error-copy hint">${esc(subscriptionError)}</p>` : ''}`
-      + `<div class="group">${toggle('guard', '免费档守卫', d.guard, '开启时绘图参数不会超出免费档，不会发出扣 Anlas 的请求。')}</div>
-        <div class="actions">${btn('open-draw', icon('paint') + '打开绘图', 'primary')}</div>`);
+        </div>${relayNoSubscription() ? `<p class="hint">这个中转不转发查订阅（插件请求的是「中转地址/user/subscription」），出图不受影响。${d.relay.assumeOpus ? '已经按 Opus 算，小图会自动出。' : '想让新回复自动出图，打开上面的「读不到订阅时按 Opus 算」。'}右上角「⋯」里的「测试连接」可以单独检查出图接口。</p>` : subscriptionError ? `<p class="error-copy hint">${esc(subscriptionError)}</p>` : ''}`
+      + `<div class="actions">${btn('open-draw', icon('paint') + '打开绘图', 'secondary')}</div>`);
   }
 
   /** The engine the 绘图 App draws with: a line on each image card, with a button to switch to this one. */
   const drawingWith = id => {
     const using = api.getState().draw.engine === id;
-    return `<div class="group"><div class="setting-row"><span>绘图 App 用它来画</span>${using ? plate('正在用') : btn('use-draw-engine', '改用它画', 'chip-button', `data-engine="${id}"`)}</div></div>`;
+    return `<div class="setting-row"><span>绘图 App 用它来画</span>${using ? plate('正在用') : btn('use-draw-engine', '改用它画', 'chip-button', `data-engine="${id}"`)}</div>`;
   };
   function renderGpt() {
     const saved = api.keyStatus('gpt'), g = api.getState().draw.gpt;
     v.root.dataset.engine = 'gpt';
-    v.draw(heading('GPT 生图', '', 'Image Card')
+    v.draw(heading('GPT 生图', moreButton(), 'Image Card')
       + card('gpt', 'div')
-      + drawingWith('gpt')
-      + imageConnections('gpt')
-      + groupTitle('连接')
-      + `<div class="group pad">
-          <div class="setting-row"><span>密钥</span><span class="key-state ${saved ? 'ok' : 'no'}">${saved ? `已保存${api.keyHint('gpt') ? '，末尾 ' + esc(api.keyHint('gpt')) : ''}` : '还没有填写'}</span></div>
-          ${field(g.url ? '中转密钥' : 'OpenAI API Key', input('key', '', 'password', `autocomplete="off" placeholder="${saved ? '已保存，填写新的可替换' : g.url ? '填中转要求的密钥' : 'sk- 开头'}"`), '插件从浏览器直接请求 OpenAI（或你填的中转），密钥只保存在当前浏览器和酒馆地址。每张图都按对方的价格收费。')}
-          <div class="key-actions">${btn('save-key', icon('key') + '保存密钥', 'primary')}${btn('reveal-key', '显示', 'secondary')}${btn('clear-key', '清除', 'danger')}</div>
-        </div>`
-      + groupTitle('接口', help('留空就直连 OpenAI（https://api.openai.com/v1）。用中转时填中转给的地址，写到 /v1 为止；插件请求的是「地址/images/generations」。\n\n中转要允许跨域（CORS）；酒馆用 HTTPS 打开时，中转也要用 HTTPS。'))
-      + `<div class="group pad">
+      + groupTitle('连接', help('接口地址留空就直连 OpenAI（https://api.openai.com/v1）。用中转时填中转给的地址，写到 /v1 为止；插件请求的是「地址/images/generations」。中转要允许跨域（CORS）；酒馆用 HTTPS 打开时，中转也要用 HTTPS。填完点一下别处就保存了。\n\nGPT 读不懂 NovelAI 的写法：插件会把出图块里的英文 tag 和每个人的外貌整理成一段英文描述再发过去；画师串、权重括号和负面不会发。GPT 的内容审核比较严，被拒时会显示它给的原因。画质、画幅和要不要每张先问，在绘图 App 的「参数」里改。'))
+      + `<div class="group pad">${drawingWith('gpt')}${imageConnectionRow('gpt')}
+          ${keyBox(g.url ? '中转密钥' : 'OpenAI API Key', saved && (api.keyHint('gpt') || '已保存'), g.url ? '填中转要求的密钥' : 'sk- 开头', '插件从浏览器直接请求 OpenAI（或你填的中转），密钥只保存在当前浏览器和酒馆地址。每张图都按对方的价格收费。')}
           ${field('接口地址', input('gpt-url', g.url, 'url', 'autocomplete="off" placeholder="留空直连 OpenAI，例如 https://relay.example.com/v1"'))}
-          <div class="key-actions">${btn('save-gpt-url', g.url ? '保存地址' : '使用中转', 'primary')}</div>
-          ${field('模型', input('gpt-model', g.model, 'text', `list="sttts-gpt-models" autocomplete="off" spellcheck="false"`) + `<datalist id="sttts-gpt-models">${api.drawCatalog.gptModels.map(m => `<option value="${esc(m)}">`).join('')}</datalist>`, 'gpt-image 系列画得最好；dall-e-3 便宜一些但不太听 tag。中转上别的模型名（只要是 OpenAI 的 images 接口）也可以直接填。')}
+          ${field('模型', `<div class="music-selfhost">${input('gpt-model', g.model, 'text', `list="sttts-gpt-models" autocomplete="off" spellcheck="false"`)}${btn('gpt-models', icon('refresh') + '读取', 'secondary small')}</div><datalist id="sttts-gpt-models">${gptModelOptions()}</datalist>`, '「读取」列出这组连接提供的模型；列表可能包含文字模型，请选择支持 images 接口的模型。中转的自定义名称（例如 image2.5）也可以直接填，名称以中转提供的为准。')}
+          <p class="hint" data-gpt-status aria-live="polite">${esc(gptStatus)}</p>
+          <div class="combo-menu model-list" data-gpt-model-list ${gptList.length ? '' : 'hidden'}>${gptModelButtons(g.model)}</div>
         </div>
-        <p class="hint">GPT 读不懂 NovelAI 的写法：插件会把出图块里的英文 tag 和每个人的外貌整理成一段英文描述再发过去；画师串、权重括号和负面不会发。GPT 的内容审核比较严，被拒时会显示它给的原因。画质、画幅和要不要每张先问，在绘图 App 的「参数」里改。</p>
-        <div class="actions">${btn('open-draw', icon('paint') + '打开绘图', 'primary')}</div>`);
+        <div class="actions">${btn('open-draw', icon('paint') + '打开绘图', 'secondary')}</div>`);
+  }
+  const gptModelButtons = model => gptList.map(m => `<button type="button" class="combo-chip" data-action="gpt-pick" data-model="${esc(m)}" aria-pressed="${m === model}">${esc(m)}</button>`).join('');
+  const gptModelOptions = () => [...new Set([...gptList, ...api.drawCatalog.gptModels])].map(m => `<option value="${esc(m)}">`).join('');
+  function resetGptModels() { gptRequest++; gptList = []; gptStatus = ''; }
+  // Only replace the result area: a delayed response must not erase the connection form being edited.
+  function updateGptModels() {
+    if (v.disposed || engine !== 'gpt') return;
+    const status = v.root.querySelector('[data-gpt-status]'), list = v.root.querySelector('[data-gpt-model-list]'), options = v.root.querySelector('#sttts-gpt-models');
+    if (status) status.textContent = gptStatus;
+    if (list) { list.hidden = !gptList.length; list.innerHTML = gptModelButtons(v.root.querySelector('[data-field=gpt-model]')?.value); }
+    if (options) options.innerHTML = gptModelOptions();
   }
   function renderComfy() {
     const c = api.getState().draw.comfy, info = comfyInfo;
     v.root.dataset.engine = 'comfy';
-    v.draw(heading('ComfyUI', '', 'Image Card') + card('comfy', 'div') + drawingWith('comfy')
+    v.draw(heading('ComfyUI', '', 'Image Card') + card('comfy', 'div') + `<div class="group">${drawingWith('comfy')}</div>`
       + groupTitle('连接', help('生成图片经酒馆服务器连接 ComfyUI。地址填酒馆所在电脑能访问的地址；同机一般是 http://127.0.0.1:8188，另一台电脑需使用局域网地址和 --listen。'))
       + `<div class="group pad">
-        ${field('ComfyUI 地址', input('comfy-url', c.url, 'url', 'autocomplete="off" placeholder="http://127.0.0.1:8188"'))}
-        <div class="key-actions">${btn('save-comfy-url', '保存地址', 'primary')}${btn('comfy-test', icon('refresh') + '测试连接', 'secondary')}</div>
+        ${field('ComfyUI 地址', `<div class="music-selfhost">${input('comfy-url', c.url, 'url', 'autocomplete="off" placeholder="http://127.0.0.1:8188"')}${btn('comfy-test', icon('refresh') + '测试', 'secondary small')}</div>`, '填完点一下别处就保存了。')}
         ${info ? `<div class="comfy-note${info.error ? ' error-copy' : ''}">${info.error ? `连接失败 ${help(info.error)}` : '连接正常'}</div>` : ''}
         ${field('LoRA 列表连接', select('comfy-transport', c.loraTransport, [['tavern', '经酒馆代理'], ['direct', '浏览器直连']]), '列表读取经酒馆代理时需要 enableCorsProxy。浏览器直连需要 ComfyUI 允许跨域，且当前设备能访问这个地址。生成图片仍经酒馆转发。')}
-      </div><div class="actions">${btn('open-draw', icon('paint') + '去绘画 · 方案与 LoRA', 'primary')}</div>`);
+      </div><div class="actions">${btn('open-draw', icon('paint') + '去绘画 · 方案与 LoRA', 'secondary')}</div>`);
   }
   async function loadComfy() {
     const token = ++comfyRequest, url = v.root.querySelector('[data-field=comfy-url]')?.value;
@@ -266,8 +291,9 @@ export function enginesApp(ctx) {
       return [`正在用 ${names[s.draw.engine] || 'NovelAI'}`, `${ready}/${g.ids.length}`];
     }
     if (g.id === 'voice') {
-      const ready = g.ids.filter(id => api.keyStatus(id)).length, voiced = s.routes.filter(r => r.voice).length;
-      return [ready ? `${ready} 家绑定了密钥 · ${voiced} 个角色有音色` : '还没有绑定密钥', `${ready}/${g.ids.length}`];
+      // 自己的接口 is ready once it has an address (a key is optional there).
+      const ready = g.ids.filter(id => id === 'custom' ? !!s.connections.custom?.params?.url : api.keyStatus(id)).length, voiced = s.routes.filter(r => r.voice).length;
+      return [ready ? `${ready} 家能用 · ${voiced} 个角色有音色` : '还没有绑定密钥', `${ready}/${g.ids.length}`];
     }
     const custom = s.text.source === 'custom', vector = s.embed?.enabled;
     return [`${custom ? '自定义接口' : '酒馆主模型'}写字 · 记忆${vector ? '按意思找（向量）' : '本地检索'}`, `${(custom ? 1 : 0) + (vector ? 1 : 0)}/2`];
@@ -288,9 +314,9 @@ export function enginesApp(ctx) {
   /** Fish relay (中转): an address in front of Fish Audio, saved on its own, and a check of what it forwards. */
   function fishRelay() {
     const fish = api.getState().connections.fish, relay = fish.relay || '';
-    return `${field('中转地址', input('relay', relay, 'url', 'autocomplete="off" placeholder="留空直连 Fish Audio，例如 https://fish.example.com"'), '用中转（公益站、自己搭的反代）时填这里，留空就直连 Fish Audio。\n\n插件会把请求发到「中转地址」加上 Fish 官方的路径：合成 /compat/v1/audio/speech，音色列表 /model，余额 /wallet/self/api-credit。所以只填到这些路径前面为止；把完整地址粘进来也行，会自动去掉。\n\n中转要允许网页直接访问（CORS）；酒馆用 HTTPS 打开时，中转也要是 HTTPS。密钥填中转要求的那个（可能是 Fish 的，也可能是站长发的），一样可以存好几个。')}
+    return `${field('中转地址', input('relay', relay, 'url', 'autocomplete="off" placeholder="留空直连 Fish Audio，例如 https://fish.example.com"'), '用中转（公益站、自己搭的反代）时填这里，留空就直连 Fish Audio；填完点一下别处就保存了，右上角「⋯」里可以测试连接。\n\n插件会把请求发到「中转地址」加上 Fish 官方的路径：合成 /compat/v1/audio/speech，音色列表 /model，余额 /wallet/self/api-credit。所以只填到这些路径前面为止；把完整地址粘进来也行，会自动去掉。\n\n中转要允许网页直接访问（CORS）；酒馆用 HTTPS 打开时，中转也要是 HTTPS。密钥填中转要求的那个（可能是 Fish 的，也可能是站长发的），一样可以存好几个。')}
       ${relay ? field('中转接口格式', select('relayApi', fish.relayApi || 'fish', [['fish', 'Fish 官方路径（/compat/v1/audio/speech）'], ['openai', 'OpenAI 格式（/v1/audio/speech）']]), '保存中转或者测试连接时会自动认出来，一般不用自己选。\n\nOpenAI 格式的中转只收文字、音色 ID、模型和语速：情绪标签写在文字里，照样有效；没有音色列表（音色 ID 手动填）、不能带参考音频、看不到余额，温度等其他参数由中转决定。') : ''}
-      <div class="key-actions">${btn('save-fish-relay', relay ? '保存中转' : '使用中转', 'primary')}${btn('test-fish-relay', icon('refresh') + '测试连接', 'secondary', api.keyStatus('fish') ? '' : 'disabled')}</div>`;
+`;
   }
   function fishProbeReport(r, switched = '') {
     const where = r.relay ? '中转' : 'Fish Audio', path = p => `「${esc(r.base)}${p}」`;
@@ -329,51 +355,67 @@ export function enginesApp(ctx) {
       rows = `<div class="setting-row"><span>API 余额</span><strong>$${b.credit.toFixed(2)}</strong></div>
         <div class="setting-row"><span>免费额度</span><small>${b.free ? '还有' : '没有或已用完'}</small></div>`;
     } else rows = `<div class="setting-row"><span>额度</span><small>${state || '—'}</small></div>`;
-    return groupTitle('额度', btn('refresh-balance', icon('refresh') + '刷新', 'chip-button', saved ? '' : 'disabled'))
-      + `<div class="group${b?.kind === 'characters' ? ' pad' : ''}">${rows}</div>${entry.error ? `<p class="error-copy hint">${esc(entry.error)}</p>` : ''}`
-      + `<p class="hint">${engine === 'eleven' ? '每生成一句新语音后自动重新读取。ElevenLabs 按字符扣积分，v3/v4 等模型的倍率以官网为准。' : '每生成一句新语音后自动重新读取。金额是 Fish Audio 后台的 API 余额。'}</p>`;
+    return groupTitle('额度', help(engine === 'eleven' ? '每生成一句新语音后自动重新读取。ElevenLabs 按字符扣积分，v3/v4 等模型的倍率以官网为准。' : '每生成一句新语音后自动重新读取。金额是 Fish Audio 后台的 API 余额。') + btn('refresh-balance', icon('refresh') + '刷新', 'chip-button', saved ? '' : 'disabled'))
+      + `<div class="group${b?.kind === 'characters' ? ' pad' : ''}">${rows}</div>${entry.error ? `<p class="error-copy hint">${esc(entry.error)}</p>` : ''}`;
   }
 
   function renderDetail() {
     const schema = api.engineSchema(engine, draft());
     drafts.set(engine, schema.connection);
-    const c = draft(), saved = api.keyStatus(engine);
+    const c = draft(), saved = api.keyStatus(engine), fish = engine === 'fish' ? api.getState().connections.fish : null;
     v.root.dataset.engine = engine;
+    const tags = ['doubao', 'custom'].includes(engine) || engine === 'eleven' && !/^eleven_v[34]/.test(c.model) ? [] : engine === 'fish' && !['s1', 'drama-3'].includes(c.model) ? ['happy', 'whispers sweetly', 'slightly sad'] : schema.tags;
     const unsupported = schema.models.filter(m => !m.supported).map(m => m.id + '：' + m.reason).join('\n');
-    v.draw(heading(engines[engine], '', 'Engine Card')
+    v.draw(heading(engines[engine], moreButton(), 'Engine Card')
       + card(engine, 'div')
       + groupTitle('连接')
       + `<div class="group pad">
-          <div class="setting-row"><span>密钥</span><span class="key-state ${saved ? 'ok' : 'no'}">${saved ? keyState(engine) : '还没有填写'}</span></div>
           ${keyRows(engine)}
-          ${field(saved ? '添加密钥' : 'API Key', textArea('key', '', `rows="2" class="code" autocomplete="off" spellcheck="false" placeholder="${saved ? '粘贴新的密钥，会加在后面' : '粘贴密钥；有多个账号可以每行一个'}"`), '可以保存多个账号的密钥，新加的排在后面，不用的可以单独删掉。先用排在前面的；某个密钥被拒（401、403）、额度用完（402）或请求太频繁（429）时，自动换下一个重试，这次打开页面里不再用它。想手动换，点那个密钥的「用这个」：马上改用它，并把它排到第一个，以后打开也先用它。\n\n密钥只保存在当前浏览器和酒馆地址，按账户分别保存。')}
-          <div class="key-actions">${btn('add-key', icon('key') + (saved ? '添加' : '保存密钥'), 'primary')}${saved ? btn('clear-key', '全部清除', 'danger') : ''}</div>
-          ${field('默认模型', select('model', c.model, schema.models.map(m => [m.id, m.id, !m.supported])), unsupported || '角色没有单独指定模型时使用这里的模型。')}
+          ${field(saved ? '再加一个密钥' : engine === 'custom' ? '密钥（不用密钥的接口可以不填）' : 'API Key', textArea('key', '', `rows="1" class="code key-paste" autocomplete="off" spellcheck="false" placeholder="${saved ? '粘贴新的密钥' : '粘贴密钥，多个就每行一个'}"`), '粘贴完点一下别处就保存了。可以保存多个账号的密钥，新加的排在后面，不用的可以单独删掉。先用排在前面的；某个密钥被拒（401、403）、额度用完（402）或请求太频繁（429）时，自动换下一个重试，这次打开页面里不再用它。想手动换，点那个密钥的「用这个」：马上改用它，并把它排到第一个，以后打开也先用它。\n\n密钥只保存在当前浏览器和酒馆地址，按账户分别保存。')}
+          ${schema.models.length > 1 ? field('默认模型', select('model', c.model, schema.models.map(m => [m.id, m.id, !m.supported])), unsupported || [schema.modelNote, '角色没有单独指定模型时使用这里的模型。'].filter(Boolean).join('\n\n')) : ''}
           ${engine === 'mini' ? field('服务区域', select('region', c.region, [['cn', '国内'], ['global', '国际'], ['uw', '国际 · 低延迟入口']])) : ''}
-          ${engine === 'fish' ? fishRelay() : ''}
-          <div class="actions">${btn('read-voices', icon('refresh') + '读取音色列表', 'secondary')}</div><p class="hint" data-connection-status></p>
         </div>`
+      + (fish ? `<details data-group="fish-relay"><summary>中转<small class="fold-note">${fish.relay ? esc(fish.relay.replace(/^https?:\/\//, '')) : '直连 Fish Audio'}</small></summary><div class="fold-body">${fishRelay()}</div></details>` : '')
+      + (engine === 'custom' ? customImport() + customTemplates() : '')
       + balanceGroup()
-      + groupTitle('参数')
+      + groupTitle(engine === 'custom' ? '接口和音色' : '参数')
       + schema.groups.map((g, i) => `<details data-group="${engine}:${g.id}" ${i === 0 ? 'open' : ''}><summary>${esc(g.title)}</summary><div>${g.fields.map(f => control(f, c)).join('')}</div></details>`).join('')
-      + `<details data-group="tags"><summary>情绪与语气标签</summary><div>${schema.tagNote ? `<p class="hint">${esc(schema.tagNote)}</p>` : ''}<div class="tags">${schema.tags.map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div>${engine === 'mini' && c.model.startsWith('speech-2.8') ? '<div class="tags">' + ['laughs', 'chuckle', 'coughs', 'clear-throat', 'groans', 'breath', 'pant', 'inhale', 'exhale', 'gasps', 'sniffs', 'sighs', 'snorts', 'burps', 'lip-smacking', 'humming', 'hissing', 'emm', 'sneezes'].map(x => `<span class="tag">(${x})</span>`).join('') + '</div>' : ''}${schema.sounds?.length ? '<div class="tags">' + schema.sounds.map(x => `<span class="tag">(${esc(x)})</span>`).join('') + '</div>' : ''}<a href="${esc(schema.source)}" target="_blank" rel="noopener noreferrer">查看官方文档</a></div></details>`
-      + `<div class="actions">${engine === 'fish' ? btn('references', '管理参考音频', 'secondary') : ''}${btn('request-preview', icon('eye') + '请求预览', 'text-button')}</div>`
+      + (tags.length || schema.sounds?.length ? `<details data-group="tags"><summary>情绪与语气标签</summary><div><div class="tags">${tags.map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div>${engine === 'mini' && c.model.startsWith('speech-2.8') ? '<div class="tags">' + ['laughs', 'chuckle', 'coughs', 'clear-throat', 'groans', 'breath', 'pant', 'inhale', 'exhale', 'gasps', 'sniffs', 'sighs', 'snorts', 'burps', 'lip-smacking', 'humming', 'hissing', 'emm', 'sneezes'].map(x => `<span class="tag">(${x})</span>`).join('') + '</div>' : ''}${schema.sounds?.length ? '<div class="tags">' + schema.sounds.map(x => `<span class="tag">(${esc(x)})</span>`).join('') + '</div>' : ''}<a href="${esc(schema.source)}" target="_blank" rel="noopener noreferrer">查看官方文档</a></div></details>` : '')
+      + (engine === 'custom' ? `<div class="actions">${btn('custom-test', icon('play', true) + '试一试', 'secondary')}</div><p class="hint" data-custom-test style="white-space:pre-line"></p>` : '')
       + `<div class="savebar"><span class="save-state" data-save-state>${dirty ? '未保存' : '已保存'}</span>${btn('save-connection', '保存配置', 'primary')}</div>`);
   }
 
+  const FOLDER_KEY = 'sttts.voiceFolder';
+  const lastFolder = () => { try { return ctx.win.localStorage.getItem(FOLDER_KEY) || ''; } catch { return ''; } };
+  /** 自己的接口: a folder of GPT-SoVITS characters (one folder each: .ckpt, .pth, reference audios) in one go. */
+  function customImport() {
+    return `<details data-group="custom-import"><summary>从文件夹导入 ${help('GPT-SoVITS 的角色文件夹（每个角色一个文件夹，里面有 .ckpt、.pth 模型和参考音频）可以一次导入：填这个文件夹在电脑上的位置，再点「选择文件夹」选同一个文件夹。\n\n只读文件名，不会上传任何文件。每个角色变成一个音色：模型路径、参考音频、参考文本（从文件名里读）、参考语言都会填好；同名的音色换成新的。还没填接口的话，会按 GPT-SoVITS 的默认地址填好。导入后，名字和角色一样的角色可以一起换成「自己的接口」。\n\n要在电脑上导入：手机上选不了电脑里的文件夹。导入一次以后手机上也能用。')}<small class="fold-note">GPT-SoVITS 角色文件夹</small></summary><div class="fold-body">${field('文件夹在电脑上的位置', input('voice-folder', lastFolder(), 'text', 'placeholder="比如 E:\\GPT-SoVITS\\MyCharacters" autocomplete="off" spellcheck="false"'))}
+        <div class="actions">${btn('voice-folder-pick', icon('import') + '选择文件夹', 'secondary')}</div><input type="file" data-voice-folder webkitdirectory directory multiple hidden></div></details>`;
+  }
+  /** After an import: roles named like a voice may switch to 自己的接口 with it. */
+  async function matchRoles(voices) {
+    const loose = s => String(s).toLowerCase().replace(/\s+/g, '');
+    const pairs = api.getState().routes.map(r => [r, voices.find(v => loose(v.name) === loose(r.name)) || voices.find(v => loose(r.name).length >= 2 && loose(v.name).startsWith(loose(r.name)))]).filter(([r, v]) => v && !(r.engine === 'custom' && r.voice === v.name));
+    if (!pairs.length) return 0;
+    if (!await ctx.confirm('给角色配上这些音色？', pairs.map(([r, v]) => `${r.name} → ${v.name}`).join('\n') + '\n\n这些角色会换成「自己的接口」，原来的引擎和音色还记着，换回去就恢复。')) return 0;
+    for (const [r, v] of pairs) api.saveRoute({...r, engine: 'custom', voice: v.name});
+    return pairs.length;
+  }
+  /** 自己的接口: one-click formats of well-known self-hosted services (only the user's own address goes in). */
+  function customTemplates() {
+    return `<details data-group="custom-templates"><summary>一键格式 ${help('用自己电脑（或者局域网里别的电脑）上跑的语音服务时，填上它的地址，点「按这个格式填」，下面的接口设置就填好了，再添加音色、保存。插件不带任何别人的服务器地址。\n\n别的服务：照它的接口文档，自己在下面填地址、请求体和回答的格式。')}<small class="fold-note">${CUSTOM_TEMPLATES.map(t => t.name.replace(/（.*）/, '')).join('、')}</small></summary><div class="fold-body">${CUSTOM_TEMPLATES.map(t => field(t.name, `<div class="music-selfhost">${input('voice-base-' + t.id, '', 'url', `placeholder="${esc(t.example)}" autocomplete="off" spellcheck="false"`)}${btn('voice-template', '按这个格式填', 'secondary small', `data-template="${esc(t.id)}"`)}</div>`, t.note)).join('')}</div></details>`;
+  }
   /** 向量模型: an OpenAI-compatible Embeddings API for 记忆 (core/embed.js). Off: 记忆 searches locally. */
   function renderEmbed() {
     const e = embedDraft, hint = api.keyHint('embed'), saved = !!hint;
     v.root.dataset.engine = 'embed';
-    v.draw(heading('向量模型', '', 'Vector Card')
+    v.draw(heading('向量模型', saved ? moreButton() : '', 'Vector Card')
       + card('embed', 'div')
       + groupTitle('做什么用', help('聊天的「记忆」会按最近几句话，从更早的聊天原话里找出相关的几段一起带给模型。\n不开：在本地按字词找，人名、地名、说过的原话找得准，不花钱。\n开了：用 Embedding 模型按意思找（比如“上次吵架”能找到没出现“吵架”两个字的那段），每次回消息多一次很便宜的 Embedding 请求；第一次会给旧聊天建索引，之后只算新的。'))
       + `<div class="group pad">${toggle('embed-enabled', '记忆用向量模型找旧聊天', e.enabled)}</div>`
       + groupTitle('连接') + `<div class="group pad">
           ${field('接口地址', input('embed-url', e.url, 'url', 'autocomplete="off" placeholder="https://api.siliconflow.cn/v1"'), '填到 /v1 为止，后面的 /embeddings 不用写。OpenAI 格式的 Embedding 接口都可以：OpenAI、硅基流动（有免费的 BAAI/bge-m3）、各种中转站、本地的 Ollama。接口要允许网页直接访问（CORS）。')}
-          <div class="setting-row"><span>密钥</span><span class="key-state ${saved ? 'ok' : 'no'}">${saved ? `已保存，末尾 ${esc(hint)}` : '还没有填写'}</span></div>
-          ${field('API Key', input('key', '', 'password', `autocomplete="off" placeholder="${saved ? '已保存，填写新密钥可替换' : '这个接口的密钥（本地接口可以不填）'}"`), '密钥只保存在当前浏览器和酒馆地址，不会写进设置或备份。')}
-          <div class="key-actions">${btn('save-key', icon('key') + '保存密钥', 'primary')}${btn('reveal-key', '显示', 'secondary')}${btn('clear-key', '清除', 'danger')}</div>
+          ${keyBox('API Key', saved && hint, '这个接口的密钥（本地接口可以不填）', '填完点一下别处就保存了。密钥只保存在当前浏览器和酒馆地址，不会写进设置或备份。')}
           ${field('模型', input('embed-model', e.model, 'text', 'autocomplete="off" placeholder="例如 text-embedding-3-small、BAAI/bge-m3"'), '要选 Embedding 模型（名字里常有 embed、bge、e5），聊天模型用不了。换模型后旧聊天会重新建索引。')}
           <div class="actions">${btn('embed-models', icon('refresh') + '读取模型列表', 'secondary')}${btn('embed-test', icon('eye') + '测试一下', 'secondary')}</div>
           <div class="combo-menu model-list" data-model-list ${embedModels.length ? '' : 'hidden'}>${embedModels.map(m => `<button type="button" class="combo-chip" data-action="embed-pick" data-model="${esc(m)}" aria-pressed="${m === e.model}">${esc(m)}</button>`).join('')}</div>
@@ -385,33 +427,30 @@ export function enginesApp(ctx) {
   function renderText() {
     const all = textDraft, t = textPreset(), hint = api.textKeyHint?.(t.id) || '', saved = !!hint, custom = all.source === 'custom';
     v.root.dataset.engine = 'llm';
-    v.draw(heading('文字模型', '', 'Text Card')
+    v.draw(heading('文字模型', custom && (saved || all.presets.length > 1) ? moreButton() : '', 'Text Card')
       + card('llm', 'div')
       + groupTitle('谁来写手机里的字', help('手机里的字：聊天回复、朋友圈、来电，以及正文配图时挑画面。正文本身始终用酒馆的模型。\n酒馆主模型：和正文一样，用酒馆当前连接的模型，换了酒馆的模型手机也跟着换。\n自定义接口：用你自己的 OpenAI 兼容接口，不占用酒馆正在用的模型，正文和手机可以用不同的模型。插件直接从浏览器连接这个接口，不经过酒馆。'))
       + `<div class="group pad"><div class="segmented" style="margin:0">${[['tavern', '酒馆主模型'], ['custom', '自定义接口']].map(([k, l]) => `<button type="button" data-action="text-source" data-source="${k}" aria-pressed="${all.source === k}">${l}</button>`).join('')}</div>
 </div>`
-      + (custom ? groupTitle('接口预设', help('可以存好几套自定义接口：地址、模型、密钥、温度、长度各一份，点一下切换正在用的那套。每套的密钥分开保存；删掉一套，它的密钥也一起删掉。切换、新建、删除和改名都要点下面的「保存」才生效。'))
-        + `<div class="group pad"><div class="text-presets">${all.presets.map(p => `<button type="button" class="combo-chip" data-action="text-preset" data-id="${esc(p.id)}" aria-pressed="${p.id === all.active}">${esc(p.name)}</button>`).join('')}${btn('text-new', icon('add') + '新建', 'chip-button')}</div>
-          ${field('预设名字', input('text-name', t.name, 'text', 'maxlength="40" autocomplete="off"'))}
-          ${all.presets.length > 1 ? `<div class="actions" style="margin-top:0">${btn('text-delete', icon('trash') + '删除这套', 'danger')}</div>` : ''}</div>`
-        + groupTitle('连接') + `<div class="group pad">
+      + (custom ? groupTitle('接口', help('可以存好几套自定义接口：地址、模型、密钥、温度、长度各一份，点一下切换正在用的那套。每套的密钥分开保存；删掉一套（右上角「⋯」），它的密钥也一起删掉。切换、新建、删除和改名都要点下面的「保存」才生效。'))
+        + `<div class="group pad"><div class="text-presets">${all.presets.map(p => `<button type="button" class="combo-chip" data-action="text-preset" data-id="${esc(p.id)}" aria-pressed="${p.id === all.active}">${esc(p.name)}</button>`).join('')}${btn('text-new', icon('add'), 'chip-button', 'aria-label="新建一套接口"')}</div>
+          ${field('名字', input('text-name', t.name, 'text', 'maxlength="40" autocomplete="off"'))}
           ${field('接口地址', input('text-url', t.url, 'url', 'autocomplete="off" placeholder="https://api.openai.com/v1"'), '填到 /v1 为止，后面的 /chat/completions 不用写。OpenAI 格式的服务都可以：OpenAI、DeepSeek、OpenRouter、硅基流动、各种中转站。接口要允许网页直接访问（CORS），不然浏览器会拦下请求。')}
-          <div class="setting-row"><span>密钥</span><span class="key-state ${saved ? 'ok' : 'no'}">${saved ? `已保存，末尾 ${esc(hint)}` : '还没有填写'}</span></div>
-          ${field('API Key', input('key', '', 'password', `autocomplete="off" placeholder="${saved ? '已保存，填写新密钥可替换' : '这个接口的密钥（本地模型可以不填）'}"`), '密钥只保存在当前浏览器和酒馆地址，不会写进设置或备份。')}
-          <div class="key-actions">${btn('save-key', icon('key') + '保存密钥', 'primary')}${btn('reveal-key', '显示', 'secondary')}${btn('clear-key', '清除', 'danger')}</div>
-          ${field('模型', input('text-model', t.model, 'text', 'autocomplete="off" placeholder="例如 gpt-4o-mini、deepseek-chat"'))}
-          <div class="actions">${btn('text-models', icon('refresh') + '读取模型列表', 'secondary')}</div>
+          ${keyBox('API Key', saved && hint, '这个接口的密钥（本地模型可以不填）', '填完点一下别处就保存了。密钥只保存在当前浏览器和酒馆地址，不会写进设置或备份。')}
+          ${field('模型', /volces\.com|volcengine/i.test(t.url || '') ? input('text-model', t.model, 'text', 'autocomplete="off" placeholder="推理接入点 ID（ep- 开头）或模型名"') : `<div class="music-selfhost">${input('text-model', t.model, 'text', 'autocomplete="off" placeholder="例如 gpt-4o-mini、deepseek-chat"')}${btn('text-models', icon('refresh') + '读取', 'secondary small')}</div>`, /volces\.com|volcengine/i.test(t.url || '') ? '火山方舟没有模型列表：直接填推理接入点 ID（ep- 开头）或开通了的模型名，在火山方舟控制台的「在线推理」或「开通管理」里能看到。' : '「读取」列出这个接口有哪些模型，点一个就选上。')}
           <div class="combo-menu model-list" data-model-list ${models.length ? '' : 'hidden'}>${models.map(m => `<button type="button" class="combo-chip" data-action="text-pick" data-model="${esc(m)}" aria-pressed="${m === t.model}">${esc(m)}</button>`).join('')}</div>
           <p class="hint" data-text-status></p>
           ${field('温度', input('text-temperature', t.temperature, 'number', 'min="0" max="2" step="0.05"'), '越高越随性，越低越稳定。0.7–1 比较常用。')}
+          ${field('流式', select('text-stream', t.stream === false ? 'off' : 'on', [['on', '流式（默认）'], ['off', '不用流式']]), '流式：回复一边写一边传回来，模型想得久、写得长也不会等到超时。\n\n不用流式：等整条写完一次给回来。有的模型或中转（比如一些 Gemini 的接口）流式传回来的回复会被截断、只剩一半，改成「不用流式」就好；一次最多等 5 分钟。')}
           ${field('思考', select('text-thinking', t.thinking || 'auto', [['auto', '按模型默认'], ['off', '关掉思考']]), '会先思考的模型（GLM、Qwen3、豆包、DeepSeek 思考版……）写手机里的字时可以关掉思考：快很多，也省钱，长度不会被思考用光。插件会发 enable_thinking: false 和 thinking: disabled，大多数接口认其中一个；接口报错不认识这些参数时改回「按模型默认」。')}
-          ${field('最长回复（tokens）', input('text-maxTokens', t.maxTokens, 'number', 'min="64" max="32000" step="1"'), '一次回复最多写多少，聊天、电话、朋友圈用这个。帮我写、从剧情生成和配图规划按各自需要的长度来（够写到 NovelAI 的上限，也给会先思考的模型留出余量）。')}
+          ${field('最长回复（tokens）', input('text-maxTokens', t.maxTokens, 'number', 'min="64" max="128000" step="1"'), '一次回复最多写多少（最多 128000），所有用到文字模型的地方都至少给这么多。配音、配图规划这些要重写整段正文的，正文很长时会自动给到更多，不会比这里少。会先思考的模型，思考也算在里面。')}
         </div>` : '')
       + `<div class="savebar"><span class="save-state" data-save-state>${dirty ? '未保存' : '已保存'}</span>${btn('save-text', '保存', 'primary')}</div>`);
   }
 
   const render = () => engine === 'nai' ? renderNovelAI() : engine === 'gpt' ? renderGpt() : engine === 'comfy' ? renderComfy() : engine === 'llm' ? renderText() : engine === 'embed' ? renderEmbed() : engine ? renderDetail() : renderList();
   function edit(id) {
+    resetGptModels();
     engine = id;
     if (!order.length || order.at(-1) !== id) order = [...order.filter(x => x !== id), id];
     if (id === 'llm') { textDraft = structuredClone(api.getState().text); dirty = false; render(); v.root.scrollTop = 0; return; }
@@ -422,14 +461,37 @@ export function enginesApp(ctx) {
     dirty = JSON.stringify(draft()) !== JSON.stringify(api.getState().connections[id]);
     render();
     v.root.scrollTop = 0;
+    // Fish: which models web pages may call now (drama-3 moves there once Fish adds it); drawn again when that changed.
+    if (id === 'fish') api.fishCatalog?.().then(changed => { if (changed && engine === 'fish') render(); }).catch(() => {});
   }
   v.edit = edit;
-  v.back = () => { if (!engine) return false; engine = null; render(); return true; };
+  // The card in front of its pocket lifts out and becomes the card on top of its page, and goes back in (ui/carry.js).
+  function lift(from) {
+    const to = v.root.querySelector('.detail-card');
+    if (!fly(ctx.win, to, from, {duration: 380, easing: 'soft'})) return;
+    v.root.dataset.carried = '';
+    ctx.win.setTimeout(() => delete v.root.dataset.carried, 700);
+  }
+  // Back on the wallet where it was left, so the card flies back into its own pocket.
+  let listScroll = 0;
+  v.back = () => {
+    if (!engine) return false;
+    const id = engine, from = v.root.querySelector('.detail-card')?.getBoundingClientRect();
+    resetGptModels();
+    engine = null; render(); v.root.scrollTop = listScroll;
+    fly(ctx.win, v.root.querySelector(`.wallet [data-engine="${id}"]`), from, {duration: 340, easing: 'bounce'});
+    return true;
+  };
   v.refresh = () => { if (!engine) render(); };
   if (api.keyStatus('nai')) loadSubscription(false);
 
+  v.on('input', '[data-field]', el => {
+    if (engine !== 'gpt' || !['key', 'gpt-url'].includes(el.dataset.field)) return;
+    resetGptModels(); updateGptModels();
+  });
+  v.on('pointerdown', '[data-action=reveal-key]', (el, event) => event.preventDefault());
   v.on('change', '[data-field]', el => {
-    if (el.dataset.field === 'key') return;
+    if (el.dataset.field === 'key') { saveTypedKey(el); return; }
     if (el.dataset.field === 'image-name') return;
     if (engine === 'embed') {
       const key = el.dataset.field.replace(/^embed-/, '');
@@ -440,20 +502,57 @@ export function enginesApp(ctx) {
     }
     if (engine === 'llm') {
       const key = el.dataset.field.replace(/^text-/, '');
-      if (!['name', 'url', 'model', 'temperature', 'maxTokens', 'thinking'].includes(key)) return;
-      textPreset()[key] = ['temperature', 'maxTokens'].includes(key) ? Number(el.value) : el.value.trim();
+      if (!['name', 'url', 'model', 'temperature', 'maxTokens', 'thinking', 'stream'].includes(key)) return;
+      textPreset()[key] = key === 'stream' ? el.value !== 'off' : ['temperature', 'maxTokens'].includes(key) ? Number(el.value) : el.value.trim();
       changed();
       return;
     }
-    if (el.dataset.field === 'gpt-model') { api.saveDraw({gpt: {model: el.value.trim()}}); return; }
+    if (el.dataset.field === 'gpt-model') { api.saveDraw({gpt: {model: el.value.trim()}}); updateGptModels(); return; }
     if (el.dataset.field === 'comfy-transport') { api.saveDraw({comfy: {loraTransport: el.value}}); return; }
-    if (['gpt-url', 'comfy-url'].includes(el.dataset.field)) return;
+    if (el.dataset.field === 'gpt-url') { saveImageField({url: el.value}, el.value.trim() ? '接口地址已保存' : '已改回直连 OpenAI'); return; }
+    if (el.dataset.field === 'comfy-url') { api.saveDraw({comfy: {url: el.value}}); later(render); ctx.notify('ComfyUI 地址已保存'); return; }
     if (el.dataset.field === 'guard') { api.saveDraw({guard: el.checked}); return; }
     if (el.dataset.field === 'relayOpus') { api.saveDraw({relay: {assumeOpus: el.checked}}); return; }
-    if (el.dataset.field === 'relay') return;
+    if (el.dataset.field === 'relay') { if (engine === 'nai') saveImageField({url: el.value}, el.value.trim() ? '中转地址已保存' : '已改回直连 NovelAI'); else saveFishRelay(el.value); return; }
     if (el.dataset.field === 'relayApi') { api.saveConnection('fish', {relayApi: el.value}); draft().relayApi = el.value; balances.delete('fish'); render(); return; }
     draft()[el.dataset.field] = el.value; changed(); render();
   });
+  /** A key is saved when its box is left (several, one per line, on a voice engine). */
+  function saveTypedKey(el) {
+    const typed = el.value.trim();
+    if (!typed) return;
+    try {
+      if (engine === 'nai' || engine === 'gpt') { saveImageField({key: typed}, '密钥已保存'); return; }
+      if (engine === 'embed') api.setKey('embed', typed);
+      else if (engine === 'llm') api.setTextKey(textDraft.active, typed);
+      else { const added = api.addKeys(engine, typed); balances.delete(engine); ctx.notify(added > 1 ? `已添加 ${added} 个密钥` : '密钥已保存'); later(render); loadBalance(engine, true); return; }
+    } catch (error) { ctx.notify(error.message, {error: true}); return; }
+    later(render); ctx.notify('密钥已保存');
+  }
+  async function saveFishRelay(value) {
+    api.saveConnection('fish', {relay: value});
+    draft().relay = api.getState().connections.fish.relay;
+    balances.delete('fish'); later(render);
+    ctx.notify(draft().relay ? 'Fish 中转地址已保存' : '已改回直连 Fish Audio');
+    // Which form the relay speaks: checked right away when there is a key to check with.
+    if (draft().relay && api.keyStatus('fish')) { try { const {switched} = await detectFish(); if (switched) { render(); ctx.notify(switched === 'openai' ? '这个中转是 OpenAI 格式（/v1/audio/speech），已经自动切换' : '这个中转用 Fish 官方路径，已经自动切换'); } } catch { /* checked again from 「⋯」 */ } }
+    if (api.keyStatus('fish')) loadBalance('fish', true);
+  }
+  /** The 「⋯」 of an engine page: what is not needed every time. */
+  async function engineMore(el) {
+    const saved = engine === 'llm' ? !!api.textKeyHint?.(textDraft.active) : engine === 'embed' ? !!api.keyHint('embed') : api.keyStatus(engine), image = engine === 'nai' || engine === 'gpt';
+    const voice = !image && !['comfy', 'embed', 'llm'].includes(engine);
+    const picked = await menu(ctx, nameOf(engine), [
+      image && {key: 'image-connections', icon: 'swap', label: '连接', note: '新建、切换、改名、删除保存的几组连接'},
+      engine === 'nai' && saved && {key: 'test-relay', icon: 'refresh', label: '测试连接', note: '发一个空请求试探出图接口，不出图、不扣 Anlas'},
+      voice && !['custom','doubao'].includes(engine) && {key: 'read-voices', icon: 'refresh', label: '测试连接', note: '读一次音色列表，看密钥能不能用'},
+      engine === 'fish' && api.getState().connections.fish.relay && saved && {key: 'test-fish-relay', icon: 'refresh', label: '测试中转', note: '看中转转发了哪些接口，格式不对会自动切换'},
+      engine === 'fish' && {key: 'references', icon: 'wave', label: '管理参考音频'},
+      voice && {key: 'request-preview', icon: 'eye', label: '请求预览', note: '看看发给服务的请求长什么样'},
+      engine === 'llm' && textDraft.presets.length > 1 && {key: 'text-delete', icon: 'trash', label: `删除「${textPreset().name}」这套接口`, danger: true},
+      saved && {key: 'clear-key', icon: 'trash', label: voice ? '清除全部密钥' : engine === 'llm' ? '清除这套接口的密钥' : '清除密钥', danger: true}]);
+    if (picked) await act(picked, el);
+  }
   const readValue = (el, f) => f.type === 'boolean' ? el.checked : f.type === 'number' ? (el.value === '' ? '' : Number(el.value)) : f.type === 'select' ? f.options.find(([key]) => String(key) === el.value)?.[0] : el.value;
   async function updateParam(el, redraw) {
     const c = draft(), schema = api.engineSchema(engine, c), f = schema.groups.flatMap(g => g.fields).find(x => x.key === el.dataset.param);
@@ -489,21 +588,28 @@ export function enginesApp(ctx) {
   }
   v.on('input', '[data-param]', el => { if (!['checkbox', 'file'].includes(el.type) && el.tagName !== 'SELECT') return updateParam(el, false); });
   v.on('change', '[data-param]', el => updateParam(el, true));
-  v.on('click', '[data-action]', async el => {
-    switch (el.dataset.action) {
-      case 'image-save': saveImageForm(); break;
-      case 'image-new':
-        if (await leaveImageForm()) { api.saveImageConnection(engine); imageSaved(); ctx.notify('已新建连接，请填写地址和密钥'); }
-        break;
-      case 'image-connection':
-        if (el.dataset.id !== api.getState().draw.connections[engine].active && await leaveImageForm()) { api.selectImageConnection(engine, el.dataset.id); imageSaved(); ctx.notify('已切换生图连接'); }
-        break;
-      case 'image-delete': {
-        const p = api.imageConnectionList(engine).find(p => p.current);
-        if (await ctx.confirm('删除这组连接？', `「${p.name}」的地址和密钥会一起删掉，其他组保留。`)) { api.deleteImageConnection(engine, p.id); imageSaved(); ctx.notify('已删除这组连接'); }
-        break;
-      }
-      case 'engine': if (frontOf(el.dataset.engine) === el.dataset.engine) edit(el.dataset.engine); else bringFront(el.dataset.engine); break;
+  // 从文件夹导入: the picked folder's file names → voices; saved at once, then roles named alike may take them.
+  v.on('change', '[data-voice-folder]', async el => {
+    const files = [...(el.files || [])], root = v.root.querySelector('[data-field="voice-folder"]')?.value.trim() || lastFolder();
+    el.value = '';
+    if (!files.length) return;
+    const lang = shortLanguage(api.getState().general.defaultLanguage) || 'zh';
+    const {voices, skipped} = voicesFromFolder(files.map(f => f.webkitRelativePath || f.name), root, {prefer: lang});
+    if (!voices.length) { ctx.notify('这个文件夹里没找到角色：要选放着一个个角色文件夹的那一层', {error: true}); return; }
+    const c = draft(), kept = (c.params.voices || []).filter(x => !voices.some(n => n.name === String(x.name).trim()));
+    c.params = {...c.params, voices: [...kept, ...voices].slice(0, 200)};
+    if (!String(c.params.url || '').trim()) c.params = {...c.params, ...CUSTOM_TEMPLATES[0].fill('http://127.0.0.1:9880')};
+    api.saveConnection('custom', c); dirty = false; render();
+    ctx.notify(`导入了 ${voices.length} 个角色${skipped.length ? `（${skipped.join('、')} 没找到参考音频）` : ''}，已保存`);
+    const n = await matchRoles(voices);
+    if (n) { render(); ctx.notify(`${n} 个角色换成了自己的接口`); }
+  });
+  v.on('click', '[data-action]', el => act(el.dataset.action, el));
+  async function act(action, el) {
+    switch (action) {
+      case 'engine-more': await engineMore(el); break;
+      case 'image-connections': await imageConnectionMenu(); break;
+      case 'engine': if (frontOf(el.dataset.engine) === el.dataset.engine) { const from = el.getBoundingClientRect(); listScroll = v.root.scrollTop; edit(el.dataset.engine); lift(from); } else bringFront(el.dataset.engine); break;
       case 'text-source': textDraft.source = el.dataset.source; changed(); dirty = true; render(); break;
       case 'text-preset': if (textDraft.active !== el.dataset.id) { textDraft.active = el.dataset.id; models = []; changed(); dirty = true; render(); } break;
       case 'text-new': {
@@ -519,7 +625,7 @@ export function enginesApp(ctx) {
         textDraft.presets = textDraft.presets.filter(p => p.id !== gone.id); textDraft.active = textDraft.presets[0].id; models = []; changed(); dirty = true; render();
         break;
       }
-      case 'save-text': api.saveText(textDraft); textDraft = structuredClone(api.getState().text); dirty = false; render(); ctx.notify('文字模型已保存'); break;
+      case 'save-text': { const typed = v.root.querySelector('[data-field=key]')?.value.trim(); if (typed) api.setTextKey(textDraft.active, typed); } api.saveText(textDraft); textDraft = structuredClone(api.getState().text); dirty = false; render(); ctx.notify('文字模型已保存'); break;
       case 'save-embed': {
         const typed = v.root.querySelector('[data-field=key]')?.value || '';
         if (typed.trim()) api.setKey('embed', typed);
@@ -560,6 +666,33 @@ export function enginesApp(ctx) {
         changed();
         break;
       }
+      case 'gpt-models': {
+        const saved = api.getState().draw, id = saved.connections.gpt.active, url = saved.gpt.url;
+        if (v.root.querySelector('[data-field=gpt-url]')?.value.trim() !== url || v.root.querySelector('[data-field=key]')?.value.trim()) {
+          resetGptModels(); gptStatus = '地址或密钥还没保存：填完点一下别处就会保存，再点「读取」'; updateGptModels(); break;
+        }
+        const token = ++gptRequest;
+        const current = () => !v.disposed && engine === 'gpt' && token === gptRequest && api.getState().draw.connections.gpt.active === id && api.getState().draw.gpt.url === url;
+        gptList = []; gptStatus = '正在读取模型列表…'; updateGptModels();
+        await v.busy(el, async () => {
+          try {
+            const result = await api.gptModels();
+            if (!current()) return;
+            gptList = result;
+            gptStatus = gptList.length ? `读到 ${gptList.length} 个模型，点一个就能选上` : '连接成功，但没有列出模型，直接在「模型」里填就好';
+            updateGptModels();
+          } catch (error) { if (current()) { gptStatus = error.message; updateGptModels(); } }
+        });
+        break;
+      }
+      case 'gpt-pick': {
+        api.saveDraw({gpt: {model: el.dataset.model}});
+        const input = v.root.querySelector('[data-field=gpt-model]');
+        if (input) input.value = el.dataset.model;
+        for (const chip of v.root.querySelectorAll('[data-action=gpt-pick]')) chip.setAttribute('aria-pressed', String(chip === el));
+        ctx.notify('已选 ' + el.dataset.model);
+        break;
+      }
       case 'text-models': {
         const status = () => v.root.querySelector('[data-text-status]');
         await v.busy(el, async () => {
@@ -579,22 +712,7 @@ export function enginesApp(ctx) {
         if (typed.trim()) loadBalance(engine, true);
         break;
       }
-      case 'save-key': if (engine === 'nai' || engine === 'gpt') { saveImageForm(); break; } if (engine === 'embed') { api.setKey('embed', v.root.querySelector('[data-field=key]').value); render(); ctx.notify('密钥已保存'); break; } if (engine === 'llm') { api.setTextKey(textDraft.active, v.root.querySelector('[data-field=key]').value); render(); ctx.notify('密钥已保存'); break; } api.setKey(engine, v.root.querySelector('[data-field=key]').value); balances.delete(engine); render(); ctx.notify('密钥已保存'); loadBalance(engine, true); break;
       case 'refresh-subscription': await v.busy(el, () => loadSubscription(true)); break;
-      case 'save-relay': {
-        saveImageForm();
-        break;
-      }
-      case 'save-fish-relay': {
-        api.saveConnection('fish', {relay: v.root.querySelector('[data-field=relay]').value});
-        draft().relay = api.getState().connections.fish.relay;
-        balances.delete('fish'); render();
-        ctx.notify(draft().relay ? 'Fish 中转地址已保存' : '已改回直连 Fish Audio');
-        // Which form the relay speaks: checked right away when there is a key to check with.
-        if (draft().relay && api.keyStatus('fish')) await v.busy(el, async () => { const {switched} = await detectFish(); if (switched) { render(); ctx.notify(switched === 'openai' ? '这个中转是 OpenAI 格式（/v1/audio/speech），已经自动切换' : '这个中转用 Fish 官方路径，已经自动切换'); } }).catch(() => {});
-        if (api.keyStatus('fish')) loadBalance('fish', true);
-        break;
-      }
       case 'test-fish-relay': await v.busy(el, async () => { const {r, switched} = await detectFish(); if (switched) render(); ctx.dialog('测试连接', fishProbeReport(r, switched)); }); break;
       case 'test-relay': await v.busy(el, async () => {
         const result = await api.naiProbe();
@@ -604,17 +722,7 @@ export function enginesApp(ctx) {
       case 'refresh-balance': await v.busy(el, () => loadBalance(engine, true)); break;
       case 'open-draw': ctx.open('draw'); break;
       case 'use-draw-engine': api.saveDraw({engine: el.dataset.engine}); render(); ctx.notify(`绘图改用 ${nameOf(el.dataset.engine)} 画`); break;
-      case 'save-gpt-url': {
-        saveImageForm();
-        break;
-      }
-      case 'save-comfy-url': api.saveDraw({comfy: {url: v.root.querySelector('[data-field=comfy-url]').value}}); render(); ctx.notify('ComfyUI 地址已保存'); break;
       case 'comfy-test': await v.busy(el, loadComfy); break;
-      case 'add-key': {
-        const added = api.addKeys(engine, v.root.querySelector('[data-field=key]').value);
-        balances.delete(engine); render(); ctx.notify(added > 1 ? `已添加 ${added} 个密钥` : '密钥已保存'); loadBalance(engine, true);
-        break;
-      }
       case 'use-key': {
         const index = Number(el.dataset.index), k = api.keyList(engine)[index];
         if (!k) break;
@@ -634,15 +742,42 @@ export function enginesApp(ctx) {
         if (await ctx.confirm(['nai', 'gpt'].includes(engine) ? '清除密钥？' : '清除全部密钥？', '之后使用这个引擎需要重新填写。')) { api.clearKey(engine); if (engine === 'nai') subscription = null; balances.delete(engine); render(); } break;
       case 'reveal-key': {
         const field = v.root.querySelector('[data-field=key]');
-        field.type = field.type === 'password' ? 'text' : 'password';
-        el.textContent = field.type === 'password' ? '显示' : '隐藏';
+        const visible = field.classList.toggle('secret-visible');
+        el.setAttribute('aria-label', visible ? '隐藏密钥' : '显示密钥');
+        el.setAttribute('aria-pressed', String(visible));
+        break;
+      }
+      case 'voice-folder-pick': {
+        const root = v.root.querySelector('[data-field="voice-folder"]')?.value.trim() || '';
+        if (!/^(?:[a-z]:[\\/]|\/|\\\\)/i.test(root)) { ctx.notify('先填这个文件夹在电脑上的位置，比如 E:\\GPT-SoVITS\\MyCharacters', {error: true}); break; }
+        try { ctx.win.localStorage.setItem(FOLDER_KEY, root); } catch { /* typed again next time */ }
+        v.root.querySelector('[data-voice-folder]')?.click();
+        break;
+      }
+      case 'voice-template': {
+        const t = CUSTOM_TEMPLATES.find(x => x.id === el.dataset.template), base = v.root.querySelector(`[data-field="voice-base-${el.dataset.template}"]`)?.value.trim().replace(/\/+$/, '') || '';
+        if (!t || !/^https?:\/\/[^\s/]+/i.test(base)) { ctx.notify('先填服务的地址，比如 ' + t?.example, {error: true}); break; }
+        draft().params = {...draft().params, ...t.fill(base)};
+        changed(); render();
+        ctx.notify('接口填好了：再在下面「音色」里添加音色，然后保存配置');
+        break;
+      }
+      case 'custom-test': {
+        const out = () => v.root.querySelector('[data-custom-test]');
+        await v.busy(el, async () => {
+          if (out()) out().textContent = '正在请求……';
+          try {
+            const r = await api.customTest(draft());
+            if (out()) out().textContent = `✓ 接口通了，${r.voice ? `用音色「${r.voice}」` : ''}念了一句（${Math.round(r.bytes / 1024)} KB）。记得保存配置。`;
+          } catch (error) { const hint = customHint(error.message); if (out()) out().textContent = '✗ ' + error.message + (hint ? '\n👉 ' + hint : ''); }
+        });
         break;
       }
       case 'read-voices': {
         const current = engine;
         await v.busy(el, async () => {
-          const r = await api.voices(current, draft());
-          if (current === engine) { const status = v.root.querySelector('[data-connection-status]'); if (status) status.textContent = r.note + ' · ' + r.voices.length + ' 个'; }
+          try { const r = await api.voices(current, draft()); if (current === engine) ctx.notify(`✓ 连上了：${r.note} · ${r.voices.length} 个`); }
+          catch (error) { if (current === engine) ctx.notify('✗ ' + error.message, {error: true}); }
         });
         break;
       }
@@ -662,7 +797,7 @@ export function enginesApp(ctx) {
       }
       case 'references': await manageReferences(); break;
     }
-  });
+  }
 
   async function manageReferences() {
     const d = ctx.dialog('参考音频', '<p class="hint">正在读取…</p>');

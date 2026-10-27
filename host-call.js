@@ -2,6 +2,7 @@
 // the contact's words are generated with the tavern's connected model (generateRaw) and read aloud with the contact's
 // own voice through the normal player. A missed call gets a short voice message. When the call ends it is kept in
 // the private chat with that contact. Nothing is written into the story.
+import {currentDm} from './core/chats.js';
 import {buildCallRequest, parseCallReply, CALL_LIMITS} from './core/call.js';
 import {chatContacts, activeChatPreset, messageLine, cleanTagged} from './core/chat.js';
 import {worldInfoFor, loreOptions} from './host-lore.js';
@@ -32,10 +33,33 @@ export function createCallHost({context, settings, backend, notice, ringing = ()
   const snapshot = () => call && structuredClone({id: call.id, name: call.name, dir: call.dir, state: call.state, since: call.since, answeredAt: call.answeredAt,
     lines: call.lines, thinking: call.thinking, speaking: call.speaking, voiced: call.voiced, error: call.error, ended: call.ended || null, auto: call.auto});
   const emit = () => backend.emit('call', {call: snapshot()});
+  // Each of the contact's lines shows where it is, as the story's waves do: heard 'pending' (not played yet),
+  // 'generating', 'playing', 'played'. `playing` holds the lines being read now, in queue order.
+  let playing = null;
+  backend.subscribe?.(e => {
+    if (e?.type !== 'playback' || !playing || !call) return;
+    let changed = false;
+    playing.forEach((line, k) => {
+      const next = k < e.index ? 'played' : k === e.index ? (e.phase === 'generating' ? 'generating' : ['playing', 'paused'].includes(e.phase) ? 'playing' : line.heard) : line.heard === 'played' ? 'played' : 'pending';
+      if (next !== line.heard) { line.heard = next; changed = true; }
+    });
+    if (changed) emit();
+  });
+  /** Reads lines aloud through the phone's earpiece; their marks follow the player. */
+  async function speak(c, lines) {
+    const id = c.id;
+    playing = lines;
+    c.speaking = true; emit();
+    try { await backend.player.start(lines.map(l => ({role: c.name, emotion: l.emotion, text: l.text, translation: l.translation, effect: 'phone'})), () => live(id), null, {ahead: true}); } catch { /* the words are on screen */ }
+    // Read to the end (not stopped): every line was heard.
+    if (playing === lines && /^播放完成/.test(backend.player.snapshot?.().message || '') && live(id)) for (const l of lines) l.heard = 'played';
+    if (playing === lines) playing = null;
+    if (call?.id === id) { c.speaking = false; emit(); }
+  }
   const live = id => call?.id === id && call.state !== 'ended';
 
   async function dmThread(name) {
-    const existing = (await backend.threads()).find(t => t.type === 'dm' && t.members[0] === name);
+    const existing = currentDm(await backend.threads(), name);
     return existing || backend.chats.create({type: 'dm', members: [name], space: backend.spaceKey()});
   }
   /** Keeps the finished call in the private chat. A missed incoming call counts as unread. */
@@ -121,17 +145,17 @@ export function createCallHost({context, settings, backend, notice, ringing = ()
 
   async function ask(mode, c) {
     const ctx = context();
-    const s = settings(), preset = activeChatPreset(s.chat), user = userName(), thread = (await backend.threads()).find(t => t.type === 'dm' && t.members[0] === c.name);
+    const s = settings(), preset = activeChatPreset(s.chat), user = userName(), thread = currentDm(await backend.threads(), c.name);
     const history = thread ? (await backend.chats.get(thread.id)).messages.filter(m => m.kind !== 'system' && m.kind !== 'call').slice(-CALL_LIMITS.history) : [];
-    const voiceFormat = backend.voiceFormat(), story = storyLines(ctx.chat || [], preset.context, user);
-    const lore = preset.lore === false ? '' : await worldInfoFor(context, {...loreOptions(preset), persona: userPersona(), characters: c.contact.persona || c.contact.card || '',
+    const voiceFormat = backend.voiceFormat(), story = storyLines(ctx.chat || [], preset, user);
+    const lore = preset.lore === false ? '' : await worldInfoFor(context, {...loreOptions(preset), report: (...args) => backend.reportDiagnostic?.(...args), persona: userPersona(), characters: c.contact.persona || c.contact.card || '',
       texts: [c.name, c.reason, ...story.map(r => `${r.name}: ${r.text}`), ...history.map(m => messageLine(m, user)), ...c.lines.map(l => `${l.from === 'me' ? user : c.name}: ${l.translation || l.text}`)]});
     // 记忆: looked up on the call's first turn (with why the call was made and the last chat) and kept for the call.
     if (c.memory === undefined && memory && thread) {
       const full = await backend.chats.get(thread.id);
       c.memory = (await memory.contextFor(full, {query: [c.reason, ...history.slice(-4).map(m => messageLine(m, user))].filter(Boolean).join('\n')}).catch(() => ({text: ''}))).text;
     }
-    const prompt = buildCallRequest({preset, mode, contact: c.contact, lines: c.lines, history, story, user, userPersona: userPersona(),
+    const prompt = buildCallRequest({prompts: settings().promptRules, preset, mode, contact: c.contact, lines: c.lines, history, story, user, userPersona: userPersona(),
       voiceFormat, voiceRules: c.voiced ? modelRules(s, [c.name]) : '', reason: c.reason, lore, memory: c.memory || '', earlier: memory?.storyMemory() || ''});
     const text = cleanTagged(await backend.generateText(ctx, {prompt, trimNames: false}), preset.cleanTags);
     return parseCallReply(text, {name: c.name, user, voiceFormat, voiced: c.voiced});
@@ -154,15 +178,11 @@ export function createCallHost({context, settings, backend, notice, ringing = ()
     }
     if (!live(id)) return;
     c.thinking = false;
-    const lines = found.lines.map(l => ({from: c.name, ...l}));
+    const lines = found.lines.map(l => ({from: c.name, ...l, ...(c.voiced ? {heard: 'pending'} : {})}));
     c.lines.push(...lines);
     if (c.lines.length > CALL_LIMITS.lines) c.lines = c.lines.slice(-CALL_LIMITS.lines);
     emit();
-    if (c.voiced && lines.length) {
-      c.speaking = true; emit();
-      try { await backend.player.start(lines.map(l => ({role: c.name, emotion: l.emotion, text: l.text, translation: l.translation})), () => live(id)); } catch { /* the words are on screen */ }
-      if (call?.id === id) { c.speaking = false; emit(); }
-    }
+    if (c.voiced && lines.length) await speak(c, lines);
     if (found.hangup && live(id)) {
       // A short pause after the last words, like a real hang-up.
       await new Promise(resolve => setTimeout(resolve, timing.hang?.() ?? (c.voiced ? 600 : 1800)));
@@ -208,5 +228,12 @@ export function createCallHost({context, settings, backend, notice, ringing = ()
 
   function dispose() { clearTimeout(ringTimer); clearTimeout(pickTimer); if (call?.speaking) backend.player.stop(); call = null; }
 
-  return {ring, dial, answer, decline, hangup, say, reply, retry, storyReplied, dispose, status: snapshot};
+  /** A line of the contact's tapped again: read once more (not while the contact is thinking or speaking). */
+  async function replay(index) {
+    const c = call, line = c?.lines[index];
+    if (!c || c.state !== 'talking' || !c.voiced || c.thinking || c.speaking || !line || line.from === 'me') return;
+    await speak(c, [line]);
+  }
+
+  return {ring, dial, answer, decline, hangup, say, reply, retry, replay, storyReplied, dispose, status: snapshot};
 }

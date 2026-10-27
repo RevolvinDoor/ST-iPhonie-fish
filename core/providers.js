@@ -1,7 +1,12 @@
+import {buildDoubaoRequest,doubaoAudio,DOUBAO_VOICES} from './doubao.js';
+import {proxyAddress} from './proxy-url.js';
 import { validateKey, MULTI_KEY, keyTail } from './keys.js';
 import { languageCode } from './languages.js';
-import { TTSParameters as P } from './parameters.js';
-const names={fish:'Fish Audio',mini:'MiniMax',eleven:'ElevenLabs',mimo:'小米 MiMo'};
+import { TTSParameters as P, FISH_PROXY_NOTE, FISH_NATIVE_REFS, FISH_API, FISH_TAURI_NOTE, FISH_PROXY_PAGE, tauriTavern, setFishCompat } from './parameters.js';
+import { speakable } from './voice-fx.js';
+import { buildCustomRequest, customInit, readCustomAnswer, customVoices, readVoiceList } from './custom-voice.js';
+import { unpacked, audioKind } from './audio-bytes.js';
+const names={fish:'Fish Audio',mini:'MiniMax',eleven:'ElevenLabs',mimo:'小米 MiMo',doubao:'豆包语音',custom:'自己的接口'};
 export const miniBase=c=>'https://'+(c.region==='cn'?'api.minimaxi.com':c.region==='uw'?'api-uw.minimax.io':'api.minimax.io');
 const object=value=>Object.prototype.toString.call(value)==='[object Object]';
 function checkedConnection(engine,connection,route,line,references){
@@ -30,17 +35,20 @@ function checkedConnection(engine,connection,route,line,references){
  }
  return c;
 }
-export function buildRequest(engine,connection,route,line,references=new Map()){
+export function buildRequest(engine,connection,route,line,references=new Map()){line=speakable(line);// 心声/电话 are played, not read: off the emotion before the engine sees it.
+ // 自己的接口: the user's templates (core/custom-voice.js).
+ if(engine==='custom'){if(!object(connection)||!object(connection.params))throw Error('引擎设置格式无效，请重新保存引擎设置');return buildCustomRequest({...connection,params:{...P.defaults('custom'),...connection.params}},route,line);}
  const c=checkedConnection(engine,connection,route,line,references);
+ if(engine==='doubao'){P.normalize(engine,c);const error=P.validate(engine,c);if(error)throw Error(error);return buildDoubaoRequest(c,route,line);}
  // MiMo's preset model knows only its own voices. A 音色 that names a clone sample is drawn with the clone model;
  // any other name is explained here instead of MiMo's English "Unknown voice".
  if(engine==='mimo'&&P.mimoMode(c.model)==='preset'&&route.voice?.trim()){const v=route.voice.trim();if(!P.vocab.MIMO_VOICES.some(([id])=>id===v)){if((c.params.samples||[]).some(x=>String(x.name).trim()===v))c.model=P.catalogs.mimo.models.find(m=>P.mimoMode(m)==='clone');else throw Error('小米 MiMo：「'+v+'」不是预置音色（预置音色有：'+P.vocab.MIMO_VOICES.map(([id])=>id).join('、')+'）。想用自己的声音，就在 MiMo 引擎的「克隆样本」里上传一段，名字填「'+v+'」；想用文字描述声音，就把这个角色的模型换成 voicedesign，音色里写描述。');}}
  P.normalize(engine,c);const error=P.validate(engine,c);if(error)throw Error(error);
- if(engine==='fish'&&c.model==='drama-3-preview')throw Error('这个模型尚未列入 Fish 兼容通道，请选择 S2 或 S1');
  if(engine==='mimo'&&!route.voice?.trim()){const mode=P.mimoMode(c.model);throw Error(mode==='design'?'请先在角色里填写音色描述':mode==='clone'?'请先在角色里填写克隆样本的名字':'请先选择角色音色');}
  if(!route.voice?.trim()&&!(engine==='fish'&&c.params.references.length)&&!(engine==='mini'&&c.params.timbre_weights.length))throw Error('请先选择角色音色');
  // The 情绪 field becomes the model's own opening tag (Fish, Eleven v3/v4) unless the text already starts with one.
- const request=P.requestPreview(engine,c,route.voice,P.emotionTag(engine,c.model,line.emotion,line.text),c.model);
+ const request=P.requestPreview(engine,c,route.voice,P.emotionTag(engine,c.model,line.emotion,line.text),c.model,line.emotion);
+ if(engine==='fish'&&request.native&&c.params.references.length)throw Error(FISH_NATIVE_REFS);
  if(engine==='fish'&&c.params.references.length){request.body.provider.options['fish-audio'].references=c.params.references.map(r=>{const audio=references.get(r.audio);if(typeof audio!=='string'||!audio)throw Error('请在引擎设置重新选择参考音频：'+r.audio);return {audio,text:r.text};});}
  // MiniMax takes a fixed emotion list: Chinese or English words map onto it; anything else lets the model choose.
  if(engine==='mini'&&!request.body.voice_setting.emotion){const emotion=P.miniEmotion(c.model,line.emotion);if(emotion)request.body.voice_setting.emotion=emotion;else delete request.body.voice_setting.emotion;}
@@ -49,7 +57,8 @@ export function buildRequest(engine,connection,route,line,references=new Map()){
  if(engine==='eleven'&&!request.body.language_code&&c.model!=='eleven_multilingual_v2'){const code=languageCode(route.language).split('-')[0];if(/^[a-z]{2,3}$/.test(code))request.body.language_code=code;}
  // A relay in OpenAI's form (/v1/audio/speech): the standard fields only. What Fish itself would get is kept, so the
  // cache (core/cache.js requestHash) finds the same line whichever way it went.
- let official=null;
+ let official=null,extra={};
+ if(request.native){official=request.compat;extra={headers:request.headers,...(P.fishBase(c)===FISH_API?{viaTavern:true}:{})};}
  if(engine==='fish'&&P.fishOpenAI(c)){
   if(c.params.references.length)throw Error('这个中转是 OpenAI 格式，不能带参考音频：在 Fish 引擎里去掉参考音频，角色的「音色」填 Fish 的音色 ID');
   const fish=request.body.provider?.options?.['fish-audio']||{},speed=Number(fish.prosody?.speed);
@@ -57,8 +66,8 @@ export function buildRequest(engine,connection,route,line,references=new Map()){
   request.url=P.openaiSpeech(P.fishBase(c));
   request.body={model:c.model,input:request.body.input,voice:request.body.voice,response_format:request.body.response_format,...(Number.isFinite(speed)&&speed!==1?{speed}:{})};
  }
- const url=new URL(request.url);for(const [k,v] of Object.entries(request.query||{}))url.searchParams.set(k,String(v));
- return {engine,url:url.href,body:request.body,...(official?{official}:{}),format:engine==='mimo'?'wav':engine==='fish'?c.params.format:engine==='mini'?c.params['audio_setting.format']:c.params.output_format,sampleRate:engine==='mimo'?24000:engine==='fish'?c.params.sample_rate:engine==='mini'?c.params['audio_setting.sample_rate']:Number(c.params.output_format.split('_')[1]),channels:engine==='mini'?c.params['audio_setting.channel']:1};
+ const url=new URL(request.url,globalThis.location?.href);for(const [k,v] of Object.entries(request.query||{}))url.searchParams.set(k,String(v));
+ return {engine,url:url.href,body:request.body,...(official?{official}:{}),...extra,format:engine==='mimo'?'wav':engine==='fish'?c.params.format:engine==='mini'?c.params['audio_setting.format']:c.params.output_format,sampleRate:engine==='mimo'?24000:engine==='fish'?c.params.sample_rate:engine==='mini'?c.params['audio_setting.sample_rate']:Number(c.params.output_format.split('_')[1]),channels:engine==='mini'?c.params['audio_setting.channel']:1};
 }
 export function hexBytes(hex){if(typeof hex!=='string'||!hex.length||hex.length%2||!/^[\da-f]+$/i.test(hex))throw Error('返回的音频数据无效');return Uint8Array.from(hex.match(/../g),x=>parseInt(x,16));}
 export function wavePCM(bytes,rate=24000,channels=1){if(bytes.length%2||!Number.isFinite(rate)||rate<8000||rate>192000||![1,2].includes(channels))throw Error('PCM 音频参数无效');const out=new Uint8Array(44+bytes.length),v=new DataView(out.buffer),ascii=(p,s)=>[...s].forEach((x,i)=>v.setUint8(p+i,x.charCodeAt(0)));ascii(0,'RIFF');v.setUint32(4,36+bytes.length,true);ascii(8,'WAVEfmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,channels,true);v.setUint32(24,rate,true);v.setUint32(28,rate*channels*2,true);v.setUint16(32,channels*2,true);v.setUint16(34,16,true);ascii(36,'data');v.setUint32(40,bytes.length,true);out.set(bytes,44);return out;}
@@ -96,7 +105,7 @@ const REASONS={
  unsupported_model:'这个模型不支持请求里的某个模型或设置，看括号里的说明。',
  quota_exceeded:'额度用完了。',
  insufficient_credits:'额度用完了。',
- voice_not_found:'找不到这个音色 ID，可能已经删除或者填错了。',
+ voice_not_found:'找不到这个音色：音色 ID 填错了、已经删除，或者不属于这个密钥的账号。',
  invalid_voice_id:'音色 ID 格式不对，请重新选择音色。',
  invalid_voice_settings:'音色设置里有这个模型不接受的数值。eleven_v3 的稳定性只能是 0、0.5 或 1。',
  text_too_long:'这句台词太长了。',
@@ -119,6 +128,7 @@ export async function httpError(engine,response,what='',secrets=[],relay=false){
  const code=[detail.code,detail.status,detail.type].find(x=>typeof x==='string'&&REASONS[x])||(typeof detail.code==='string'?detail.code:typeof detail.status==='string'?detail.status:'');
  // 「Providing X is not supported with the 'M' model」names the field: say that plainly.
  const refused=typeof detail.message==='string'&&detail.message.match(/Providing (\S+) is not supported with the '([^']+)' model/);
+ if(response.status===403&&/CORS proxy is disabled/i.test(detail.message||''))return Error('酒馆的跨域代理未开启：把 config.yaml 的 enableCorsProxy 改成 true 后重启酒馆');
  const reason=refused?`${refused[2]} 不接受 ${refused[1]} 这一项设置`:REASONS[code]||FALLBACK[response.status]||'请求失败';
  const hide=text=>secrets.filter(k=>typeof k==='string'&&k.length>=4).reduce((t,k)=>t.split(k).join('***'),String(text)).replace(/[A-Za-z0-9_-]{24,}/g,t=>/\d/.test(t)&&/[A-Za-z]/.test(t)?'***':t);
  const said=hide([code,typeof detail.message==='string'?detail.message.slice(0,200):'',detail.param?'参数 '+detail.param:''].filter(Boolean).join('：'));
@@ -148,13 +158,14 @@ export class Providers{
  nextKey(engine){const {keys,p}=this.pool(engine);p.refused.add(p.current);const at=keys.indexOf(p.current);for(let i=1;i<keys.length;i++){const key=keys[(at+i)%keys.length];if(!p.refused.has(key)){p.current=key;try{this.onKeySwitch?.(engine);}catch{}return true;}}p.refused.clear();return false;}
  /** Uses this saved key from now on (the user picked it); it is no longer counted as refused. */
  useKey(engine,key){const {keys,p}=this.pool(engine);if(!keys.includes(key))throw Error('这个密钥已经不在了');p.refused.delete(key);if(p.current!==key){p.current=key;try{this.onKeySwitch?.(engine);}catch{}}}
- headers(engine){const key=this.currentKey(engine);if(!key)throw Error('请先填写 '+names[engine]+' 的 API Key');return engine==='eleven'?{'xi-api-key':key}:{Authorization:'Bearer '+key};}
+ headers(engine){const key=this.currentKey(engine);if(!key)throw Error('请先填写 '+names[engine]+' 的 API Key');return engine==='eleven'?{'xi-api-key':key}:engine==='doubao'?{'X-Api-Key':key}:{Authorization:'Bearer '+key};}
  async fetch(url,init,signal){return fetchWithPolicy(this.fetcher,url,init,signal);}
  /**
   * One synthesis request. When ElevenLabs answers 400 「Providing X is not supported with the 'M' model」 for a field
   * we sent, that field is dropped and the request is sent once more; the model is remembered so later lines skip it.
   */
  async synthesize(request,signal){
+  if(request.engine==='custom')return this.speakCustom(request,signal);
   const model=request.body?.model_id,body={...request.body};
   for(const field of this.refused.get(model)||[])delete body[field];
   let response=await this.post(request,body,signal);
@@ -175,8 +186,41 @@ export class Providers{
   }
   // A new audio was paid for: the balance shown on the engine card is out of date.
   try{this.onSpend?.(request.engine);}catch{}
+  if(request.engine==='doubao'){try{return audioBlob(doubaoAudio(await limitedBytes(response)),request);}catch(error){for(const key of (this.keys.get('doubao')||'').split('\n').filter(Boolean))error.message=error.message.split(key).join('***');throw error;}}
   if(request.engine==='mimo')return decodeMimo(response,request);
-  if(request.engine==='mini')return decodeMini(response,request,this.fetcher,signal);if(response.headers.get('Content-Type')?.includes('json'))throw Error(names[request.engine]+' 未返回音频');return audioBlob(await limitedBytes(response),request);}
+  if(request.engine==='mini')return decodeMini(response,request,this.fetcher,signal);if(response.headers.get('Content-Type')?.includes('json'))throw Error(names[request.engine]+' 未返回音频');const bytes=await limitedBytes(response);return audioBlob(await unpacked(bytes)||bytes,request);}
+ /**
+  * 自己的接口: the request as the templates say, the key (optional) put in now. A service that does not let web pages
+  * ask it (no CORS) is asked again through the tavern's own proxy (this.proxy, set by the backend).
+  */
+ async speakCustom(request,signal){
+  // One at a time: a model is switched for this line and must not be switched again by another before it is said.
+  const turn=(this.customTurn||Promise.resolve()).catch(()=>{}).then(()=>this.speakCustomNow(request,signal));
+  this.customTurn=turn;return turn;
+ }
+ async speakCustomNow(request,signal){
+  const {url,init}=customInit(request,this.keys.get('custom')||'');
+  const send=async(target,how=init)=>{try{return await fetchWithPolicy(this.fetcher,target,how,signal);}catch(error){if(signal?.aborted||!this.proxy||!/无法连接/.test(error.message))throw error;
+   const relayed=await this.proxy(target,how,signal).catch(()=>null);if(!relayed)throw Error('连不上自己的接口：地址不对、服务没开，或者它不让网页直接访问（可以在酒馆的 config.yaml 里把 enableCorsProxy 改成 true 再重启酒馆）');
+   if(relayed.status===403&&/CORS proxy is disabled/i.test(await relayed.clone().text().catch(()=>'')))throw Error('自己的接口不让网页直接访问：在酒馆的 config.yaml 里把 enableCorsProxy 改成 true 再重启酒馆');return relayed;}};
+  // 换模型: only when this voice's model is not the one loaded last.
+  const loaded=(request.before||[]).join('\n');
+  if(loaded&&this.customLoaded!==loaded){this.customLoaded='';for(const step of request.before){const {url:target,init:get}=customInit({...request,url:step,method:'GET',body:undefined});const r=await send(target,get).catch(e=>{throw Error('换模型失败：'+e.message);});
+   if(!r.ok){const said=(await r.text().catch(()=>'')).replace(/\s+/g,' ').slice(0,160);throw Error('换模型失败（HTTP '+r.status+'）'+(said?'：'+said:'')+'：检查音色里模型的路径');}await r.body?.cancel?.().catch(()=>{});}this.customLoaded=loaded;}
+  const response=await send(url);
+  return readCustomAnswer(response,request,{read:limitedBytes,load:link=>send(link,{method:'GET',headers:init.headers})});
+ }
+ /** 自己的接口's voices: the ones added by hand, and (音色列表地址) the ones the service lists. */
+ async customVoiceList(c,search=''){
+  const own=customVoices(c),q=search.trim().toLowerCase();let listed=[],note='';
+  const url=String(c.params.listUrl||'').trim();
+  if(proxyAddress(url)||/^https?:\/\//i.test(url)){const {url:target,init}=customInit({url,method:'GET',headers:String(c.params.headers||'')},this.keys.get('custom')||'');
+   let r=await fetchWithPolicy(this.fetcher,target,init).catch(()=>null);if(!r&&this.proxy)r=await this.proxy(target,init).catch(()=>null);
+   if(!r)note='音色列表地址连不上';else if(!r.ok)note='音色列表地址回答 HTTP '+r.status;else{try{listed=readVoiceList(await r.json(),String(c.params.listPath||'').trim());}catch{note='音色列表回的不是 JSON';}}
+   listed=listed.filter(v=>!own.some(o=>o.id===v.id));}
+  const all=[...own,...listed];
+  return {voices:q?all.filter(v=>v.name.toLowerCase().includes(q)||v.id.toLowerCase().includes(q)):all,more:false,token:'',note:note||(all.length?(listed.length?`自己添加的 ${own.length} 个，服务列出的 ${listed.length} 个`:'自己的接口里添加的音色'):'还没有音色：在引擎 App 的「自己的接口」里添加，或者填音色列表地址')};
+ }
  /** ElevenLabs 音效 (text to sound effects): an English description to an MP3. seconds 0: ElevenLabs picks; loop: an ambience that loops seamlessly. */
  async soundEffect({text,seconds=0,loop=false},signal=new AbortController().signal){
   const body={text:String(text||'').slice(0,450),model_id:'eleven_text_to_sound_v2',prompt_influence:.4,...(seconds?{duration_seconds:Math.min(30,Math.max(.5,Number(seconds)))}:{}),...(loop?{loop:true}:{})};
@@ -188,10 +232,26 @@ export class Providers{
   try{this.onSpend?.('eleven');}catch{}
   const bytes=await limitedBytes(response);if(!bytes.length)throw Error('ElevenLabs 没有返回声音');
   return new Blob([bytes],{type:'audio/mpeg'});}
- post(request,body,signal){return this.fetch(request.url,{method:'POST',headers:{...this.headers(request.engine),'Content-Type':'application/json'},body:JSON.stringify(body)},signal);}
+ post(request,body,signal){if(request.engine==='doubao'){const key=this.currentKey('doubao'),headers={'Content-Type':'application/json','X-Api-Resource-Id':request.resourceId,'X-Api-Request-Id':crypto.randomUUID(),...(request.appId?{'X-Api-App-Id':request.appId,'X-Api-Access-Key':key}:{'X-Api-Key':key})};if(!key)throw Error('请先填写豆包语音的 API Key');return this.fetch(request.url,{method:'POST',headers,body:JSON.stringify(body)},signal);}
+ const init={method:'POST',headers:{...this.headers(request.engine),'Content-Type':'application/json',...request.headers},body:JSON.stringify(body)};return request.viaTavern?this.viaTavern(request.url,init,signal):this.fetch(request.url,init,signal);}
+ /** Fish's own /v1/tts lets no web page call it: asked through the tavern's proxy, which must be switched on. */
+ async viaTavern(url,init,signal){if(!this.proxy)throw Error(FISH_PROXY_NOTE);const r=await this.proxy(url,init,signal).catch(error=>{if(signal?.aborted)throw error;throw Error('连不上酒馆的转发。'+FISH_PROXY_NOTE);});
+  if(r.redirected||r.status===401&&/text\/html/i.test(r.headers?.get('content-type')||''))throw Object.assign(Error('酒馆转发返回了登录页面，可能是云酒馆登录失效或转发接口限制；这不是音色不存在。请先重新登录酒馆，仍失败时查看日志中的酒馆转发请求'),{code:'TAVERN_AUTH',status:r.status});
+  // TauriTavern is asked all the same: once it has a /proxy/ of its own, drama-3 works there without an update.
+  const none=Object.assign(Error(tauriTavern()?FISH_TAURI_NOTE:FISH_PROXY_PAGE),{code:'TAVERN_PROXY'});
+  if(!r.ok){const said=await r.clone().text().catch(()=>'');if(/CORS proxy is disabled/i.test(said))throw Error(FISH_PROXY_NOTE);if(tauriTavern()&&/Unsupported endpoint/i.test(said))throw none;}
+  // A tavern without the proxy (an app's tavern) answers its own page or script instead: words, not a sound (JSON is
+  // Fish's own answer, said as such further on).
+  if(r.ok&&!/json/i.test(r.headers?.get('content-type')||'')&&audioKind(new Uint8Array(await r.clone().arrayBuffer().catch(()=>new ArrayBuffer(0))).subarray(0,64))==='text')throw none;
+  return r;}
+ /** The models Fish's compat endpoint serves (no key needed), read once a page and again after half an hour; true when what goes where changed. */
+ fishCatalog(){const now=Date.now();if(this.catalogRead&&now-this.catalogAt<30*60*1000)return this.catalogRead;this.catalogAt=now;
+  return this.catalogRead=fetchWithPolicy(this.fetcher,FISH_API+'/compat/v1/models',{}).then(async r=>{if(!r.ok)throw Error('HTTP '+r.status);const json=await r.json();return setFishCompat((json?.data||[]).map(m=>m?.id).filter(id=>typeof id==='string'));}).catch(()=>{this.catalogRead=null;return false;});}
  /** What a voice list says about a voice besides its name (description, tags, gender and age, languages), for picking one. */
  static voiceInfo(engine,v){const list=x=>Array.isArray(x)?x.filter(y=>typeof y==='string'):[];const parts=engine==='fish'?[v.description,list(v.tags).join(' '),list(v.languages).join('/')]:engine==='mini'?[Array.isArray(v.description)?list(v.description).join('；'):v.description]:[Object.values(v.labels&&typeof v.labels==='object'?v.labels:{}).filter(x=>typeof x==='string').join(' '),v.description];return parts.filter(x=>typeof x==='string'&&x.trim()).map(x=>x.trim().replace(/\s+/g,' ')).join(' · ').slice(0,240);}
  async voices(engine,c,{search='',page=0,token=''}={}){
+  if(engine==='doubao'){const q=search.trim().toLowerCase(),saved=(c.params.voices||[]).filter(v=>v.id?.trim()).map(v=>({id:v.id.trim(),name:v.name.trim()||v.id.trim()})),all=[...saved,...(c.model==='seed-tts-2.0'?DOUBAO_VOICES:[])].filter((v,i,rows)=>rows.findIndex(x=>x.id===v.id)===i);return {voices:all.filter(v=>!q||(v.id+' '+v.name).toLowerCase().includes(q)),more:false,token:'',note:'本地音色列表；可直接粘贴控制台的音色 ID，这里不校验密钥或音色授权'};}
+  if(engine==='custom')return this.customVoiceList({params:{...P.defaults('custom'),...c?.params}},search);
   if(engine==='fish'&&P.fishOpenAI(c))throw Error('这个中转（OpenAI 格式）没有音色列表：在角色的「音色」里直接填 Fish 的音色 ID（fish.audio 网站上音色页面地址里那串字母数字）');
   if(engine==='mimo'){const mode=P.mimoMode(c.model),q=search.trim().toLowerCase();const all=mode==='preset'?P.vocab.MIMO_VOICES.map(([id,name])=>({id,name})):mode==='clone'?c.params.samples.filter(x=>String(x.name).trim()).map(x=>({id:String(x.name).trim(),name:String(x.name).trim()+' · 克隆样本'})):[];
    return {voices:q?all.filter(v=>v.name.toLowerCase().includes(q)):all,more:false,token:'',note:mode==='design'?'音色设计模型没有音色列表：在「音色」一栏写音色描述':mode==='clone'?'克隆样本在 MiMo 引擎里上传':'MiMo 内置音色'};}

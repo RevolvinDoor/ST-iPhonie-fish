@@ -7,6 +7,7 @@
 //   【赞】名字、名字            likes on the post above (or on the post being reacted to)
 //   【评论】名字：内容          a comment; 「名字 回复 名字：内容」 answers someone
 // The rules come from the chat preset: its rules marked for 朋友圈, plus its story length and posts per refresh.
+import {promptText} from './prompt-rules.js';
 import {plainStory} from './chat.js';
 import {isPlaceholderRole} from './protocol.js';
 
@@ -39,31 +40,17 @@ export function postLines(post, user) {
  * The request for moments, with the chat preset's rules used in 朋友圈. mode 'posts': new posts from the people; 'react': reactions to one post (the user's new post);
  * 'reply': answers to the user's comment on a post. people: [{name, persona, card}]. recent: latest posts, for variety.
  */
-export function buildMomentsRequest({preset, mode = 'posts', people, story = [], user = '我', userPersona = '', recent = [], post = null, comment = null, images = true, lore = '', memory = '', earlier = ''}) {
+export function buildMomentsRequest({prompts = {}, preset, mode = 'posts', people, story = [], user = '我', userPersona = '', recent = [], post = null, comment = null, images = true, lore = '', memory = '', earlier = ''}) {
   const values = {'用户': user};
   const rules = preset.entries.filter(e => e.enabled && e.text.trim() && (e.use || []).includes('moments')).filter(e => images || e.id !== 'm-picture').map(e => fill(e.text, values));
-  const names = people.map(p => p.name);
-  const system = [
-    rules.join('\n\n'),
-    `【朋友圈里的人】\n${people.map(p => `- ${p.name}：${(p.persona || p.card || '').trim() || '（没有资料，按剧情里的表现来）'}`).join('\n')}`,
-    lore.trim() ? `【世界书】（这些人物和这个世界的设定：人设、口音、方言、说话方式都按这里来）\n${lore.trim()}` : '',
-    userPersona.trim() ? `【${user}】\n${userPersona.trim()}` : '',
-    earlier.trim() ? `【更早的剧情】（记忆插件整理的长期剧情，只作背景参考）\n${earlier.trim()}` : '',
-    story.length ? `【最近的剧情】（只作背景参考）\n${story.map(s => `${s.name}：${s.text}`).join('\n')}` : '',
-    memory.trim() ? `${memory.trim()}\n（这些是各人和${user}私下聊过的事：只有那个人自己知道，别人的动态和评论里不要提）` : '',
-    recent.length && mode === 'posts' ? `【最近的朋友圈】（不要重复这些内容）\n${recent.map(p => postLines(p, user)).join('\n')}` : '',
-    ['【输出格式】',
-      '每一项单独一行，只能用下面这几种写法，不要写别的文字、编号或解释：',
-      mode === 'posts' ? '「【动态】名字：动态内容」发一条新动态；' : '',
-      mode === 'posts' && images ? '「【配图】英文 tag」给上一条动态配图，不需要配图就不写；' : '',
-      '「【赞】名字、名字」点赞；',
-      `「【评论】名字：评论内容」评论，回复某人时写「【评论】名字 回复 某人：内容」。`,
-      `名字只能是：${names.join('、')}。不要替${user}写动态、点赞或评论。`].filter(Boolean).join('\n')
-  ].filter(Boolean).join('\n\n');
-  let ask;
-  if (mode === 'posts') ask = `挑 1 到 ${preset.posts} 个人各发一条新动态（不一定每个人都发）。每条动态下面可以跟着别人的赞和评论。`;
-  else if (mode === 'react') ask = `【${user}刚发的动态】\n${postLines(post, user)}\n\n朋友们看到了这条动态：写出谁点了赞、谁评论了什么。`;
-  else ask = `【这条动态】\n${postLines(post, user)}\n\n${user}刚评论：「${comment.text}」${comment.to ? `（回复 ${who(comment.to, user)}）` : ''}\n被评论的人回复${user}，别的人也可以接话。只写新的评论。`;
+  const now = {'刷新': mode === 'posts', '回应': mode === 'react', '回复': mode === 'reply'};
+  const system = promptText(prompts, 'moments', 'system', {...now, '预设规则': rules.join('\n\n'), '用户': user,
+    '朋友圈里的人': people.map(p => `- ${p.name}：${(p.persona || p.card || '').trim() || '（没有资料，按剧情里的表现来）'}`).join('\n'),
+    '世界书': lore.trim(), '用户设定': userPersona.trim(), '更早的剧情': earlier.trim(), '最近的剧情': story.map(s => `${s.name}：${s.text}`).join('\n'),
+    '记忆': memory.trim(), '最近的朋友圈': mode === 'posts' ? recent.map(p => postLines(p, user)).join('\n') : '',
+    '出图': images, '名单': people.map(p => p.name).join('、')});
+  const ask = promptText(prompts, 'moments', 'ask', {...now, '用户': user, '人数': preset.posts,
+    '动态': mode === 'posts' ? '' : postLines(post, user), '评论': mode === 'reply' ? comment.text : '', '回复谁': mode === 'reply' && comment.to ? who(comment.to, user) : ''});
   return [{role: 'system', content: system}, {role: 'user', content: ask}];
 }
 
@@ -118,7 +105,10 @@ export function parseMoments(reply, {names, user = '我', mode = 'posts'}) {
 // Recent story for the phone's requests: a reply is kept whole up to `each` characters (it used to be cut at 600, so a
 // long reply stopped mid-sentence), and the newest come first until `total` is used up.
 export const STORY_LIMITS = Object.freeze({each: 4000, total: 20000});
+// limit: how many replies, or a chat preset (its context, storyEach and storyTotal; 0 there is no limit).
 export function storyLines(chat, limit, user, {each = STORY_LIMITS.each, total = STORY_LIMITS.total} = {}) {
+  if (limit && typeof limit === 'object') { const p = limit; limit = p.context; each = p.storyEach ?? each; total = p.storyTotal ?? total; }
+  each = each || Infinity; total = total || Infinity;
   const out = [];
   let used = 0;
   for (let i = (chat?.length || 0) - 1; i >= 0 && out.length < limit; i--) {

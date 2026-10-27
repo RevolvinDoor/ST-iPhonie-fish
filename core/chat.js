@@ -3,17 +3,21 @@
 //
 // A chat preset holds the rules the model follows when it answers in the phone, how many recent story messages
 // and chat messages it sees, and the template used when a chat is brought into the story.
+import {promptText, promptOn} from './prompt-rules.js';
+import {songOf, listeningNote} from './music.js';
 import {normalizeWallet, defaultWallet, PREMIUM, guessEmoji, yuan} from './wallet.js';
 import {parseDialogue, isPlaceholderRole} from './protocol.js';
+import {cardRoutes} from './routes.js';
 import {money} from './chats.js';
 import {callSummary} from './call.js';
 import {languageName} from './languages.js';
 import {normalizeMemory} from './memory.js';
 
-export const CHAT_LIMITS = Object.freeze({contacts: 200, persona: 4000, story: 40, history: 200});
+// loreMax, storyEach, storyTotal: characters (0: no limit of the phone's own; the tavern's World Info budget still applies).
+export const CHAT_LIMITS = Object.freeze({contacts: 200, persona: 4000, story: 100, history: 500, chars: 2_000_000});
 
 // Where a rule is used: private chats, group chats, 朋友圈 (posts, likes and comments), 电话 (voice calls).
-export const RULE_USES = Object.freeze(['dm', 'group', 'moments', 'call', 'forum', 'peek']);
+export const RULE_USES = Object.freeze(['dm', 'group', 'moments', 'call', 'forum', 'peek', 'story']);
 export const DEFAULT_CHAT_ENTRIES = Object.freeze([
   {id: 'style', title: '短信口吻', text: '你在一个手机聊天软件里，以联系人本人的身份回复{{用户}}。像真的在发手机消息：口语，可以用语气词和颜文字，不写动作、旁白和心理描写，不加引号。发几条、每条多长，按这个人的性格、说话习惯和当下的心情来：话少的人可能只回一个字、一个表情；话多的人会连着发好几条；习惯打长段的人一条就是一大段；激动、委屈、兴奋或者有很多话想说的时候，可以一口气发很多条。不要每次都发差不多的条数和长度。', use: ['dm', 'group']},
   {id: 'persona', title: '守住人设', text: '严格按每个联系人的人设、和{{用户}}的关系、说话习惯来回复。最近的剧情只作背景：可以提到发生过的事，但不要复述剧情，也不要替{{用户}}说话。', use: ['dm', 'group']},
@@ -26,8 +30,9 @@ export const DEFAULT_CHAT_ENTRIES = Object.freeze([
   {id: 'm-interact', title: '点赞和评论', use: ['moments'], text: '别人发动态时，关系好的联系人会点赞或评论；评论简短口语，可以互相接话、吐槽、开玩笑。{{用户}}评论时，被评论的人一定会回复，别的人看到了也可以接话。'},
   {id: 'm-picture', title: '朋友圈配图', use: ['moments'], text: '有画面感的动态可以配一张图，大约三成的动态配图就好：自拍、吃的、风景、宠物、正在看的东西。配图写成英文 danbooru tag，描述画面本身。'},
   {id: 'c-dial', title: '打电话', use: ['dm'], text: '想马上听到{{用户}}的声音、有急事、吵完架想和好、半夜睡不着想念的时候，很偶尔可以直接打电话过去。大多数时候发消息就好，只有真的有理由时才打。'},
-  {id: 'f-style', title: '论坛口吻', use: ['forum'], text: '论坛是公开的，谁都能看：发帖和回帖的有角色，也有不认识的网友（路人）。路人有自己的网名和说话习惯，吃瓜、八卦、玩梗、抬杠、安利、求助都可以，口吻像真的网友，别都是好话。角色在论坛上用自己的名字，发言符合人设；公开场合说话一般比私聊更注意分寸，除非人设就是这样。话题可以来自最近的剧情、这个世界的设定、日常生活和身边的事；路人不知道只有当事人才知道的秘密。'},
+  {id: 'f-style', title: '论坛口吻', use: ['forum'], text: '论坛是公开的，谁都能看：发帖和回帖的有角色，也有不认识的网友（路人）。路人有自己的网名和说话习惯，吃瓜、八卦、玩梗、抬杠、安利、求助都可以，口吻像真的网友，别都是好话。角色在论坛上用自己的名字，发言符合人设；公开场合说话一般比私聊更注意分寸，除非人设就是这样。话题可以来自这个世界里公开发生的事、人人都知道的设定、日常生活和身边的事；剧情里私下发生的事，论坛上的人不知道。'},
   {id: 'p-style', title: 'TA 的手机', use: ['peek'], text: '{{用户}}正在偷看{{对象}}的手机。手机里的东西都要像真的：{{对象}}和朋友、家人、同事或别的角色的聊天，搜索记录，备忘录，相册。内容要符合{{对象}}的人设、生活和最近发生的事，聊天对象各有各的说话方式；可以藏着{{对象}}没对{{用户}}说出口的心思、小秘密或者反差，但不要编出和剧情矛盾的大事件。'},
+  {id: 's-text', title: '正文里主动发消息', use: ['story'], text: '剧情里有人这时会给{{用户}}发手机消息的话（刚分开、说好到了报个平安、在别处想起{{用户}}、有事找{{用户}}、吵完架想和好……），可以让 TA 在手机上发几条消息。像真的短信：口语、简短，看人设和剧情来，也可以发 [图片]、[位置]、[红包 ¥金额] 这些。不用每次都发，剧情里没有合适的时候就不发。'},
   {id: 'c-style', title: '通话口吻', use: ['call'], text: '你在和{{用户}}打语音电话，说的每一句都会被念出来。像真人打电话一样说话：口语，会接话、会反问，会有停顿和语气词。说多少按人设和情境来：话少的人三言两语，健谈的人、激动的时候、正在讲一件事的时候可以一口气说一大段；不要每次都说差不多长。身边发生的小事用说的话带出来（比如「等一下，我这边有点吵」），不写动作、旁白、心理描写和表情符号。守住人设和你们的关系，最近的剧情和聊天可以自然提起。'}
 ]);
 export const DEFAULT_BRING = '以下是{{用户}}刚才在手机上和{{对象}}的聊天记录。接下来的正文可以自然地承接、提到或回应这段聊天，不要原样复述：\n{{聊天记录}}';
@@ -39,9 +44,10 @@ const DEFAULT_INJECTION = {position: 'in_chat', depth: 1, role: 'system'};
 // rev 5 (0.6.42): how much a contact says follows the person, not a fixed 一到三条 / 一到三句; rules still holding the old
 // default words get the new ones, rules the user changed stay as they are.
 // rev 6 (0.6.45): 论坛 and 查手机; presets made earlier get 论坛口吻 and TA 的手机 once.
-const PRESET_REV = 6;
+// rev 7 (0.7.3): characters text the user from the story; presets made earlier get 正文里主动发消息 once.
+const PRESET_REV = 7;
 const OLD_RULES = Object.freeze({style: '你在一个手机聊天软件里，以联系人本人的身份回复{{用户}}。像真的在发手机消息：口语、简短，一次发一到三条，每条一两句话。可以用语气词和颜文字，不写动作、旁白和心理描写，不加引号。', group: '群聊里每次由一到三位成员接话，谁接话看话题和各自性格，成员之间也可以互相回应、吐槽。', 'c-style': '你在和{{用户}}打语音电话，说的每一句都会被念出来。像真人打电话一样说话：口语、句子短，一次说一到三句；会接话、会反问，会有停顿和语气词。身边发生的小事用说的话带出来（比如「等一下，我这边有点吵」），不写动作、旁白、心理描写和表情符号。守住人设和你们的关系，最近的剧情和聊天可以自然提起。'});
-const DEFAULT_PRESET = {id: 'default', name: '日常短信', rev: PRESET_REV, context: 6, history: 30, posts: 2, lore: true, loreSkipBooks: [], loreSkipEntries: [], cleanTags: [], bring: DEFAULT_BRING, injection: DEFAULT_INJECTION, entries: DEFAULT_CHAT_ENTRIES.map(e => ({...e, enabled: true}))};
+const DEFAULT_PRESET = {id: 'default', name: '日常短信', rev: PRESET_REV, context: 6, history: 30, storyEach: 4000, storyTotal: 20000, loreMax: 30000, posts: 2, lore: true, loreSkipBooks: [], loreSkipEntries: [], cleanTags: [], bring: DEFAULT_BRING, injection: DEFAULT_INJECTION, entries: DEFAULT_CHAT_ENTRIES.map(e => ({...e, enabled: true}))};
 
 // How voice messages read in the phone: only the voice bar until the user asks for 转文字 (or `auto`),
 // then the translation, the original line, or both.
@@ -52,7 +58,7 @@ export function normalizeVoiceText(v = {}) {
 }
 
 export function defaultChat() {
-  return {presets: [{...structuredClone(DEFAULT_PRESET), memory: normalizeMemory()}], activePreset: 'default', contacts: [], voiceText: {...DEFAULT_VOICE_TEXT}, profile: normalizeProfile(), starred: [], avatars: {}, partition: 'none', pace: true, wallet: defaultWallet(), stickers: []};
+  return {presets: [{...structuredClone(DEFAULT_PRESET), memory: normalizeMemory()}], activePreset: 'default', contacts: [], voiceText: {...DEFAULT_VOICE_TEXT}, profile: normalizeProfile(), starred: [], avatars: {}, partition: 'card', pace: true, wallet: defaultWallet(), stickers: [], proactive: normalizeProactive(), remarks: {}, netNames: {}};
 }
 
 const text = (value, max) => String(value ?? '').slice(0, max);
@@ -92,6 +98,7 @@ export function normalizeChatPreset(p = {}) {
     const missing = DEFAULT_CHAT_ENTRIES.filter(e => ['f-style', 'p-style'].includes(e.id) && !entries.some(x => x.id === e.id));
     entries = [...entries, ...missing.map(e => ({...e, enabled: true}))];
   }
+  if (!(Number(p.rev) >= 7) && entries.length && !entries.some(e => e.id === 's-text')) entries = [...entries, {...DEFAULT_CHAT_ENTRIES.find(e => e.id === 's-text'), enabled: true}];
   if (!(Number(p.rev) >= 5) && entries.length) {
     entries = entries.map(e => OLD_RULES[e?.id] && e.text === OLD_RULES[e.id] ? {...e, text: DEFAULT_CHAT_ENTRIES.find(x => x.id === e.id).text} : e);
   }
@@ -99,6 +106,10 @@ export function normalizeChatPreset(p = {}) {
     id: String(p.id || crypto.randomUUID()), name: text(p.name, 60) || '聊天预设', rev: PRESET_REV,
     context: count(p.context, 0, CHAT_LIMITS.story, DEFAULT_PRESET.context),
     history: count(p.history, 2, CHAT_LIMITS.history, DEFAULT_PRESET.history),
+    // How much story and 世界书 a phone request takes, in characters; 0: no limit.
+    storyEach: count(p.storyEach, 0, CHAT_LIMITS.chars, DEFAULT_PRESET.storyEach),
+    storyTotal: count(p.storyTotal, 0, CHAT_LIMITS.chars, DEFAULT_PRESET.storyTotal),
+    loreMax: count(p.loreMax, 0, CHAT_LIMITS.chars, DEFAULT_PRESET.loreMax),
     posts: count(p.posts, 1, 5, DEFAULT_PRESET.posts),
     // 世界书: entries the tavern would turn on are added to chat, call and 朋友圈 requests (host-lore.js).
     lore: p.lore !== false,
@@ -122,20 +133,36 @@ function ruleUse(e) {
 
 // The user in the chat app (QQ style): shown name (empty: the tavern's persona name), status, signature, and looks.
 export const PROFILE_STATUS = Object.freeze({online: '在线', qme: 'Q我吧', busy: '忙碌', away: '离开', hidden: '隐身'});
-export const BUBBLES = Object.freeze({default: '默认', candy: '糖果', mint: '薄荷', night: '星空', ink: '描边'});
+// 质感 bubbles and 氛围 backgrounds (ui/aura.css, ui/chat-scenes.js): material and soft colour, each with a day and a night
+// look. The ones from before (drawn pictures) become the nearest new one (OLD_LOOKS).
+export const BUBBLES = Object.freeze({default: '默认', paper: '纸张', jelly: '果冻', frost: '磨砂', glow: '夜光'});
 export const FRAMES = Object.freeze({none: '无', star: '星星', cat: '猫耳', flower: '花环', halo: '光环'});
-export const BACKGROUNDS = Object.freeze({none: '无', clouds: '云朵', stars: '星空', grid: '格子', sakura: '樱花'});
+export const BACKGROUNDS = Object.freeze({none: '无', sky: '晴空', dusk: '黄昏', blush: '樱粉', mint: '薄荷', lavender: '薰衣草', deep: '深海', paper: '纸张'});
+const OLD_LOOKS = {bubble: {candy: 'jelly', mint: 'jelly', night: 'glow', ink: 'paper'}, background: {clouds: 'sky', stars: 'lavender', grid: 'paper', sakura: 'blush', 'aura-sky': 'sky', 'aura-dusk': 'dusk', 'aura-blush': 'blush', 'aura-deep': 'deep', 'aura-night': 'lavender'}};
 export function normalizeProfile(p = {}) {
   const pick = (value, list, fallback) => Object.hasOwn(list, value) ? value : fallback;
   return {name: text(p.name, 40).trim(), status: pick(p.status, PROFILE_STATUS, 'online'), statusText: text(p.statusText, 20).trim(), signature: text(p.signature, 80).trim(),
     // Bought looks (PREMIUM) are kept like the free ones; the backend checks they were bought before they are put on.
-    bubble: pick(p.bubble, {...BUBBLES, ...PREMIUM.bubble}, 'default'), frame: pick(p.frame, {...FRAMES, ...PREMIUM.frame}, 'none'), background: pick(p.background, {...BACKGROUNDS, ...PREMIUM.background}, 'none'), backgroundPhoto: text(p.backgroundPhoto, 512)};
+    bubble: pick(OLD_LOOKS.bubble[p.bubble] || p.bubble, {...BUBBLES, ...PREMIUM.bubble}, 'default'), frame: pick(p.frame, {...FRAMES, ...PREMIUM.frame}, 'none'), background: pick(OLD_LOOKS.background[p.background] || p.background, {...BACKGROUNDS, ...PREMIUM.background}, 'none'), backgroundPhoto: text(p.backgroundPhoto, 512)};
 }
 
 /**
  * Avatar choices by name ('me' is the user): a photo from the album, or plain text (the first letter). A name that is
  * not listed shows the tavern's own avatar when there is one (character card, persona), else the first letter.
  */
+/**
+ * Other names by person: 备注 (remarks: what the user calls a contact in the chat app — only the user sees it) and
+ * 网名 (netNames: the names on the forum; 'me' is the user's). {name: other name}.
+ */
+export function normalizeNames(value, max = 30) {
+  const out = {};
+  if (!value || typeof value !== 'object') return out;
+  for (const [name, other] of Object.entries(value).slice(0, CHAT_LIMITS.contacts * 2)) {
+    const key = text(name, 40).trim(), v = text(other, max).trim();
+    if (key && v && v !== key) out[key] = v;
+  }
+  return out;
+}
 export function normalizeAvatars(value) {
   const out = {};
   if (!value || typeof value !== 'object') return out;
@@ -191,7 +218,93 @@ export function normalizeChat(value) {
   const presets = (Array.isArray(value.presets) && value.presets.length ? value.presets : base.presets).map(normalizeChatPreset);
   const contacts = (Array.isArray(value.contacts) ? value.contacts : []).slice(0, CHAT_LIMITS.contacts).map(normalizeContact).filter(c => c.name);
   const starred = [...new Set((Array.isArray(value.starred) ? value.starred : []).map(n => text(n, 40).trim()).filter(Boolean))].slice(0, CHAT_LIMITS.contacts);
-  return {presets, activePreset: presets.some(p => p.id === value.activePreset) ? value.activePreset : presets[0].id, contacts, voiceText: normalizeVoiceText(value.voiceText), profile: normalizeProfile(value.profile), wallet: normalizeWallet(value.wallet), starred, avatars: normalizeAvatars(value.avatars), partition: value.partition === 'card' ? 'card' : 'none', pace: value.pace !== false, stickers: normalizeStickers(value.stickers)};
+  return {presets, activePreset: presets.some(p => p.id === value.activePreset) ? value.activePreset : presets[0].id, contacts, voiceText: normalizeVoiceText(value.voiceText), profile: normalizeProfile(value.profile), wallet: normalizeWallet(value.wallet), starred, avatars: normalizeAvatars(value.avatars), partition: value.partition === 'none' ? 'none' : 'card', pace: value.pace !== false, stickers: normalizeStickers(value.stickers), proactive: normalizeProactive(value.proactive), remarks: normalizeNames(value.remarks, 20), netNames: normalizeNames(value.netNames, 30)};
+}
+
+// ---------- 主动发消息: characters text the user on their own ----------
+/**
+ * on: the story may have characters text the user (<phone> in a story reply, no request of its own); every: besides,
+ * every this many story replies someone may text first (0: never; one phone request each), at most dailyMax a day.
+ */
+// dailyMax 0: no limit a day.
+export function normalizeProactive(value = {}) {
+  return {on: value?.on === true, every: count(value?.every, 0, 100, 0), dailyMax: count(value?.dailyMax, 0, 99, 3)};
+}
+export const PHONE_TAG = /<phone\b([^>]*)>([\s\S]*?)<\/phone\s*>/gi;
+/**
+ * What a story reply sent to the phone: [{group, text}] for each <phone>…</phone> (group: the group chat's name of
+ * <phone group="群名">, '' for private messages).
+ */
+export const phoneParts = text => [...String(text ?? '').matchAll(PHONE_TAG)].map(m => ({group: (m[1].match(/group\s*=\s*["'“”「『]?([^"'“”」』>]+)/)?.[1] || '').trim(), text: m[2].trim()})).filter(p => p.text);
+/** The inside of each <phone>…</phone>. */
+export const phoneBlocks = text => phoneParts(text).map(p => p.text);
+/**
+ * How things that happen on the user's phone are written: messages, photos (in words; with drawing tags when pictures
+ * can be drawn), 位置, money, presents, songs, a call (the phone rings), 朋友圈, group messages.
+ * after: for the request made after the reply (回复后单独), which reads the finished story; else for the story itself.
+ */
+export function phoneFormat({user = '我', names = [], groups = [], images = false, after = false} = {}) {
+  const list = names.join('、');
+  return [after ? '【手机上的事】' : '【发到手机上的事】',
+    after ? `读这段正文：里面写到有人用手机联系${user}（发消息、发照片、转账、发红包、送礼物、分享歌曲、打电话），或者有人发了朋友圈，就把这些事在${user}的手机上真的发出来，内容和正文写的对得上；剧情里有人这时自然会给${user}发消息的，也可以发。`
+      : `剧情里有人这时会用手机联系${user}（发消息、发照片、转账、打电话……），或者正文里写到了这样的事，就在正文写完的地方另起一行写 <phone></phone>（预设要求写在正文后面的状态栏、选项这些照常写在它后面，不要省略），把这些事在${user}的手机上真的发出来，内容和正文写的对得上。`,
+    `${after ? '' : '<phone></phone> 里'}一件事一行：`,
+    '- 消息：「名字：消息」，可以连着发几条',
+    `- 照片：「名字：[图片] 一句话描述照片里拍到的画面${images ? '｜画这张照片用的英文 danbooru tag（只写照片里真有的：拍的是猫就写 cat，画面里没有人就写 no humans、不写 1girl 1boy；只有拍到自己时才写 1girl 或 1boy 和 selfie；再写构图、光线）' : ''}」`,
+    '- 位置：「名字：[位置] 地点」',
+    '- 红包、转账：「名字：[红包 ¥金额] 祝福语」「名字：[转账 ¥金额] 备注」',
+    '- 礼物：「名字：[礼物 物品名] 附言」',
+    '- 分享歌曲：「名字：[分享歌曲] 歌名 - 歌手｜想说的话」',
+    `- 打电话：「名字：[打电话] 为什么打」（${user}的手机会响，每次最多一个）`,
+    `- 发朋友圈：「名字：[朋友圈] 动态内容」（发给所有朋友看的，不是发给${user}的）`,
+    `私聊是一对一的：${after ? '' : '<phone></phone> 里'}每个人的每一条都是他单独发给${user}的，只有他和${user}看得到，发到他和${user}的私聊窗口里。所以：`,
+    `- 每条都是对${user}说的（「你」就是${user}），不对别人说话、不喊别人的名字让对方接话；想说别人的事，就当着${user}的面说起他。`,
+    `- 几个人都发消息时，各发各的：彼此看不到对方发了什么，不回应、不引用、不接着别人私聊里的话，也不知道别人给${user}发过消息（正文里当面说过、${user}告诉过他的除外）。`,
+    `- 消息内容只能是他这时会知道的事：没在场的人不知道刚才当面发生了什么。`,
+    groups.length ? (after ? `几个人在一起聊、互相能看到的，只能发在群里：另起一段，第一行写「群：群名」，下面一样一行一件事；群名只能是：${groups.join('、')}。` : `几个人在一起聊、互相能看到的，只能发在群里：另写一段 <phone group="群名"></phone>；群名只能是：${groups.join('、')}。`) : '',
+    `名字只能是：${list}。不要替${user}发，不写语音标签。这些只出现在${user}的手机上，不写进正文的叙述里。${after ? '正文里没有这样的事、也没人要发消息，就只写「无」。' : '没有这样的事就不写。'}`].filter(Boolean).join('\n');
+}
+const storyRules = (preset, user, list) => (preset?.entries || []).filter(e => e.enabled && e.text?.trim() && (e.use || []).includes('story')).map(e => fill(e.text, {'用户': user, '联系人': list, '对象': list}));
+/**
+ * The rule for the story request: the chat preset's 正文 rules ({{用户}}, {{联系人}}), and how to write what happens
+ * on the phone. '' when there is no rule or no one to send them.
+ */
+export function storyTextRule(preset, {user = '我', names = [], groups = [], images = false} = {}) {
+  const used = storyRules(preset, user, names.join('、'));
+  if (!used.length || !names.length) return '';
+  return [...used, phoneFormat({user, names, groups, images})].join('\n\n');
+}
+/** The same for the request made after the reply (回复后单独配音/配图): it reads the story and writes the phone part. */
+export function phoneAfterRule(preset, {user = '我', names = [], groups = [], images = false} = {}) {
+  const used = storyRules(preset, user, names.join('、'));
+  if (!used.length || !names.length) return '';
+  return [...used, phoneFormat({user, names, groups, images, after: true})].join('\n\n');
+}
+/** A request made after the reply (its system and user messages) with the phone part asked for at the end. */
+export function withPhone(prompt, rule) {
+  if (!rule) return prompt;
+  const [system, user, ...rest] = prompt;
+  return [{...system, content: `${system.content}\n\n${rule}\n\n【这次还要做一件事】上面要输出的都写完以后，最后另起一行写「【手机】」，下面按【手机上的事】的格式写；没有就在「【手机】」下面只写「无」。`},
+    {...user, content: `${user.content}\n（最后别忘了「【手机】」那一段。）`}, ...rest];
+}
+/** An answer split: what comes before 「【手机】」, and the phone part as <phone> blocks ('' when there is none). */
+export function phoneSection(reply) {
+  const text = String(reply ?? ''), at = text.search(/^[ \t]*[【\[]手机[】\]][ \t]*/m);
+  if (at < 0) return {rest: text, phone: ''};
+  const tail = text.slice(at).replace(/^[ \t]*[【\[]手机[】\]][ \t]*/, ''), end = tail.search(/^[ \t]*【(?!手机)[^】\n]{1,10}】[ \t]*$/m);
+  const body = (end < 0 ? tail : tail.slice(0, end)).trim(), rest = text.slice(0, at) + (end < 0 ? '' : tail.slice(end));
+  if (!body || /^无[。.]?$/.test(body)) return {rest, phone: ''};
+  // 「群：群名」 starts a group's part.
+  const blocks = [], add = (group, lines) => { const t = lines.join('\n').trim(); if (t) blocks.push(group ? `<phone group="${group.replace(/["<>]/g, '')}">\n${t}\n</phone>` : `<phone>\n${t}\n</phone>`); };
+  let group = '', lines = [];
+  for (const line of body.split(/\r?\n/)) {
+    const g = line.match(/^\s*(?:群聊?|群名)\s*[:：]\s*(.+?)\s*$/);
+    if (g) { add(group, lines); group = g[1]; lines = []; continue; }
+    if (/^\s*无[。.]?\s*$/.test(line)) continue;
+    lines.push(line);
+  }
+  add(group, lines);
+  return {rest, phone: blocks.join('\n')};
 }
 
 export function validateChatPreset(p) {
@@ -221,10 +334,15 @@ export const inSpace = (item, space) => !space?.key || !item?.space || item.spac
 /** The space to filter by: the open card's, when partition is on and a card is open; else null (everything). */
 export const activeSpace = (settings, space) => settings.chat?.partition === 'card' && space?.key ? space : null;
 export function chatContacts(settings, space = null) {
-  // A card's contacts: its own character(s), the roles that have spoken in its story, and contacts added under it.
-  // A role no story has met yet (just made in the 角色 App) belongs to every card until one does.
-  const here = r => !space?.key || (space.members || []).includes(r.name) || !(Array.isArray(r.cards) && r.cards.length) || r.cards.includes(space.key);
-  const roles = settings.routes.filter(r => !isPlaceholderRole(r.name) && here(r)).map(r => ({name: r.name, source: 'role', voice: !!r.voice, engine: r.voice ? r.engine : 'none', language: r.language || settings.general.defaultLanguage, persona: ''}));
+  // A card's contacts: its own character(s), the roles that have spoken (or been named) in its story, roles added to
+  // it, and contacts added under it. A role no story has met yet is in none until one does: it used to be in every
+  // card, so that roles made before cards were kept (most of them) made every card's phone look the same. A role
+  // made while a card is open belongs to that card; any role can be added from 联系人 →「＋」.
+  const scoped = space?.key ? cardRoutes(settings.routes, space.key) : (settings.routes || []);
+  const here = r => !space?.key || (space.members || []).includes(r.name) || r.card === space.key || (Array.isArray(r.cards) && r.cards.includes(space.key));
+  const roles = scoped.filter(r => !isPlaceholderRole(r.name) && r.name !== '旁白' && here(r)).map(r => ({name: r.name, source: 'role', voice: !!r.voice, engine: r.voice ? r.engine : 'none', language: r.language || settings.general.defaultLanguage,
+    // 角色资料: written in the 角色 App, else a contact of the same name's (a contact given a voice keeps who they are).
+    persona: String(r.persona || settings.chat.contacts.find(c => c.name === r.name && inSpace(c, space))?.persona || '').slice(0, CHAT_LIMITS.persona)}));
   const manual = settings.chat.contacts.filter(c => !roles.some(r => r.name === c.name) && inSpace(c, space)).map(c => ({name: c.name, source: 'manual', id: c.id, voice: false, engine: 'none', language: '', persona: c.persona}));
   return [...roles, ...manual];
 }
@@ -242,12 +360,14 @@ export function messageLine(m, user) {
   switch (m.kind) {
     case 'system': return '';
     case 'voice': return `${who}：${quote}[语音] ${m.translation || m.text}`;
-    case 'photo': return `${who}：[图片]${m.text ? ' ' + m.text : ''}`;
+    case 'photo': return `${who}：[图片${m.seen ? m.seen : ''}]${m.text ? ' ' + m.text : ''}`;
+    case 'file': return `${who}：[文件 ${m.name}]${m.text ? ' ' + m.text : ''}`;
     case 'sticker': return `${who}：[表情包] ${m.text}`;
     case 'redpacket': return `${who}：[红包 ¥${m.amount}] ${m.text || DEFAULT_BLESSING}（${m.state === 'opened' ? nameOf(m.openedBy, user) + '已领取' : '还没领取'}）`;
     case 'transfer': return `${who}：[转账 ¥${m.amount}]${m.text ? ' ' + m.text : ''}（${TRANSFER_STATE[m.state] || '待收款'}）`;
     case 'gift': return `${who}：[礼物 ${m.gift?.name || ''}${m.gift?.price ? ' ¥' + yuan(m.gift.price) : ''}]${m.text ? ' ' + m.text : ''}（${m.state === 'accepted' ? '已收下' : m.state === 'returned' ? '被退还了' : '还没收下'}）`;
     case 'location': return `${who}：[位置] ${m.text}${m.detail ? '（' + m.detail + '）' : ''}`;
+    case 'song': return `${who}：${quote}[分享歌曲] ${m.song?.title || ''}${m.song?.artist ? ' - ' + m.song.artist : ''}${m.text ? ' ' + m.text : ''}`;
     case 'pat': return `（${patText(m, user)}）`;
     case 'dice': return `${who}：[骰子] ${m.text} 点`;
     case 'notice': return `（${noticeText(m, user)}）`;
@@ -259,54 +379,71 @@ export function messageLine(m, user) {
 
 const fill = (template, values) => Object.entries(values).reduce((s, [k, v]) => s.replaceAll(`{{${k}}}`, v), template);
 
+/** The words of the files still in the chat window: the latest three, at most 30000 characters together. */
+export const CHAT_FILES = Object.freeze({count: 3, chars: 30000});
+function filesText(history, user) {
+  let room = CHAT_FILES.chars;
+  const files = history.filter(m => m.kind === 'file' && m.fileText).slice(-CHAT_FILES.count).reverse().map(m => {
+    const words = m.fileText.slice(0, Math.max(0, room)); room -= words.length;
+    return words ? `【${nameOf(m.from, user)}发来的文件：${m.name}】\n${words}${words.length < m.fileText.length ? '\n（后面太长，没有发出来）' : ''}\n【文件结束】` : '';
+  }).filter(Boolean).reverse();
+  return files.length ? files.join('\n\n') + '\n\n' : '';
+}
+
 /**
  * Chat-style request for one reply turn.
  * members: [{name, persona, card, voice, language}] (card: the tavern character card text, when there is one)
  * story: [{name, text}] recent story messages, oldest first.
  */
-export function buildChatRequest({preset, thread, members, story = [], user = '我', userPersona = '', voiceFormat, lore = '', memory = '', earlier = '', images = false, stickers = []}) {
+/**
+ * What the people on the phone know of the story: what they were there for, were told, or said on the phone — not
+ * the rest the reader saw. names: who speaks (a chat's members, the one on the call). group: a group chat.
+ */
+export function knowsRule(names, user, {prompts = {}, group = false} = {}) {
+  const one = names.length === 1 ? names[0] : '';
+  return promptText(prompts, 'knows', 'text', {'谁': one || '各人', '每个人': one || '每个人', '用户': user, '告诉': one ? ' TA ' : '自己', '某人': one || '一个人', '那人': one || '这个人', '群聊': group});
+}
+export function buildChatRequest({prompts = {}, preset, thread, members, story = [], user = '我', userPersona = '', voiceFormat, lore = '', memory = '', earlier = '', images = false, stickers = [], asking = '', music = null, forum = '', nudge = false, pictures = []}) {
   const group = thread.type === 'group';
   const partner = group ? thread.name : members[0]?.name || thread.name;
   const speakers = members.filter(m => m.voice);
   const values = {
     '用户': user, '对象': partner,
     '语音格式': voiceFormat,
-    '可发语音': speakers.length ? speakers.map(m => `${m.name}（${languageName(m.language || 'zh')}）`).join('、') : '（暂时没有人能发语音，只发文字）'
+    '可发语音': speakers.length ? speakers.map(m => `${m.name}（${languageName(m.language || 'zh')}）`).join('、') : promptText(prompts, 'chat', 'noVoice')
   };
   const used = preset.entries.filter(e => e.enabled && e.text.trim() && e.use.includes(group ? 'group' : 'dm')).filter(e => speakers.length || e.id !== 'voice');
   const rules = used.map(e => fill(e.text, values)), posting = used.some(e => e.id === 'post' || /朋友圈/.test(e.text)), dialing = !group && used.some(e => e.id === 'c-dial');
-  const people = members.map(m => `- ${m.name}：${(m.persona || m.card || '').trim() || '（没有资料，按剧情里的表现来）'}`).join('\n');
-  const names = members.map(m => m.name).join('、');
-  const system = [
-    rules.join('\n\n'),
-    `【聊天对象】\n${people}`,
-    lore.trim() ? `【世界书】（这些人物和这个世界的设定：人设、口音、方言、说话方式都按这里来）\n${lore.trim()}` : '',
-    userPersona.trim() ? `【${user}】\n${userPersona.trim()}` : '',
-    earlier.trim() ? `【更早的剧情】（记忆插件整理的长期剧情，只作背景参考）\n${earlier.trim()}` : '',
-    story.length ? `【最近的剧情】（只作背景参考）\n${story.map(s => `${s.name}：${s.text}`).join('\n')}` : '',
-    memory.trim(),
-    ['【输出格式】',
-      `只输出新消息，每条消息单独一行，写成「名字：消息内容」。名字只能是：${names}。`,
-      `不要写${user}的消息，不要写时间、编号、引号或任何解释。`,
-      speakers.length ? `语音消息的整行写成「名字：${voiceFormat}」，标签里的角色填同一个名字；标签里的原文（{文本}）是念出来的话，用这个人的语音语言写（${speakers.map(m => `${m.name}：${languageName(m.language || 'zh')}`).join('，')}），引号里的{译文}写中文。` : '',
-      `需要时也可以像真人一样用手机功能，每种单独一行，偶尔用，别每轮都用：「名字：[图片] 一句话描述拍的照片${images ? '｜画这张照片用的英文 danbooru tag（拍的是什么、构图、光线；拍到自己就写 1girl 或 1boy 和 selfie）' : ''}」「名字：[位置] 地点」「名字：[红包 ¥金额] 祝福语」「名字：[转账 ¥金额] 备注」「名字：[拍一拍]」（拍一拍${user}）；很偶尔（节日、纪念日、道歉、想对${user}好的时候）可以送${user}礼物：「名字：[礼物 物品名] 附言」。`,
-      `${user}发来红包或转账时，收下红包单独写一行「名字：[领取红包]」，收下转账写「名字：[收款]」，退还转账写「名字：[退还]」；${user}送来礼物时，收下写「名字：[收下礼物]」，不收写「名字：[退还礼物]」；收不收按人设决定。`,
-      stickers.length ? `可以像真人一样发表情包，单独一行写成「名字：[表情包] 表情包的名字」，合适的时候用，别每条都发；名字只能从这些里选：${stickers.slice(-80).map(s => s.name ?? s).join('、')}。` : '',
-      dialing ? `很偶尔可以直接给${user}打语音电话：这一轮最后单独一行写成「名字：[打电话] 为什么打」，大多数回复都不要打。` : '',
-      posting ? `很偶尔可以顺手发一条朋友圈，单独一行写成「名字：[朋友圈] 动态内容」；这是发给所有朋友看的动态，不是发给${user}的消息，大多数回复都不要发。` : ''].filter(Boolean).join('\n')
-  ].filter(Boolean).join('\n\n');
-  const history = thread.messages.filter(m => m.kind !== 'system').slice(-preset.history);
-  const last = history.at(-1);
-  const turn = !history.length ? `（聊天刚开始：${group ? '群里有人' : partner}主动给${user}发消息。）`
-    : last.from === 'me' ? `（现在轮到${group ? '群里的成员' : partner}回复${user}。）`
-    : `（${group ? '群里' : partner}可以继续说，或者换个话题。）`;
+  const system = promptText(prompts, 'chat', 'system', {
+    '预设规则': rules.join('\n\n'), '用户': user, '聊天对象': partner, '谁': group ? '群里每个人' : partner,
+    '聊天对象资料': members.map(m => `- ${m.name}：${(m.persona || m.card || '').trim() || '（没有资料，按剧情里的表现来）'}`).join('\n'),
+    '世界书': lore.trim(), '用户设定': userPersona.trim(), '更早的剧情': earlier.trim(), '最近的剧情': story.map(s => `${s.name}：${s.text}`).join('\n'),
+    '论坛': forum.trim() ? promptText(prompts, 'chat-forum', 'text', {'论坛内容': forum.trim()}) : '',
+    '记忆': memory.trim(),
+    '知情范围': story.length || earlier.trim() ? knowsRule(group ? members.map(m => m.name) : [partner], user, {group, prompts}) : '',
+    '名单': members.map(m => m.name).join('、'),
+    '语音': speakers.length > 0, '语音格式': voiceFormat, '语音语言': speakers.map(m => `${m.name}：${languageName(m.language || 'zh')}`).join('，'),
+    '出图': images, '表情包': stickers.slice(-80).map(s => s.name ?? s).join('、'), '打电话': dialing, '朋友圈': posting, '分享歌曲': !!music?.share, '删好友': !group && !asking,
+    '正在听': music?.listening ? listeningNote(music.listening, user, prompts) : '', '好友申请': asking, '看图': pictures.length > 0});
+  // pictures: [{id, url}] — photos sent along for a model that sees; the record numbers them [图片1], [图片2]… in order.
+  const seen = new Map(pictures.map((p, i) => [p.id, i + 1]));
+  const history = thread.messages.filter(m => m.kind !== 'system').slice(-preset.history).map(m => seen.has(m.id) ? {...m, seen: seen.get(m.id)} : m);
+  const last = history.at(-1), now = !nudge && !asking;
+  // 主动找你: whether to text at all is the model's to judge, by the preset's 「正文里主动发消息」 rule; [不发] is no.
+  const when = nudge ? preset.entries.find(e => e.id === 's-text' && e.enabled && e.text.trim()) : null;
+  const turn = promptText(prompts, 'chat', 'turn', {'用户': user, '聊天对象': partner,
+    '主动': nudge, '什么时候发': when ? fill(when.text, values) : '', '好友申请': !nudge && asking,
+    '刚开始': now && !history.length ? (group ? '群里有人' : partner) : '',
+    '轮到回复': now && last?.from === 'me' ? (group ? '群里的成员' : partner) : '',
+    '接着说': now && last && last.from !== 'me' ? (group ? '群里' : partner) : ''});
   const transcript = history.length ? `【${group ? thread.name + '（群聊）' : '和' + partner}的聊天记录】\n${history.map(m => messageLine(m, user)).filter(Boolean).join('\n')}\n\n` : '';
-  return [{role: 'system', content: system}, {role: 'user', content: transcript + turn}];
+  const text = transcript + filesText(history, user) + turn;
+  return [{role: 'system', content: system}, {role: 'user', content: pictures.length ? [{type: 'text', text}, ...pictures.map(p => ({type: 'image_url', image_url: {url: p.url}}))] : text}];
 }
 
 const NAME_LINE = /^\s*(?:\*\*)?[[【]?([^\]】:：\n]{1,40}?)[\]】]?(?:\*\*)?\s*[:：]\s*(.*)$/;
 const unquote = s => s.trim().replace(/^[「“"『](.*)[」”"』]$/s, '$1').trim();
-const SPECIAL = /^\s*[[【]\s*(表情包|表情|收下礼物|退还礼物|礼物|送礼|图片|照片|位置|定位|红包|转账|拍一拍|领取红包|领取|收下|收款|退还|退回|朋友圈|发朋友圈|动态|打电话|语音通话|来电)\s*([^\]】]*)[\]】]\s*(.*)$/;
+const SPECIAL = /^\s*[[【]\s*(表情包|表情|收下礼物|退还礼物|礼物|送礼|图片|照片|位置|定位|红包|转账|拍一拍|领取红包|领取|收下|收款|退还|退回|朋友圈|发朋友圈|动态|打电话|语音通话|来电|分享歌曲|分享音乐|分享歌|歌曲|音乐|删除好友|删好友|拉黑|通过好友申请|通过好友|同意好友|接受好友|拒绝好友申请|拒绝好友)\s*([^\]】]*)[\]】]\s*(.*)$/;
 const LUCKY = ['6.66', '8.88', '5.20', '13.14', '16.80', '1.88'];
 /**
  * A phone-feature line (「[红包 ¥8.88] 祝福」 and the like) as a message; {kind:'claim', action} for taking or returning
@@ -321,6 +458,12 @@ function special(from, content, {names, user, stickers = []}) {
     case '朋友圈': case '发朋友圈': case '动态': { const said = (text || arg.trim()).slice(0, 2000); return said ? {from, kind: 'moment', text: said} : null; }
     // A voice call placed from the chat: the phone rings after this reply.
     case '打电话': case '语音通话': case '来电': return {from, kind: 'call', reason: (text || arg.trim()).slice(0, 200)};
+    // A song shared (「[分享歌曲] 歌名 - 歌手｜想说的话」): a card the user can play.
+    case '分享歌曲': case '分享音乐': case '分享歌': case '歌曲': case '音乐': { const [what, ...note] = (arg.trim() ? arg.trim() + (text ? '｜' + text : '') : text).split(/[|｜]/); const song = songOf(what); return song.title ? {from, kind: 'song', song, text: note.join(' ').trim().slice(0, 200)} : null; }
+    // 删好友: the contact deletes the user; answering the user's 好友申请.
+    case '删除好友': case '删好友': case '拉黑': return {from, kind: 'unfriend'};
+    case '通过好友': case '通过好友申请': case '同意好友': case '接受好友': return {from, kind: 'befriend'};
+    case '拒绝好友': case '拒绝好友申请': return {from, kind: 'refuse', text: (text || arg.trim()).slice(0, 200)};
     case '图片': case '照片': {
       // 「描述｜英文 tag」: the tags draw it when a drawing engine is set up (Chinese words in them are left out).
       const [said, ...tags] = (text || arg.trim()).split(/[|｜]/);

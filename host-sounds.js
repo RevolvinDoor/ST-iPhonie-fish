@@ -32,6 +32,8 @@ export function createSoundHost({context, settings, backend, notice = () => {}, 
   // ---------- Sound out ----------
   function audio() {
     if (!ctx && AudioContextClass && !closed) {
+      // Phones: Web Audio in the same session as the music (an <audio>), so a sound plays over it instead of stopping it.
+      try { const s = globalThis.navigator?.audioSession; if (s && s.type === 'auto') s.type = 'playback'; } catch {}
       ctx = new AudioContextClass();
       sfxOut = ctx.createGain(); ambienceOut = ctx.createGain();
       sfxOut.connect(ctx.destination); ambienceOut.connect(ctx.destination);
@@ -40,6 +42,8 @@ export function createSoundHost({context, settings, backend, notice = () => {}, 
     return ctx;
   }
   const running = () => ctx?.state === 'running';
+  /** Tells the music a sound is starting: some phones stop the music for it, and the music goes on. */
+  function heard() { try { doc?.dispatchEvent?.(new CustomEvent('sttts-sound')); } catch {} }
   function ramp(param, value, seconds) {
     const t = ctx.currentTime;
     try { param.cancelScheduledValues(t); param.setValueAtTime(param.value, t); param.linearRampToValueAtTime(value, t + Math.max(0.01, seconds)); } catch { param.value = value; }
@@ -68,6 +72,7 @@ export function createSoundHost({context, settings, backend, notice = () => {}, 
   /** Plays one sound once (a little different each time); resolves to its source node, or null. */
   async function shot(row, {strength = '', pan = 0, gain = 1, out = sfxOut} = {}) {
     if (!row || !running()) return null;
+    heard();
     let data;
     try { data = await buffer(row); } catch { return null; }
     if (closed || !running()) return null;
@@ -79,7 +84,7 @@ export function createSoundHost({context, settings, backend, notice = () => {}, 
     if (pan && ctx.createStereoPanner) { const p = ctx.createStereoPanner(); p.pan.value = pan; level.connect(p); tail = p; }
     tail.connect(out);
     src.onended = () => { try { src.disconnect(); level.disconnect(); tail.disconnect(); } catch {} };
-    src.start();
+    src.start(); heard();
     return src;
   }
 
@@ -219,6 +224,9 @@ export function createSoundHost({context, settings, backend, notice = () => {}, 
     return true;
   }
 
+  /** Whether sounds play by themselves (reading, voice, another chat): not when they wait for a tap on their ♪. */
+  const byItself = () => opts().tapOnly !== true;
+
   // ---------- A new reply, at reading pace ----------
   const message = id => context()?.chat?.[id];
   const rawOf = id => { const m = message(id); return m && !m.is_user && !m.is_system ? String(m.mes ?? '') : null; };
@@ -253,7 +261,7 @@ export function createSoundHost({context, settings, backend, notice = () => {}, 
       const tag = tags[i];
       if (below(id, tag.index) && waited < 60000) { waited += 500; plan.timer = setTimer(step, 500); return; }
       waited = 0;
-      if (once(id, raw, tag)) cue(tag);
+      if (byItself(tag) && once(id, raw, tag)) cue(tag);
       if (++i >= tags.length) { plans.delete(id); return; }
       plan.timer = setTimer(step, gaps[i] * 1000);
     };
@@ -275,12 +283,12 @@ export function createSoundHost({context, settings, backend, notice = () => {}, 
       const k = Number.isInteger(line.uiIndex) ? line.uiIndex : lines.findIndex(l => l.start === line.start);
       voicing.index = k;
       const from = k > 0 && lines[k - 1] ? lines[k - 1].end : 0;
-      for (const tag of voicing.tags) if (tag.start >= from && tag.start < line.start && once(snap.id, snap.raw, tag, VOICE_AGAIN)) cue(tag);
+      for (const tag of voicing.tags) if (tag.start >= from && tag.start < line.start && byItself(tag) && once(snap.id, snap.raw, tag, VOICE_AGAIN)) cue(tag);
       return;
     }
     if (status.phase === 'idle' && voicing && voicing.id === snap.id && voicing.raw === snap.raw && /^播放完成/.test(status.message || '')) {
       const lastLine = lines.at(-1);
-      if (lastLine && voicing.index === lines.length - 1) for (const tag of voicing.tags) if (tag.start >= lastLine.end && once(snap.id, snap.raw, tag, VOICE_AGAIN)) cue(tag);
+      if (lastLine && voicing.index === lines.length - 1) for (const tag of voicing.tags) if (tag.start >= lastLine.end && byItself(tag) && once(snap.id, snap.raw, tag, VOICE_AGAIN)) cue(tag);
       voicing = null;
     }
   }
@@ -290,7 +298,7 @@ export function createSoundHost({context, settings, backend, notice = () => {}, 
   function chatChanged() {
     cancelAll(); fresh.clear(); voicing = null;
     const chat = context()?.chat || [];
-    const name = on() ? latestAmbience(chat.slice(-30).filter(m => m && !m.is_user && !m.is_system).map(m => String(m.mes ?? ''))) : '';
+    const name = on() && byItself() ? latestAmbience(chat.slice(-30).filter(m => m && !m.is_user && !m.is_system).map(m => String(m.mes ?? ''))) : '';
     if (name) setAmbience(name); else { wanted = ''; stopAmbience(1); }
   }
   /** A message changed or went away: its sounds stop coming. */
@@ -305,6 +313,13 @@ export function createSoundHost({context, settings, backend, notice = () => {}, 
     if (!tag || !on()) return;
     await unlock();
     if (tag.kind === 'ambience' && !tag.stop && ambience.name === tag.name) { wanted = ''; stopAmbience(1); return; }
+    return cue(tag);
+  }
+  /** 视觉小说: the story reached a sound tag (快进 runs past the one-off sounds; an ambience still changes). Once. */
+  async function stage(id, index, {skipping = false} = {}) {
+    const raw = rawOf(Number(id)), tag = raw === null ? null : parseSounds(raw)[Number(index)];
+    if (!tag || !on() || skipping && tag.kind === 'sfx' || !once(Number(id), raw, tag, VOICE_AGAIN)) return;
+    await unlock();
     return cue(tag);
   }
   /** 试听 in the 音效 App: one sound as it is, once (again: stops it). */
@@ -340,5 +355,5 @@ export function createSoundHost({context, settings, backend, notice = () => {}, 
     const c = ctx; ctx = null;
     setTimer(() => { try { c?.close(); } catch {} }, 200);
   }
-  return {unlock, received, rendered, voice, chatChanged, messageChanged, refresh, tap, listen, state, promptPlan, close, stopAmbience: () => { wanted = ''; stopAmbience(1); }, reload, cue};
+  return {unlock, received, rendered, voice, chatChanged, messageChanged, refresh, tap, stage, listen, state, promptPlan, close, stopAmbience: () => { wanted = ''; stopAmbience(1); }, reload, cue};
 }

@@ -6,6 +6,7 @@
 //   ComfyUI: through the tavern's own ComfyUI proxy (/api/sd/comfy/…), so neither CORS nor a phone that cannot reach
 //   the computer's 127.0.0.1 gets in the way: the tavern server talks to ComfyUI. Workflows use the tavern's
 //   placeholders ("%prompt%", "%width%" …), so a workflow made for the tavern's image generation works here too.
+import {proxyAddress} from './proxy-url.js';
 
 import {normalizeDisabledLoras} from './comfy-loras.js';
 
@@ -14,7 +15,7 @@ export const DRAW_ENGINE_NAMES = {nai: 'NovelAI', gpt: 'GPT 生图', comfy: 'Com
 
 // ---------- GPT ----------
 export const OPENAI_BASE = 'https://api.openai.com/v1';
-export const GPT_IMAGE_MODELS = ['gpt-image-2', 'gpt-image-1.5', 'gpt-image-1', 'gpt-image-1-mini', 'dall-e-3'];
+export const GPT_IMAGE_MODELS = ['gpt-image-2.5-sunburst', 'gpt-image-2.5-flare', 'gpt-image-2', 'gpt-image-1.5', 'gpt-image-1', 'gpt-image-1-mini', 'dall-e-3'];
 export const GPT_QUALITIES = ['auto', 'low', 'medium', 'high'];
 export const GPT_ORIENTATIONS = ['portrait', 'landscape', 'square'];
 export const defaultGpt = () => ({url: '', model: 'gpt-image-1', quality: 'auto', orientation: 'portrait', ask: true, style: ''});
@@ -23,6 +24,8 @@ export const defaultGpt = () => ({url: '', model: 'gpt-image-1', quality: 'auto'
 export function gptBase(value, pageProtocol = globalThis.location?.protocol) {
   const raw = String(value ?? '').trim();
   if (!raw) return '';
+  const proxy = proxyAddress(raw);
+  if (proxy) { let path = proxy.replace(/\/+$/, '').replace(/\/images\/(generations|edits)$/i, ''); if (!/\/v\d+$/i.test(path)) path += '/v1'; return path; }
   let url; try { url = new URL(raw); } catch { throw Error('接口地址格式不对，要以 https:// 开头'); }
   if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('接口地址格式不对：以 https:// 开头，不带 ? 和 #');
   if (url.protocol === 'http:' && pageProtocol === 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) throw Error('酒馆是用 HTTPS 打开的，浏览器不允许连 http:// 的接口，请换成 HTTPS 地址');
@@ -100,17 +103,107 @@ const base64Blob = (data, type = 'image/png') => {
 };
 const imageType = format => ({jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', png: 'image/png'})[String(format || 'png').toLowerCase()] || 'image/png';
 
+/**
+ * The models the relay (or OpenAI) offers, drawing ones first: names with image, dall-e, imagen, flux, seedream,
+ * banana… Keep other names too: a relay may name its image models its own way.
+ */
+export async function gptModels({fetch = globalThis.fetch, settings, key}) {
+  const base = settings.url || OPENAI_BASE, url = base + '/models';
+  const headers = key ? {Authorization: 'Bearer ' + key} : {};
+  let response;
+  try { response = await fetch(url, {headers}); }
+  catch {
+    try { response = await fetch('/proxy/' + encodeURIComponent(url), {headers, credentials: 'same-origin'}); }
+    catch { throw Error('读不到模型列表：连不上这个接口，或者它不允许网页直接访问（CORS），酒馆代理也无法连接。也可以直接在「模型」里填模型名'); }
+  }
+  const raw = await response.text().catch(() => '');
+  if (!response.ok && /CORS proxy is disabled/i.test(raw)) throw Error('读不到模型列表：接口不允许跨域（CORS），酒馆代理尚未开启。请在 config.yaml 设置 enableCorsProxy: true 后重启，或直接在「模型」里填模型名');
+  if (response.status === 401 || response.status === 403) throw Error('读不到模型列表：密钥不对或没有权限，先保存密钥再读');
+  if (!response.ok) throw Error(`读不到模型列表（${response.status}）：这个接口可能没有模型列表，直接在「模型」里填模型名就行`);
+  let json; try { json = JSON.parse(raw); } catch { throw Error('读不到模型列表：返回的不是列表，直接在「模型」里填模型名就行'); }
+  const list = Array.isArray(json?.data) ? json.data : Array.isArray(json?.models) ? json.models : Array.isArray(json) ? json : [];
+  const names = [...new Set(list.map(m => typeof m === 'string' ? m : m?.id || m?.name).filter(Boolean).map(String))].sort();
+  const drawing = n => /image|dall-?e|imagen|flux|seedream|banana|kolors|ideogram|recraft|midjourney|\bmj\b|sdxl|stable-?diffusion|cogview|wanx|hunyuan-?image|jimeng/i.test(n);
+  return [...names.filter(drawing), ...names.filter(n => !drawing(n))].slice(0, 500);
+}
+
+// Only an explicit parameter rejection warrants a second generation request. Auth, quota, moderation and
+// ambiguous failures must not cause another paid POST just because the response mentions response_format.
+function rejectsResponseFormat(status, text) {
+  if (![400, 422].includes(status)) return false;
+  let error;
+  try { error = JSON.parse(text)?.error; } catch { error = text; }
+  if (error?.param && error.param !== 'response_format') return false;
+  if (error?.param === 'response_format' && ['unknown_parameter', 'unsupported_parameter'].includes(error.code)) return true;
+  const message = typeof error === 'string' ? error : String(error?.message || '');
+  return /(?:unknown|unrecognized|unexpected|unsupported)\s+(?:request\s+)?(?:parameter|field|argument)\s*[:=]?\s*['"`]?response_format\b|\bresponse_format['"`]?\s+(?:parameter\s+)?(?:is\s+)?(?:not\s+(?:currently\s+)?supported|unsupported)|(?:does not support|doesn't support)\s+(?:the\s+)?(?:parameter\s+)?['"`]?response_format\b|不支持(?:的)?(?:参数)?[:：\s]*['"`]?response_format\b/i.test(message);
+}
+
+async function pictureBlob(response) {
+  const blob = await response.blob();
+  // SillyTavern's proxy can omit Content-Type. Inspect common image signatures instead of rejecting small
+  // valid images, or treating a large HTML error page as a successful picture.
+  const bytes = new Uint8Array(await blob.slice(0, 16).arrayBuffer());
+  const starts = values => values.every((n, i) => bytes[i] === n);
+  const text = String.fromCharCode(...bytes);
+  const type = starts([137, 80, 78, 71, 13, 10, 26, 10]) ? 'image/png'
+    : starts([255, 216, 255]) ? 'image/jpeg'
+    : /^GIF8[79]a/.test(text) ? 'image/gif'
+    : text.startsWith('RIFF') && text.slice(8, 12) === 'WEBP' ? 'image/webp'
+    : text.slice(4, 8) === 'ftyp' && /^avi[fs]$/.test(text.slice(8, 12)) ? 'image/avif' : '';
+  if (!type) throw Error('中转给的图片链接没有取到图片');
+  return blob.type === type ? blob : new Blob([blob], {type});
+}
+
+async function gptPicture({fetch, url, signal}) {
+  let parsed;
+  try { parsed = new URL(url); } catch { throw Error('中转给的图片链接格式不正确'); }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw Error('中转给的图片链接格式不正确');
+  const read = async (target, proxy = false) => {
+    signal?.throwIfAborted();
+    // The generation key belongs to the API, never to the image CDN.
+    const response = await fetch(target, {signal, credentials: proxy ? 'same-origin' : 'omit'});
+    if (!response.ok) {
+      const text = proxy ? await response.text() : '';
+      if (/CORS proxy is disabled/i.test(text)) throw Error('中转给的是图片链接，但浏览器打不开它（链接不允许跨域）。请在酒馆的 config.yaml 里把 enableCorsProxy 改成 true 再重启酒馆，插件会通过酒馆去取；或者请中转直接返回图片数据（b64_json）');
+      throw Error(`中转给的图片链接打不开（${response.status}）`);
+    }
+    return pictureBlob(response);
+  };
+  try { return await read(url); }
+  catch (error) { signal?.throwIfAborted(); if (error?.name === 'AbortError') throw error; }
+  // Encode the entire URL: otherwise Express treats a signed CDN query as the proxy's own query and loses it.
+  try { return await read('/proxy/' + encodeURIComponent(url), true); }
+  catch (error) {
+    signal?.throwIfAborted(); if (error?.name === 'AbortError') throw error;
+    if (error instanceof TypeError) throw Error('中转图片下载失败：浏览器和酒馆代理都无法读取链接。请检查网络、链接是否过期，以及酒馆是否已开启 enableCorsProxy；也可以请中转直接返回 b64_json');
+    throw error;
+  }
+}
+
 /** Draws one picture with a GPT image model. Returns a Blob. */
 export async function gptGenerate({fetch = globalThis.fetch, settings, key, prompt, size, signal}) {
   if (!key) throw Error('还没有填写 GPT 生图的密钥');
-  const base = settings.url || OPENAI_BASE, relay = !!settings.url;
+  const base = settings.url || OPENAI_BASE, relay = base !== OPENAI_BASE;
   const body = {model: settings.model, prompt, n: 1, size};
   if (dalle(settings.model)) { body.response_format = 'b64_json'; if (/dall-e-3/i.test(settings.model)) body.quality = settings.quality === 'high' ? 'hd' : 'standard'; }
   else if (settings.quality !== 'auto') body.quality = settings.quality;
-  let response;
-  try { response = await fetch(base + '/images/generations', {method: 'POST', headers: {Authorization: 'Bearer ' + key, 'Content-Type': 'application/json'}, body: JSON.stringify(body), signal}); }
-  catch (error) { if (error?.name === 'AbortError') throw error; throw Error(relay ? '连不上中转：请确认地址正确、中转允许跨域（CORS）' : '连不上 OpenAI，请检查网络'); }
-  const text = await response.text().catch(() => '');
+  // Prefer inline image data from relays, with one compatibility retry on an explicit unsupported parameter.
+  if (relay) body.response_format = 'b64_json';
+  const post = async payload => {
+    signal?.throwIfAborted();
+    try { return await fetch(base + '/images/generations', {method: 'POST', headers: {Authorization: 'Bearer ' + key, 'Content-Type': 'application/json'}, body: JSON.stringify(payload), signal}); }
+    catch (error) { signal?.throwIfAborted(); if (error?.name === 'AbortError') throw error; throw Error(relay ? '连不上中转：请确认地址正确、中转允许跨域（CORS）' : '连不上 OpenAI，请检查网络'); }
+  };
+  const read = async response => {
+    try { const text = await response.text(); signal?.throwIfAborted(); return text; }
+    catch (error) { signal?.throwIfAborted(); if (error?.name === 'AbortError') throw error; throw Error('图片接口的响应读取中断，请检查网络'); }
+  };
+  let response = await post(body), text = await read(response);
+  if (relay && !dalle(settings.model) && rejectsResponseFormat(response.status, text)) {
+    const {response_format: unknown, ...plain} = body;
+    response = await post(plain); text = await read(response);
+  }
   if (!response.ok) throw gptFailure(response.status, text, relay);
   let data; try { data = JSON.parse(text); } catch { throw Error((relay ? '中转' : 'OpenAI') + '返回的内容不是图片数据'); }
   const item = data?.data?.[0];
@@ -118,10 +211,7 @@ export async function gptGenerate({fetch = globalThis.fetch, settings, key, prom
   if (item?.url) {
     // Some relays answer with a link: fetched here (a link the browser may not open says so).
     if (/^data:image\//.test(item.url)) return base64Blob(item.url.split(',')[1] || '', item.url.slice(5, item.url.indexOf(';')));
-    let picture;
-    try { picture = await fetch(item.url, {signal}); } catch (error) { if (error?.name === 'AbortError') throw error; throw Error('中转给的是图片链接，但浏览器打不开它（链接不允许跨域）'); }
-    if (!picture.ok) throw Error(`中转给的图片链接打不开（${picture.status}）`);
-    return await picture.blob();
+    return gptPicture({fetch, url: item.url, signal});
   }
   throw Error((relay ? '中转' : 'OpenAI') + '没有返回图片' + (data?.error?.message ? '：' + data.error.message : ''));
 }
@@ -137,8 +227,29 @@ export const DEFAULT_COMFY_WORKFLOW = JSON.stringify({
   8: {class_type: 'VAEDecode', inputs: {samples: ['3', 0], vae: ['4', 2]}},
   9: {class_type: 'SaveImage', inputs: {filename_prefix: 'ST-iPhonie', images: ['8', 0]}}
 }, null, 2);
+/**
+ * The same for a model kept on its own (ComfyUI's diffusion_models: anima, Flux and the like), whose text encoder
+ * and VAE are separate files: UNETLoader (or the GGUF loader) + CLIPLoader + VAELoader. The tavern's model list says
+ * which kind a model is ("UNet: …", "GGUF: …"); a checkpoint in the plain loader, or a UNet in it, fails.
+ */
+const unetWorkflow = loader => JSON.stringify({
+  3: {class_type: 'KSampler', inputs: {cfg: '%scale%', denoise: 1, latent_image: ['5', 0], model: ['4', 0], negative: ['7', 0], positive: ['6', 0], sampler_name: '%sampler%', scheduler: '%scheduler%', seed: '%seed%', steps: '%steps%'}},
+  4: loader === 'gguf' ? {class_type: 'UnetLoaderGGUF', inputs: {unet_name: '%model%'}} : {class_type: 'UNETLoader', inputs: {unet_name: '%model%', weight_dtype: 'default'}},
+  5: {class_type: 'EmptyLatentImage', inputs: {batch_size: 1, height: '%height%', width: '%width%'}},
+  6: {class_type: 'CLIPTextEncode', inputs: {clip: ['10', 0], text: '%prompt%'}},
+  7: {class_type: 'CLIPTextEncode', inputs: {clip: ['10', 0], text: '%negative_prompt%'}},
+  8: {class_type: 'VAEDecode', inputs: {samples: ['3', 0], vae: ['11', 0]}},
+  9: {class_type: 'SaveImage', inputs: {filename_prefix: 'ST-iPhonie', images: ['8', 0]}},
+  10: {class_type: 'CLIPLoader', inputs: {clip_name: '%clip%', type: '%clip_type%'}},
+  11: {class_type: 'VAELoader', inputs: {vae_name: '%vae%'}}
+}, null, 2);
+export const COMFY_LOADERS = ['checkpoint', 'unet', 'gguf'];
+/** The built-in workflow for a scheme: the one that loads the kind of model chosen. */
+export const defaultWorkflow = c => c?.loader === 'unet' || c?.loader === 'gguf' ? unetWorkflow(c.loader) : DEFAULT_COMFY_WORKFLOW;
+/** The kind of a model in the tavern's list, from how it names it. */
+export const loaderOf = text => /^UNet:/i.test(String(text || '')) ? 'unet' : /^GGUF:/i.test(String(text || '')) ? 'gguf' : 'checkpoint';
 export const COMFY_LIMITS = {workflow: 300000, presets: 20};
-const COMFY_DEFAULT_PARAMS = {model: '', vae: '', sampler: 'euler_ancestral', scheduler: 'normal', steps: 28, scale: 6, width: 832, height: 1216, clipSkip: 2};
+const COMFY_DEFAULT_PARAMS = {model: '', loader: 'checkpoint', clip: '', clipType: 'stable_diffusion', vae: '', sampler: 'euler_ancestral', scheduler: 'normal', steps: 28, scale: 6, width: 832, height: 1216, clipSkip: 2};
 export const COMFY_PARAM_KEYS = Object.keys(COMFY_DEFAULT_PARAMS);
 export const defaultComfy = () => ({url: 'http://127.0.0.1:8188', loraTransport: 'tavern', workflow: '', disabledLoras: [], ...COMFY_DEFAULT_PARAMS, style: '', activeWorkflow: 'default', workflows: [{id: 'default', name: '默认工作流', workflow: '', disabledLoras: [], ...COMFY_DEFAULT_PARAMS}]});
 
@@ -151,7 +262,25 @@ export function comfyUrl(value) {
 }
 /** The placeholders a workflow uses ("%prompt%" → prompt). */
 export const workflowPlaceholders = text => [...new Set([...String(text).matchAll(/"%([a-z_]+)%"/g)].map(m => m[1]))];
-/** Checks an imported workflow: API format (File → Export (API)), with "%prompt%" somewhere. */
+/** Repair a placeholder typed with literal quotes in a ComfyUI text field.
+ * JSON strings already have their own quotes, so an input of "\"%prompt%\"" exports as "\\\"%prompt%\\\"".
+ * Only touch complete quoted placeholders in node inputs; never rewrite ordinary prompt text or metadata.
+ */
+function repairWorkflowPlaceholderQuotes(data) {
+  let changed = false;
+  for (const node of Object.values(data)) {
+    if (!node || typeof node !== 'object' || !node.inputs || typeof node.inputs !== 'object' || Array.isArray(node.inputs)) continue;
+    for (const [key, value] of Object.entries(node.inputs)) {
+      if (typeof value !== 'string') continue;
+      const match = /^(['"])(%[a-z_]+%)\1$/.exec(value.trim());
+      if (!match) continue;
+      node.inputs[key] = match[2];
+      changed = true;
+    }
+  }
+  return changed;
+}
+/** Checks and normalizes an imported API workflow, with %prompt% somewhere. */
 export function checkWorkflow(text) {
   const raw = String(text ?? '').trim();
   if (!raw) return '';
@@ -160,15 +289,16 @@ export function checkWorkflow(text) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) throw Error('工作流格式不对');
   if (Array.isArray(data.nodes) && data.links) throw Error('这是界面格式的工作流：请在 ComfyUI 里用「导出 (API)」（Export (API)）重新导出');
   if (!Object.values(data).some(n => n && typeof n === 'object' && typeof n.class_type === 'string')) throw Error('工作流里没有节点（需要 API 格式）');
-  if (!workflowPlaceholders(raw).includes('prompt')) throw Error('工作流里没有 "%prompt%"：把正面提示词那一栏的文字换成 "%prompt%"（带引号），插件才知道往哪里填');
-  return raw;
+  const normalized = repairWorkflowPlaceholderQuotes(data) ? JSON.stringify(data) : raw;
+  if (!workflowPlaceholders(normalized).includes('prompt')) throw Error('工作流里没有 %prompt%：请在 ComfyUI 正向提示词输入框填写 %prompt%（不要手动加引号），再导出 API 格式 JSON');
+  return normalized;
 }
 export function comfyParams(c) {
   const base = COMFY_DEFAULT_PARAMS;
   const n = (v, min, max, fallback, step = 1) => { const x = Number(v); return Number.isFinite(x) ? Math.min(max, Math.max(min, Math.round(x / step) * step)) : fallback; };
   const word = (v, fallback) => { const s = String(v ?? '').trim(); return s.length <= 300 ? s : fallback; };
   return {
-    model: word(c.model, ''), vae: word(c.vae, ''), sampler: word(c.sampler, base.sampler) || base.sampler, scheduler: word(c.scheduler, base.scheduler) || base.scheduler,
+    model: word(c.model, ''), loader: COMFY_LOADERS.includes(c.loader) ? c.loader : base.loader, clip: word(c.clip, ''), clipType: word(c.clipType, base.clipType) || base.clipType, vae: word(c.vae, ''), sampler: word(c.sampler, base.sampler) || base.sampler, scheduler: word(c.scheduler, base.scheduler) || base.scheduler,
     steps: n(c.steps, 1, 150, base.steps), scale: n(c.scale, 0, 30, base.scale, .1),
     width: n(c.width, 64, 4096, base.width, 8), height: n(c.height, 64, 4096, base.height, 8), clipSkip: n(c.clipSkip, 1, 12, base.clipSkip)
   };
@@ -249,15 +379,18 @@ export function comfyPrompt({prompt = '', negative = '', characters = []} = {}) 
 
 /** The workflow with every placeholder filled; a placeholder left over is named so the user can fix the workflow. */
 export function fillWorkflow(text, values) {
-  let out = String(text || DEFAULT_COMFY_WORKFLOW);
+  let out = String(text || defaultWorkflow(values));
   for (const [name, value] of Object.entries(values)) out = out.replaceAll(`"%${name}%"`, JSON.stringify(value));
   const left = workflowPlaceholders(out);
   if (left.length) throw Error('工作流里有插件不认识的占位符：' + left.map(x => `%${x}%`).join('、') + '。请在 ComfyUI 里把它们换成具体的值');
   return out;
 }
 export function comfyValues(c, {prompt, negative, width, height, seed}) {
-  if (!c.model && (!c.workflow || workflowPlaceholders(c.workflow).includes('model'))) throw Error('还没有选 ComfyUI 的模型，请在绘画 App 的参数里选择');
-  return {prompt, negative_prompt: negative, seed, steps: c.steps, scale: c.scale, width, height, sampler: c.sampler, scheduler: c.scheduler, model: c.model, vae: c.vae, denoise: 1, clip_skip: -c.clipSkip};
+  const used = workflowPlaceholders(c.workflow || defaultWorkflow(c));
+  if (!c.model && used.includes('model')) throw Error('还没有选 ComfyUI 的模型，请在绘画 App 的参数里选择');
+  if (!c.clip && used.includes('clip')) throw Error('这个模型要单独加载 CLIP（文本编码器），请在绘画 App 的参数里选择');
+  if (!c.vae && used.includes('vae')) throw Error('这个模型要单独加载 VAE，请在绘画 App 的参数里选择');
+  return {prompt, negative_prompt: negative, seed, steps: c.steps, scale: c.scale, width, height, sampler: c.sampler, scheduler: c.scheduler, model: c.model, loader: c.loader, clip: c.clip, clip_type: c.clipType, vae: c.vae, denoise: 1, clip_skip: -c.clipSkip};
 }
 
 /** Calls the tavern's ComfyUI proxy. headers: the tavern's request headers (CSRF token). */
@@ -287,15 +420,29 @@ export async function comfyCatalog({fetch = globalThis.fetch, headers = {}, url}
   if (ping.status === 404) throw Error('这个酒馆没有 ComfyUI 转发接口（/api/sd/comfy），请更新酒馆');
   if (!ping.ok) throw Error(comfyDown(url));
   const read = async path => { const r = await tavern(fetch, headers, path, {url}); if (!r.ok) return []; try { return await r.json(); } catch { return []; } };
-  const [models, samplers, schedulers] = await Promise.all([read('models'), read('samplers'), read('schedulers')]);
-  return {models: (Array.isArray(models) ? models : []).map(m => typeof m === 'string' ? {value: m, text: m} : {value: String(m.value), text: String(m.text || m.value)}),
-    samplers: (Array.isArray(samplers) ? samplers : []).map(String), schedulers: (Array.isArray(schedulers) ? schedulers : []).map(String)};
+  const [models, samplers, schedulers, vaes] = await Promise.all([read('models'), read('samplers'), read('schedulers'), read('vaes')]);
+  return {models: (Array.isArray(models) ? models : []).map(m => typeof m === 'string' ? {value: m, text: m, loader: 'checkpoint'} : {value: String(m.value), text: String(m.text || m.value), loader: loaderOf(m.text)}),
+    samplers: (Array.isArray(samplers) ? samplers : []).map(String), schedulers: (Array.isArray(schedulers) ? schedulers : []).map(String), vaes: (Array.isArray(vaes) ? vaes : []).map(String)};
 }
 /** Native node metadata; no third-party manager. Direct mode never sends tavern headers or cookies. */
 export async function comfyLoras({fetch = globalThis.fetch, url, transport = 'tavern', signal}) {
-  const endpoint = comfyUrl(url) + '/object_info/LoraLoader';
+  const data = await comfyNode({fetch, url, transport, signal, node: 'LoraLoader', what: 'LoRA 列表'});
+  const spec = data?.LoraLoader?.input?.required?.lora_name;
+  const names = Array.isArray(spec?.[0]) ? spec[0] : spec?.[1]?.options;
+  if (!Array.isArray(names) || names.some(n => typeof n !== 'string')) throw Error('ComfyUI 没有返回原生 LoraLoader 文件列表，请检查版本和节点是否正常');
+  return [...new Set(names.filter(n => n && n.length <= 1000))].sort((a, b) => a.localeCompare(b));
+}
+/** CLIPLoader's files and types, for a model loaded on its own ({clips, types}). The tavern has no endpoint for it. */
+export async function comfyClips({fetch = globalThis.fetch, url, transport = 'tavern', signal}) {
+  const data = await comfyNode({fetch, url, transport, signal, node: 'CLIPLoader', what: 'CLIP 列表'});
+  const req = data?.CLIPLoader?.input?.required || {};
+  const list = spec => (Array.isArray(spec?.[0]) ? spec[0] : spec?.[1]?.options || []).filter(n => typeof n === 'string' && n && n.length <= 1000);
+  return {clips: [...new Set(list(req.clip_name))].sort((a, b) => a.localeCompare(b)), types: [...new Set(list(req.type))]};
+}
+async function comfyNode({fetch, url, transport, signal, node, what}) {
+  const endpoint = comfyUrl(url) + '/object_info/' + node;
   const direct = transport === 'direct';
-  if (!['tavern', 'direct'].includes(transport)) throw Error('LoRA 列表读取方式无效');
+  if (!['tavern', 'direct'].includes(transport)) throw Error(what + '读取方式无效');
   // AbortSignal.any / .timeout are missing on older iPhones (Safari before 17.4): one controller does both.
   const control = new AbortController(), timer = setTimeout(() => control.abort(), 15000);
   if (signal) { if (signal.aborted) control.abort(); else signal.addEventListener('abort', () => control.abort(), {once: true}); }
@@ -305,19 +452,15 @@ export async function comfyLoras({fetch = globalThis.fetch, url, transport = 'ta
   catch (error) {
     clearTimeout(timer);
     if (signal?.aborted) throw error;
-    throw Error(direct ? '浏览器读不到 ComfyUI 的 LoRA 列表：请检查地址和跨域设置。手机不能用电脑的 127.0.0.1，可改用酒馆代理；也可手填文件名。' : '酒馆代理读不到 LoRA 列表：请检查 ComfyUI 地址和连接；也可手填文件名。');
+    throw Error(direct ? `浏览器读不到 ComfyUI 的${what}：请检查地址和跨域设置。手机不能用电脑的 127.0.0.1，可改用酒馆代理；也可手填文件名。` : `酒馆代理读不到${what}：请检查 ComfyUI 地址和连接；也可手填文件名。`);
   }
   clearTimeout(timer);
   const text = await response.text();
   if (!response.ok) {
-    if (!direct && /CORS proxy is disabled/i.test(text)) throw Error('酒馆代理尚未开启：在酒馆 config.yaml 设置 enableCorsProxy: true 后重启，或选择浏览器直连。也可以先手填已安装的 LoRA 文件名。');
-    throw Error(`LoRA 列表读取失败（HTTP ${response.status}），请检查连接方式和 ComfyUI 地址；也可手填文件名。`);
+    if (!direct && /CORS proxy is disabled/i.test(text)) throw Error('酒馆代理尚未开启：在酒馆 config.yaml 设置 enableCorsProxy: true 后重启，或选择浏览器直连。也可以先手填文件名。');
+    throw Error(`${what}读取失败（HTTP ${response.status}），请检查连接方式和 ComfyUI 地址；也可手填文件名。`);
   }
-  let data; try { data = JSON.parse(text); } catch { throw Error('LoRA 接口返回的不是 JSON，请检查地址是否指向 ComfyUI'); }
-  const spec = data?.LoraLoader?.input?.required?.lora_name;
-  const names = Array.isArray(spec?.[0]) ? spec[0] : spec?.[1]?.options;
-  if (!Array.isArray(names) || names.some(n => typeof n !== 'string')) throw Error('ComfyUI 没有返回原生 LoraLoader 文件列表，请检查版本和节点是否正常');
-  return [...new Set(names.filter(n => n && n.length <= 1000))].sort((a, b) => a.localeCompare(b));
+  try { return JSON.parse(text); } catch { throw Error(what + '接口返回的不是 JSON，请检查地址是否指向 ComfyUI'); }
 }
 /** The workflows saved in the tavern (its image generation settings): names, and one's text. */
 export async function tavernWorkflows({fetch = globalThis.fetch, headers = {}}) {

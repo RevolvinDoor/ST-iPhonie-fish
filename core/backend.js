@@ -1,41 +1,54 @@
+import {withProxyHeaders} from './proxy-url.js';
+import { normalizeNarration, NARRATOR } from './narration.js';
+import {RequestLog} from './request-log.js';
+import {PROMPT_BLOCKS, normalizePromptRules} from './prompt-rules.js';
+import { normalizeVn, spriteRequest, castFiles, moveCastFiles } from './vn.js';
+import { currentModel } from './model-files.js';
 import { MomentStore } from './moments-store.js';
+import { MUSIC_LIMITS, normalizeMusic, normalizeSource, validateSource, readSearch, readLink, missingLink, trialOnly, asChina, playable, onTavern, isAudio, fill as fillSource, songRow, bestMatch, matchScore, pick as pickPath } from './music.js';
 import { AppStore } from './app-store.js';
+import { ASSISTANT_LIMITS, normalizeAssistant, validateAssistantPatch, assistantId, assistantMessage, assertAssistantThread, assistantSummary } from './assistant.js';
 import { FORUM_LIMITS, buildForumRequest, cleanPost as cleanForumPost, cleanReply as cleanForumReply, startingHeat } from './forum.js';
 import { buildPeekRequest, cleanPeek, peekId } from './peek.js';
 import { languageCode } from './languages.js';
 import { normalizeMoments, buildMomentsRequest } from './moments.js';
 import { normalizeCalls, buildCallRequest } from './call.js';
-import { normalizeText, activeText, customRequest, listModels, streamText, asMessages, TEXT_PRESET_ID } from './llm.js';
+import { normalizeText, activeText, customRequest, listModels, streamText, asMessages, tavernTextRequest, answerRoom, TEXT_PRESET_ID } from './llm.js';
 import { normalizeEmbed, embedReady, embedTexts } from './embed.js';
-import { bookId, emptyBook, cleanBook, removeNode } from './memory.js';
-import { normalizeSync, runSync, removeSync, SYNC_PARTS } from './sync.js';
+import { bookId, emptyBook, cleanBook, removeNode, pruneBook } from './memory.js';
+import { normalizeMemoryBooks, normalizeAssistantThreads } from './data-transfer.js';
+import { normalizeSync, runSync, removeSync, joinGone, SYNC_PARTS } from './sync.js';
 import { normalizePool } from './auto-voice.js';
 import { normalizeSounds, soundRow, readPack, missingKey, soundName, packRows, PACK_FORMAT, SOUND_LIMITS, SOUND_KINDS } from './sounds.js';
 import { decodeMono, encodeWav } from './audio-join.js';
 import { BACKUP_PARTS, PART_STORES, writeBackup, readBackup, sealKeys, openKeys } from './backup.js';
 import { WALLET_LIMITS, PREMIUM, DECOR_KINDS, SHOP_GIFTS, LEDGER_KINDS, premiumOf, decorKey, cents, yuan, shopGifts, normalizeGift, validateGift } from './wallet.js';
-import { DRAW_ENGINES, DRAW_ENGINE_NAMES, GPT_IMAGE_MODELS, GPT_QUALITIES, normalizeGpt, gptBase, gptSize, gptPrompt, gptGenerate, normalizeComfy, comfyUrl, checkWorkflow, workflowPlaceholders, COMFY_LIMITS, comfySize, comfyPrompt, comfyValues, fillWorkflow, comfyGenerate, comfyCatalog, comfyLoras, tavernWorkflows, tavernWorkflow, orientationOf, DEFAULT_COMFY_WORKFLOW, COMFY_PARAM_KEYS, applyComfyWorkflow } from './image-engines.js';
+import { gptModels, DRAW_ENGINES, DRAW_ENGINE_NAMES, GPT_IMAGE_MODELS, GPT_QUALITIES, normalizeGpt, gptBase, gptSize, gptPrompt, gptGenerate, normalizeComfy, comfyUrl, checkWorkflow, workflowPlaceholders, COMFY_LIMITS, comfySize, comfyPrompt, comfyValues, fillWorkflow, comfyGenerate, comfyCatalog, comfyLoras, comfyClips, defaultWorkflow, tavernWorkflows, tavernWorkflow, orientationOf, DEFAULT_COMFY_WORKFLOW, COMFY_PARAM_KEYS, applyComfyWorkflow } from './image-engines.js';
 import {activeLoraWorkflow, normalizeDisabledLoras, inspectLoras, editLoras, pickLoraSource} from './comfy-loras.js';
-import { sortVoiceLibrary, normalizeLibraryEntry, parseVoiceLibraryText, mergeVoiceLibrary, pickAutoVoice, parseSpeakerAndForm } from './voice-library.js';
 import { normalizeSettings, validateSettings, modelRules, freshState } from './state.js';
-import { normalizeRoute, switchRouteEngine, removeRoute } from './routes.js';
+import { normalizeRoute, switchRouteEngine, removeRoute, withRoles, findRoute, cleanAliases, cardRoutes } from './routes.js';
 import { DEFAULT_PROMPT, DEFAULT_FORMAT, promptPlan, validatePreset, parseDialogue, isPlaceholderRole, knownFormats } from './protocol.js';
-import { TTSParameters } from './parameters.js';
+import { normalizeMarks, withMarks } from './voice-fx.js';
+import { TTSParameters, FISH_API, tauriTavern } from './parameters.js';
 import { KeyStore, keyTail, validateKey, parseTextKeys, joinTextKeys } from './keys.js';
 import { Providers, buildRequest } from './providers.js';
 import { AudioCache } from './cache.js';
+import { installDrawSettings } from './backend-draw.js';
+import { createStorageBudget } from './storage-budget.js';
 import { DialoguePlayer } from './player.js';
 import { LocalLibrary, PHONE_APPS, PHONE_WALLPAPERS, PHONE_GLYPHS, PHONE_SKINS } from './library.js';
-import { NovelAIClient, relayUrl, FISH_PATHS, NAI_MODELS, NAI_MODEL_NAMES, NAI_SAMPLERS, NAI_SCHEDULES, buildImageRequest, guardParams, isFree, isV5, normalizeDrawParams } from './novelai.js';
-import { PIC_TAG_FORMAT, DEFAULT_DRAW_RULE, DRAW_COUNT_MAX, PRESET_REV as DRAW_PRESET_REV, drawPromptPlan, planRequest, validateDrawPreset, normalizeDraw, defaultDraw, normalizeVibeSettings, applyImageConnection } from './draw.js';
-import { normalizeStickers, defaultChat, normalizeChatPreset, normalizeContact, validateChatPreset, validateContact, chatContacts, inSpace, activeSpace, buildChatRequest, activeChatPreset, normalizeVoiceText, normalizeProfile , normalizeAvatars } from './chat.js';
-import { ChatStore, money } from './chats.js';
+import { NovelAIClient, relayUrl, FISH_PATHS, NAI_MODELS, NAI_MODEL_NAMES, NAI_SAMPLERS, NAI_SCHEDULES, buildImageRequest, guardParams, isFree, isV5, normalizeDrawParams, augmentBody, upscaleBy, UPSCALE_MAX, DIRECTOR_TOOLS } from './novelai.js';
+import { PIC_TAG_FORMAT, DEFAULT_DRAW_RULE, DRAW_COUNT_MAX, PRESET_REV as DRAW_PRESET_REV, drawPromptPlan, planRequest, drawCast, validateDrawPreset, normalizeDraw, defaultDraw, normalizeVibeSettings, applyImageConnection } from './draw.js';
+import { normalizeStickers, defaultChat, normalizeChatPreset, normalizeContact, validateChatPreset, validateContact, chatContacts, inSpace, activeSpace, buildChatRequest, activeChatPreset, normalizeVoiceText, normalizeProfile , normalizeAvatars, normalizeNames, normalizeProactive } from './chat.js';
+import { ChatStore, money, currentDm } from './chats.js';
 import { DrawQueue } from './draw-queue.js';
 import { CloudQueue, KeyHashQueue, newRoomCode, validRoom, sha256Hex } from './cloud-queue.js';
 import { vibeKey, readVibeFile, imageVibe, mergeVibe, encodingFor, withEncoding, vibeSummary, vibeParameters, singleFile, bundleFile, chatu8File, strength as vibeStrength, MAX_FREE_VIBES, VIBE_ANLAS } from './vibes.js';
+/** musicFetch's answer when a 取歌地址 gave the song itself. */
+const AUDIO = Symbol('audio');
 
 export const BACKEND_API_VERSION = '1.0.0';
-const ENGINES = ['fish', 'mini', 'eleven', 'mimo'];
+const ENGINES = ['fish', 'mini', 'eleven', 'mimo', 'doubao', 'custom'];
 /** A small JPEG data URI of a base64 picture, for the vibe list; '' where pictures cannot be drawn (no canvas). */
 async function vibeThumbnail(base64) {
     try {
@@ -66,6 +79,9 @@ async function smallVibeImage(base64) {
     } catch { return base64; }
 }
 const clone = value => structuredClone(value);
+const assistantTransferRows = docs => normalizeAssistantThreads(docs.filter(row => row.kind === 'assistant').map(thread => ({...thread,
+    memory: docs.find(row => row.id === bookId(thread.id) && row.memoryRevision === (thread.memoryRevision || 0)) || null,
+})));
 const engineCheck = engine => { if (!ENGINES.includes(engine)) throw Error('引擎无效'); };
 // Keys cover the voice engines, NovelAI for drawing, and llm (the phone's own text model).
 const keyCheck = engine => { if (engine !== 'nai' && engine !== 'llm' && engine !== 'gpt' && engine !== 'embed') engineCheck(engine); };
@@ -83,26 +99,38 @@ const DRAWN_SOURCES = [
     ['chat', '正文图片', /^chat-\d+\.(?:png|jpe?g|webp)$/],
     ['peek', '查手机', /^查手机-.+-\d+\.(?:png|jpe?g|webp)$/],
     ['moments', '朋友圈', /^朋友圈-.+-\d+\.(?:png|jpe?g|webp)$/],
+    ['assistant', '助手生图', /^assistant-\d+\.(?:png|jpe?g|webp)$/],
     ['chatapp', '聊天图片', /^聊天-.+-\d+\.(?:png|jpe?g|webp)$/],
+    ['book', '绘本插图', /^绘本-.+-\d+\.(?:png|jpe?g|webp)$/],
 ];
 export class TTSBackend {
     constructor({ settings, persist = () => {}, notify = () => {}, change = () => {}, unknown = () => {},
         providers = new Providers(), cache, library, keyStore, sink, novelai, chats, indexedDB = globalThis.indexedDB, syncStorage = () => globalThis.localStorage,
-        imageFetch = (...args) => globalThis.fetch(...args), soundPack = '', tavernHeaders = () => globalThis.SillyTavern?.getContext?.()?.getRequestHeaders?.() || {} } = {}) {
+        imageFetch = (...args) => globalThis.fetch(...args), soundPack = '', speech = null, tavernHeaders = () => globalThis.SillyTavern?.getContext?.()?.getRequestHeaders?.() || {} } = {}) {
         this.settings = normalizeSettings(settings);
         validateSettings(this.settings);
         this.persist = persist;
         this.notify = notify;
         this.providers = providers;
+        // 自己的接口 that does not let web pages ask it: asked through the tavern's own proxy, with the tavern's login.
+        if (!this.providers.proxy) this.providers.proxy = (url, init, signal) => this.proxyFetch('/proxy/' + encodeURIComponent(url), { ...init, credentials: 'same-origin', redirect: 'error', signal });
         // Voice balances (ElevenLabs, Fish) read for the engine cards; a new audio marks them out of date.
         this.balances = new Map();
         // Several Fish keys: when one gives way to the next, the balance shown belongs to the old key.
         providers.onKeySwitch = engine => { this.balances.delete(engine); this.emit('balance', { engine, stale: true, switched: true }); };
         providers.onSpend = engine => { const b = this.balances.get(engine); if (b) b.checkedAt = 0; this.emit('balance', { engine, stale: true }); };
-        this.cache = cache || new AudioCache(this.settings.scope, notify, indexedDB);
-        this.library = library || new LocalLibrary(this.settings.scope, { indexedDB });
+        // How much this browser lets the phone keep (a share of what it gives the site, core/storage-budget.js).
+        this.budget = createStorageBudget();
+        this.cache = cache || new AudioCache(this.settings.scope, notify, indexedDB, { limit: this.budget.voice, keep: this.budget.keep });
+        this.library = library || new LocalLibrary(this.settings.scope, { indexedDB, limit: this.budget.library, keep: this.budget.keep });
         this.keyStore = keyStore || new KeyStore(this.settings.scope, { indexedDB, onError: message => this.notify(message) });
         this.novelai = novelai || new NovelAIClient();
+        this.requestLog = new RequestLog({change: () => this.emit('logs', {}), secrets: () => [
+            ...this.keyStore.load().values(), ...(this.textKeys?.values() || []), this.gptKey, this.embedKey, this.novelai.key,
+            ...(this.imageKeys?.nai?.values() || []), ...(this.imageKeys?.gpt?.values() || []),
+            ...(this.providers.keys?.values() || [])].flatMap(x => typeof x === 'string' ? x.split('\n').filter(Boolean) : [])});
+        if (typeof this.providers.fetcher === 'function') this.providers.fetcher = this.requestLog.fetch(withProxyHeaders(this.providers.fetcher.bind(this.providers), tavernHeaders), '语音模型');
+        if (typeof this.novelai.fetch === 'function') this.novelai.fetch = this.requestLog.fetch(withProxyHeaders(this.novelai.fetch.bind(this.novelai), tavernHeaders), 'NovelAI');
         this.textKeys = new Map();
         this.imageKeys = {nai: new Map(), gpt: new Map()};
         this.imageConnectionRevision = 0;
@@ -116,6 +144,7 @@ export class TTSBackend {
         this.memoryStore = new AppStore(this.settings.scope, { indexedDB, database: 'st-iphonie-memory-v1' });
         // 音效 (core/sounds.js): the sound library and the names the story asked for that it has none of. Its own database: big.
         this.sounds = new AppStore(this.settings.scope, { indexedDB, database: 'st-iphonie-sounds-v1' });
+        this.music = new AppStore(this.settings.scope, { indexedDB, database: 'st-iphonie-music-v1' });
         // 自带音效包: the folder of the plugin's sounds (sounds/pack.json lists them); '' when there is none (tests).
         this.soundPack = soundPack;
         this.packLoad = null;
@@ -126,7 +155,12 @@ export class TTSBackend {
         this.subscription = null;
         // GPT 生图 and ComfyUI: the key of the GPT image engine; requests go out with these (tests pass their own).
         this.gptKey = '';
-        this.imageFetch = imageFetch;
+        this.assetFetch = imageFetch;
+        this.musicTransport = this.requestLog.fetch((...args) => this.assetFetch(...args), '音乐音源');
+        this.imageFetch = this.requestLog.fetch(withProxyHeaders(imageFetch, tavernHeaders), '绘图接口');
+        this.proxyFetch = this.requestLog.fetch(withProxyHeaders(imageFetch, tavernHeaders), '酒馆转发');
+        this.textFetch = this.requestLog.fetch(withProxyHeaders((...args) => globalThis.fetch(...args), tavernHeaders), '文字模型接口');
+        this.embedFetch = this.requestLog.fetch(withProxyHeaders((...args) => globalThis.fetch(...args), tavernHeaders), '向量模型');
         this.tavernHeaders = tavernHeaders;
         // 保存到酒馆: the tavern's file access (set by the tavern side), what this device last saw there, and the state shown in the phone.
         this.syncFiles = null;
@@ -141,8 +175,8 @@ export class TTSBackend {
         this.closed = false;
         this.prepared = null;
         this.player = new DialoguePlayer({
-            settings: () => this.settings, providers, cache: this.cache, ...(sink ? { sink } : {}), unknown,
-            change: state => { change(state); this.emit('playback', state); },
+            settings: () => this.cardState(), providers, cache: this.cache, ...(sink ? { sink } : {}), unknown, speech,
+            change: state => { if (state.phase === 'error') this.reportDiagnostic('语音播放', {message: state.message}); change(state); this.emit('playback', state); },
             prepared: audio => { this.prepared = audio; this.emit('audio-ready', this.audioInfo(audio)); },
         });
     }
@@ -180,7 +214,17 @@ export class TTSBackend {
         if (want.includes('keys')) { const all = Object.fromEntries(this.keyStore.load()); if (!Object.keys(all).length) throw Error('这台浏览器里还没有保存密钥，备份里不用带'); keys = await sealKeys(all, password); }
         // Vibe groups live in the settings; they travel with the vibes too, so a backup of only the vibes keeps them.
         const vibeGroups = want.includes('vibes') ? clone(this.settings.draw.vibe.groups) : null;
-        const blob = await writeBackup({ version, settings, library, chats, moments, keys, vibeGroups });
+        const memories = want.includes('memories') ? await this.exportChatMemories() : null;
+        const assistant = want.includes('assistant') ? await this.exportAssistantThreads() : null;
+        // The 视觉小说's 立绘 and 模型 are files in the tavern; the settings only name them. A backup carries the files.
+        let vnFiles = null;
+        if (want.includes('vnFiles')) {
+            const paths = castFiles([this.settings.vn.cast, this.settings.vn.moves]);
+            if (paths.length && !this.syncFiles?.readPath) throw Error('要在酒馆里打开小手机，才能把视觉小说的立绘和模型放进备份（不要的话把这一项关掉）');
+            vnFiles = [];
+            for (const path of paths) { const blob = await this.syncFiles.readPath(path).catch(() => null); if (blob) vnFiles.push({ path, blob }); }
+        }
+        const blob = await writeBackup({ version, settings, library, chats, moments, keys, vibeGroups, memories, assistant, vnFiles });
         const day = new Date(), pad = n => String(n).padStart(2, '0');
         return { blob, name: `ST-iPhonie 备份 ${day.getFullYear()}-${pad(day.getMonth() + 1)}-${pad(day.getDate())}` };
     }
@@ -207,12 +251,26 @@ export class TTSBackend {
             settings = normalizeSettings({ ...backup.settings, scope: this.settings.scope, floating: this.settings.floating });
             validateSettings(settings);
         }
+        // The 视觉小说's files the tavern lacks (another tavern, or deleted since the backup) go back in first; where
+        // one lands elsewhere, the settings are pointed there.
+        let moved = null;
+        if (want.has('vnFiles') && backup.vnFiles?.length) {
+            if (!this.syncFiles?.writePath) throw Error('要在酒馆里打开小手机，才能恢复视觉小说的立绘和模型');
+            moved = {}; done.vnFiles = 0;
+            for (const f of backup.vnFiles) {
+                if (await this.syncFiles.hasPath(f.path).catch(() => false)) continue;
+                moved[f.path] = await this.syncFiles.writePath(f.path, f.blob);
+                done.vnFiles++;
+            }
+            if (settings) { settings.vn.cast = moveCastFiles(settings.vn.cast, moved); settings.vn.moves = moveCastFiles(settings.vn.moves, moved); }
+        }
         const rows = {};
         for (const part of want) for (const store of PART_STORES[part]) if (backup.library[store]) rows[store] = backup.library[store];
         // One transaction for the library: photos land before the phone's look that uses them, references before the
         // settings that point at them.
         if (Object.keys(rows).length) Object.assign(done, await this.library.importRows(rows, { replace }));
         if (settings) { this.save(settings); done.settings = true; await this.loadReferences(); }
+        else if (moved && Object.entries(moved).some(([a, b]) => a !== b)) this.saveVn({ cast: moveCastFiles(this.settings.vn.cast, moved), moves: moveCastFiles(this.settings.vn.moves, moved) });
         if (want.has('vibes') && backup.library.vibes) {
             // The groups: replace takes the backup's; merge keeps the current ones and adds or overwrites by id.
             const now = this.settings.draw.vibe, incoming = backup.vibeGroups || [];
@@ -226,8 +284,10 @@ export class TTSBackend {
         }
         if (want.has('chats') && backup.chats) { done.chats = await this.chats.importThreads(backup.chats, { replace }); this.emit('chat', { threadId: '' }); }
         if (want.has('moments') && backup.moments) { done.moments = await this.moments.importPosts(backup.moments, { replace }); this.emit('moments', {}); }
+        if (want.has('memories') && backup.memories) done.memories = await this.importChatMemories(backup.memories, {replace, restoring: true});
+        if (want.has('assistant') && backup.assistant) done.assistant = await this.importAssistantThreads(backup.assistant, {replace, restoring: true});
         if (keys) { let count = 0; for (const [engine, key] of Object.entries(keys)) { try { this.setKey(engine, key); count++; } catch { /* an engine this version does not know */ } } done.keys = count; }
-        for (const collection of ['favorites', 'photos', 'notes']) if (collection in done) this.emit('library', { collection });
+        for (const collection of ['favorites', 'photos', 'notes', 'books']) if (collection in done) this.emit('library', { collection });
         if ('phone' in done || 'photos' in done) this.emit('phone', { preferences: await this.getPhone() });
         return done;
     }
@@ -235,7 +295,7 @@ export class TTSBackend {
     emit(type, data = {}) {
         if (this.closed) return;
         const event = { type, revision: this.revision, ...clone(data) };
-        if (!this.syncApplying && (type === 'chat' || type === 'moments' || (type === 'library' && ['notes', 'photos'].includes(data.collection)))) this.scheduleSync();
+        if (!this.syncApplying && (type === 'chat' || type === 'moments' || (['memory', 'assistant'].includes(type) && data.persisted) || (type === 'library' && ['notes', 'photos'].includes(data.collection)))) this.scheduleSync();
         for (const listener of this.listeners) { try { listener(clone(event)); } catch { /* One view cannot stop the other subscribers. */ } }
     }
     subscribe(listener) {
@@ -246,6 +306,8 @@ export class TTSBackend {
         return () => this.listeners.delete(listener);
     }
     getState() { this.assertOpen(); return clone(this.settings); }
+    routesHere(key = this.cardKey()) { return clone(cardRoutes(this.settings.routes, key)); }
+    cardState() { return { ...this.getState(), routes: this.routesHere() }; }
     getSnapshot() { return { state: this.getState(), revision: this.revision }; }
     save(next, expectedRevision) {
         this.assertOpen();
@@ -272,14 +334,42 @@ export class TTSBackend {
         this.settings = copy;
         if (imageChanged) this.activateImageKeys();
         this.revision++;
-        this.emit('settings', { state: this.getState() });
+        this.emit('settings', { state: this.cardState() });
         return this.getState();
+    }
+    /** 整篇朗读: on or off, the 旁白's voice (系统朗读 or the 旁白 role), the system voice and speed, the tags not read. */
+    saveNarration(patch) {
+        if (!patch || typeof patch !== 'object') throw Error('设置格式无效');
+        const next = this.getState();
+        next.narration = normalizeNarration({ ...next.narration, ...clone(patch) });
+        return clone(this.save(next).narration);
+    }
+    /** 视觉小说: its settings (the 立绘 of each character are in cast). */
+    saveVn(patch) {
+        if (!patch || typeof patch !== 'object') throw Error('设置格式无效');
+        const next = this.getState();
+        next.vn = normalizeVn({ ...next.vn, ...clone(patch) });
+        return clone(this.save(next).vn);
+    }
+    /** 视觉小说: the people of the open card (everyone when no card is open), with their looks and 立绘. */
+    vnCast() {
+        const s = this.cardState(), names = drawCast(s, this.space, []) || s.routes.map(r => r.name);
+        return [...new Set(names)].filter(n => n && !isPlaceholderRole(n) && n !== NARRATOR).map(name => {
+            const route = s.routes.find(r => r.name === name);
+            const entry = s.vn.cast[name];
+            return { name, appearance: route?.appearance || '', sprite: entry?.sprite || '', seed: entry?.seed ?? -1, alts: clone(entry?.alts || []), mix: !!entry?.mix, looks: clone(entry?.looks || {}), actions: clone(entry?.actions || []), outfits: clone(entry?.outfits || []), models: clone(entry?.models || []), useModel: entry?.useModel || '', model: clone(currentModel(entry)) };
+        });
     }
     updateGeneral(patch) {
         if (!patch || typeof patch !== 'object') throw Error('设置格式无效');
         const next = this.getState();
-        for (const key of ['voiceEnabled', 'cacheEnabled', 'floatingEnabled', 'waveformEnabled', 'wallpaperMotion', 'stripVoice', 'voiceExample', 'autoVoice']) if (key in patch) {
+        for (const key of ['voiceEnabled', 'hideStoryWaves', 'storyTools', 'cacheEnabled', 'floatingEnabled', 'waveformEnabled', 'wallpaperMotion', 'stripVoice', 'voiceExample', 'autoVoice', 'voiceIsland', 'pregenerate']) if (key in patch) {
             if (typeof patch[key] !== 'boolean') throw Error('开关设置无效'); next.general[key] = patch[key];
+        }
+        // 配音方式: the story model writes the voice tags itself ('inline'), or they are added after the reply ('separate').
+        if ('voiceMode' in patch) {
+            if (!['inline', 'separate'].includes(patch.voiceMode)) throw Error('配音方式无效');
+            next.general.voiceMode = patch.voiceMode;
         }
         if ('defaultLanguage' in patch) {
             if (typeof patch.defaultLanguage !== 'string' || !patch.defaultLanguage.trim() || patch.defaultLanguage.length > 40) throw Error('默认语言无效');
@@ -290,8 +380,12 @@ export class TTSBackend {
     saveRoute(value) {
         const next = this.getState();
         if (!value || typeof value.name !== 'string' || !value.name.trim() || isPlaceholderRole(value.name)) throw Error('请填写实际角色名');
-        const id = value.id || crypto.randomUUID(), index = next.routes.findIndex(route => route.id === id);
-        const route = normalizeRoute({ ...(index >= 0 ? next.routes[index] : { engine: 'fish', voice: '', model: '', language: '' }), ...clone(value), id, name: value.name.trim() });
+        const name = value.name.trim(), card = name === NARRATOR ? '' : String(value.card ?? this.cardKey() ?? '').trim();
+        const index = value.id ? next.routes.findIndex(route => route.id === value.id) : next.routes.findIndex(route => route.name === name && (route.card || '') === card);
+        const id = index >= 0 ? next.routes[index].id : (value.id || crypto.randomUUID());
+        const route = normalizeRoute({ ...(index >= 0 ? next.routes[index] : { engine: 'fish', voice: '', model: '', language: '' }), ...clone(value), id, name, card, cards: card ? [card] : [] });
+        // 角色资料: who they are, for the phone's apps when the tavern has no card for them.
+        if (typeof route.persona === 'string') { route.persona = route.persona.slice(0, 4000); if (!route.persona.trim()) delete route.persona; } else delete route.persona;
         if (index >= 0) next.routes[index] = route; else next.routes.push(route);
         next.selected = id;
         this.save(next);
@@ -326,6 +420,7 @@ export class TTSBackend {
         if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('预设格式无效');
         const next = this.getState(), preset = clone(value);
         preset.id ||= crypto.randomUUID();
+        preset.marks = normalizeMarks(preset.marks);
         validatePreset(preset);
         const index = next.presets.findIndex(item => item.id === preset.id);
         if (index < 0) next.presets.push(preset); else next.presets[index] = preset;
@@ -346,12 +441,13 @@ export class TTSBackend {
         return this.save(next);
     }
     previewPrompt(preset) {
-        const state = preset ? { ...this.settings, activePreset: preset.id, presets: [clone(preset)] } : this.settings;
+        const base = this.cardState(), state = preset ? { ...base, activePreset: preset.id, presets: [clone(preset)] } : base;
         return promptPlan(state, modelRules(state)).map(entry => entry.text).join('\n\n');
     }
     parse(text) {
-        const formats = knownFormats(this.settings);
-        for (const format of formats) { const lines = parseDialogue(text, format); if (lines.length) return { format, lines }; }
+        // 心声 and 电话 written the story's own way (*…* and the like, as the 配音预设 says) play as such.
+        const state = this.cardState(), formats = knownFormats(state), marks = state.presets.find(p => p.id === state.activePreset)?.marks;
+        for (const format of formats) { const lines = parseDialogue(text, format); if (lines.length) return { format, lines: withRoles(state.routes, withMarks(text, lines, marks)) }; }
         return { format: formats[0], lines: [] };
     }
     setKey(engine, key) {
@@ -548,6 +644,25 @@ export class TTSBackend {
             return id;
         } catch { return 'unknown'; }
     }
+    /** Remembers deleted items (keys as in joinGone) so a sync does not bring them back from another device's copy. */
+    noteGone(part, keys, after = 0) {
+        const list = [...new Set((keys || []).map(String).filter(Boolean))];
+        if (!list.length) return;
+        const memory = this.#syncMemory(), now = Math.max(Date.now(), after + 1);
+        this.#syncMemory({ ...memory, gone: joinGone([memory.gone, { [part]: Object.fromEntries(list.map(key => [key, now])) }], now) });
+    }
+    reviveSync(part, ids) {
+        const memory = this.#syncMemory(), keys = new Set(ids), gone = {...memory.gone, [part]: {...memory.gone?.[part]}};
+        for (const key of Object.keys(gone[part])) if (keys.has(key) || [...keys].some(id => key.startsWith(id + '/'))) delete gone[part][key];
+        this.#syncMemory({...memory, gone});
+    }
+    /** Runs a deletion of a part's items and remembers which went. */
+    async dropping(part, list, task) {
+        const before = new Set((await list()).map(x => String(x.id))), result = await task();
+        for (const x of await list()) before.delete(String(x.id));
+        this.noteGone(part, [...before]);
+        return result;
+    }
     syncStatus() {
         const { running, ...state } = this.syncState;
         return clone({ enabled: this.settings.sync.enabled, available: !!this.syncFiles, parts: SYNC_PARTS, ...state, memoryAt: this.#syncMemory().savedAt || 0 });
@@ -564,6 +679,7 @@ export class TTSBackend {
         if (!this.settings.sync.enabled || !this.syncFiles || this.closed) return;
         clearTimeout(this.syncTimer);
         this.syncState.pending = true;
+        if (this.syncState.busy) return;
         this.syncTimer = setTimeout(() => { this.syncNow().catch(() => {}); }, delay);
     }
     /** Deletes the phone's copy in the tavern (this device keeps everything); the next sync starts from scratch. */
@@ -585,10 +701,12 @@ export class TTSBackend {
         if (this.syncState.busy) return this.syncState.running;
         clearTimeout(this.syncTimer);
         const stores = {
-            read: async part => part === 'chats' ? this.chats.exportThreads() : part === 'moments' ? this.moments.exportPosts() : (await this.library.exportRows([part]))[part],
+            read: async part => part === 'chats' ? this.chats.exportThreads() : part === 'moments' ? this.moments.exportPosts() : part === 'memories' ? this.exportChatMemories() : part === 'assistant' ? this.exportAssistantThreads() : (await this.library.exportRows([part]))[part],
             write: async (part, items, options) => {
                 if (part === 'chats') await this.chats.importThreads(items, options);
                 else if (part === 'moments') await this.moments.importPosts(items, options);
+                else if (part === 'memories') await this.importChatMemories(items, {...options, notifySync: false});
+                else if (part === 'assistant') await this.importAssistantThreads(items, {...options, notifySync: false});
                 else await this.library.importRows({ [part]: items }, options);
             },
             photoBlob: row => row.blob,
@@ -597,23 +715,30 @@ export class TTSBackend {
         this.emit('sync', this.syncStatus());
         this.syncState.running = (async () => {
             try {
+                const result = await runSync({ stores, files: this.syncFiles, memory: this.#syncMemory(), readGone: () => this.#syncMemory().gone, device: this.#device(), deviceName: deviceName || this.syncDeviceName || '' });
+                // Deletions made while it ran are kept too.
+                this.#syncMemory({ ...result.memory, gone: joinGone([result.memory.gone, this.#syncMemory().gone]) });
+                const preferences = [...result.pulled, ...result.merged].includes('photos') ? await this.getPhone() : null;
+                this.syncState = { ...this.syncState, error: '', lastAt: Date.now(), remote: result.remote, lastResult: { pulled: result.pulled, pushed: result.pushed, merged: result.merged } };
+                // Only these refresh notifications came from syncing. User writes during network waits stay dirty.
                 this.syncApplying = true;
-                const result = await runSync({ stores, files: this.syncFiles, memory: this.#syncMemory(), device: this.#device(), deviceName: deviceName || this.syncDeviceName || '' });
-                this.#syncMemory(result.memory);
-                this.syncState = { ...this.syncState, busy: false, error: '', lastAt: Date.now(), remote: result.remote, lastResult: { pulled: result.pulled, pushed: result.pushed, merged: result.merged } };
                 for (const part of [...result.pulled, ...result.merged]) {
                     if (part === 'chats') this.emit('chat', { threadId: '' });
                     else if (part === 'moments') this.emit('moments', {});
+                    else if (part === 'memories') this.emit('memory', {threadId: '', reset: true});
+                    else if (part === 'assistant') this.emit('assistant', {threadId: '', restored: true});
                     else this.emit('library', { collection: part });
                 }
-                if ([...result.pulled, ...result.merged].includes('photos')) this.emit('phone', { preferences: await this.getPhone() });
+                if (preferences) this.emit('phone', { preferences });
                 return clone(result);
             } catch (error) {
                 this.syncState = { ...this.syncState, busy: false, error: error.message || '同步失败' };
                 throw error;
             } finally {
                 this.syncApplying = false;
+                this.syncState.busy = false;
                 delete this.syncState.running;
+                if (this.syncState.pending) this.scheduleSync(200);
                 this.emit('sync', this.syncStatus());
             }
         })();
@@ -644,31 +769,37 @@ export class TTSBackend {
      * when the source is the tavern's model. request: {prompt, responseLength?, ...} as for generateRaw.
      */
     async generateText(context, request) {
+        return this.requestLog.run('文字模型', {source: this.settings.text.source, model: activeText(this.settings.text).model, ...request}, () => this.generateTextRaw(context, request));
+    }
+    async generateTextRaw(context, request) {
         const text = activeText(this.settings.text);
-        if (text.source === 'custom') return customRequest({ text, key: this.textKeys.get(text.id) || '', prompt: request.prompt, responseLength: request.responseLength });
+        if (text.source === 'custom') return customRequest({ text, key: this.textKeys.get(text.id) || '', prompt: request.prompt, responseLength: request.responseLength, fetch: this.textFetch });
         if (!context?.generateRaw) throw Error('当前酒馆版本不支持后台生成');
         // The chat-completion request the tavern builds is kept, so an empty answer can be asked again as a stream:
         // "假流式" channels only answer streamed requests, and the tavern's background generation never streams.
-        const source = context.eventSource, event = context.eventTypes?.CHAT_COMPLETION_SETTINGS_READY, last = JSON.stringify(asMessages(request.prompt).at(-1)?.content ?? '');
+        // A length the task asks for replaces the tavern's own for that request: the tavern's, when longer, is kept.
+        const own = context?.mainApi === 'openai' ? context.chatCompletionSettings?.openai_max_tokens : 0;
+        const outgoing=tavernTextRequest(request.responseLength ? {...request, responseLength: answerRoom(request.responseLength, own)} : request);
+        const source = context.eventSource, event = context.eventTypes?.CHAT_COMPLETION_SETTINGS_READY, last = JSON.stringify(asMessages(outgoing.prompt).at(-1)?.content ?? '');
         let payload = null;
-        const keep = data => { if (!payload && data?.type === 'quiet' && JSON.stringify(data.messages?.at?.(-1)?.content ?? '') === last) payload = clone(data); };
+        const keep = data => { if (!payload && data?.type === 'quiet' && JSON.stringify(data.messages?.at?.(-1)?.content ?? '') === last) { payload = clone(data); const id = this.requestLog.add('酒馆最终请求', data); this.requestLog.finish(id, {state: '已交给酒馆发送'}); } };
         if (source?.on && event) source.on(event, keep);
         let empty = false;
         try {
-            const text = await context.generateRaw(request);
+            const text = await context.generateRaw(outgoing);
             if (String(text ?? '').trim() || !payload) return text;
             empty = true;
         } catch (error) {
             if (!payload || !/no message generated|empty/i.test(String(error?.message || ''))) throw error;
             empty = true;
         } finally { source?.removeListener?.(event, keep); }
-        if (empty) return this.streamTavern(context, payload);
+        if (empty) { const id = this.requestLog.add('文字模型重试', {reason: '普通请求为空，改用流式'}, 'warn'); this.requestLog.finish(id, {retry: true}); return this.streamTavern(context, payload); }
     }
     /** Sends the tavern's chat-completion request again with streaming on, and reads the whole answer. */
     async streamTavern(context, payload) {
         if (typeof context.getRequestHeaders !== 'function') throw Error('模型没有返回内容');
         let response;
-        try { response = await fetch('/api/backends/chat-completions/generate', { method: 'POST', headers: context.getRequestHeaders(), cache: 'no-cache', body: JSON.stringify({ ...payload, stream: true }) }); }
+        try { response = await this.textFetch('/api/backends/chat-completions/generate', { method: 'POST', headers: context.getRequestHeaders(), cache: 'no-cache', body: JSON.stringify({ ...payload, stream: true }) }); }
         catch { throw Error('模型没有返回内容，改用流式请求也没连上'); }
         if (!response.ok) throw Error(`模型没有返回内容，改用流式请求也失败了（HTTP ${response.status}）`);
         const text = await streamText(response);
@@ -685,19 +816,97 @@ export class TTSBackend {
         try { return await listModels({ text: { url }, key: this.embedKey }); } catch (error) { throw Error(error.message.replace(/^文字模型/, '向量模型')); }
     }
     /** A chat's memory book (an empty one when nothing is written yet). */
-    async memoryBook(threadId) { return (await this.memoryStore.get(bookId(threadId))) || emptyBook(threadId); }
+    async exportChatMemories() { return normalizeMemoryBooks(await this.memoryStore.list('memory')); }
+    async exportAssistantThreads() { return assistantTransferRows(await this.apps.list()); }
+    async importChatMemories(rows, {replace = false, merge, restoring = false, notifySync = true} = {}) {
+        const incoming = normalizeMemoryBooks(rows), changed = new Set();
+        await this.memoryStore.transformKinds(['memory', 'vectors'], docs => {
+            const current = normalizeMemoryBooks(docs.filter(row => row.kind === 'memory'));
+            const selected = normalizeMemoryBooks(merge ? merge(current) : incoming);
+            const next = new Map((replace ? [] : current).map(row => [row.id, row]));
+            for (const row of selected) {
+                const old = current.find(item => item.id === row.id);
+                next.set(row.id, restoring ? {...row, at: Math.max(Date.now(), (old?.at || 0) + 1)} : row);
+            }
+            // A replaced/forgotten book stays as an empty record so old devices cannot revive its summaries.
+            if (replace && restoring) for (const old of current) if (!next.has(old.id)) next.set(old.id, {...emptyBook(old.threadId, old.name), at: Math.max(Date.now(), old.at + 1)});
+            for (const old of current) if (JSON.stringify(old) !== JSON.stringify(next.get(old.id))) changed.add(old.threadId);
+            for (const row of next.values()) if (!current.some(old => old.id === row.id)) changed.add(row.threadId);
+            return [...next.values(), ...docs.filter(row => row.kind === 'vectors' && !changed.has(row.threadId))];
+        });
+        if (restoring) this.reviveSync('memories', incoming.map(row => row.id));
+        for (const threadId of changed) this.emit('memory', {threadId, reset: true, persisted: notifySync});
+        return incoming.length;
+    }
+    async importAssistantThreads(rows, {replace = false, merge, restoring = false, notifySync = true} = {}) {
+        const incoming = normalizeAssistantThreads(rows), changed = new Set(), removed = new Set();
+        const restoringIds = new Set(restoring ? incoming.map(row => row.id) : []);
+        const gone = this.#syncMemory().gone?.assistant || {};
+        let removedAfter = 0;
+        await this.apps.transformKinds(['assistant', 'memory', 'vectors'], docs => {
+            const current = assistantTransferRows(docs), byId = new Map(docs.map(row => [row.id, row]));
+            const selected = normalizeAssistantThreads(merge ? merge(current) : incoming);
+            const next = new Map((replace ? [] : current).map(row => [row.id, row]));
+            for (const row of selected) next.set(row.id, row);
+            const result = docs.filter(row => row.kind !== 'assistant' && !String(row.threadId || '').startsWith('assistant:'));
+            for (const row of current) if (!next.has(row.id)) { changed.add(row.id); removed.add(row.id); removedAfter = Math.max(removedAfter, row.restoredAt || 0, row.updatedAt || 0); }
+            for (const row of next.values()) {
+                const old = byId.get(row.id), exported = current.find(item => item.id === row.id);
+                if (!restoringIds.has(row.id) && JSON.stringify(row) === JSON.stringify(exported)) {
+                    result.push(old, ...[bookId(row.id), 'vec:' + row.id].map(id => byId.get(id)).filter(Boolean));
+                    continue;
+                }
+                changed.add(row.id);
+                const {memory, ...thread} = row;
+                thread.revision = Math.max(Date.now(), (old?.revision || 0) + 1);
+                thread.memoryRevision = Math.max(Date.now(), (old?.memoryRevision || 0) + 1);
+                if (restoringIds.has(row.id)) thread.at = thread.updatedAt = thread.restoredAt = Math.max(Date.now() + 1, (old?.updatedAt || 0) + 1, (gone[row.id] || 0) + 1, (row.restoredAt || 0) + 1);
+                result.push(thread);
+                if (memory) result.push({...memory, memoryRevision: thread.memoryRevision});
+            }
+            return result;
+        });
+        if (restoring) { this.noteGone('assistant', [...removed], removedAfter); this.reviveSync('assistant', incoming.map(row => row.id)); }
+        for (const threadId of changed) this.emit('assistant', {threadId, restored: true, memoryReset: true, deleted: removed.has(threadId), persisted: notifySync});
+        return incoming.length;
+    }
+    async memoryBook(threadId) { return (await this.memoryStore.get(bookId(threadId))) || {...emptyBook(threadId), at: 0}; }
     /** Changes a chat's book in one transaction: change(book) returns the new book. Made first when missing. */
-    async memoryChange(threadId, change, name = '') {
+    async memoryChange(threadId, change, name = '', expectedBook) {
         this.assertOpen();
         const id = bookId(threadId);
-        if (!await this.memoryStore.get(id)) await this.memoryStore.put([emptyBook(threadId, name)]);
-        const saved = await this.memoryStore.change(id, doc => { const next = cleanBook(change(structuredClone(doc)), Date.now()); for (const key of Object.keys(doc)) if (key !== 'scope') delete doc[key]; Object.assign(doc, next); });
-        this.emit('memory', { threadId });
+        let saved;
+        await this.memoryStore.transformKinds(['memory'], docs => {
+            const current = docs.find(row => row.id === id) || {...emptyBook(threadId), at: 0};
+            if (expectedBook && JSON.stringify(cleanBook(current, current.at)) !== JSON.stringify(cleanBook(expectedBook, expectedBook.at))) throw Error('聊天记忆已变化，这次整理没有写入');
+            if (!current.name) current.name = name;
+            saved = cleanBook({...change(clone(current)), threadId}, Math.max(Date.now(), current.at + 1));
+            return [...docs.filter(row => row.id !== id), saved];
+        });
+        this.emit('memory', { threadId, persisted: true });
         return saved;
+    }
+    /**
+     * Deleted messages leave the chat's memory too: with nothing said left in the chat, the memory goes as when the chat
+     * is deleted; otherwise the summaries that held them are written again (core/memory.js pruneBook). Before this, a
+     * chat emptied message by message kept its summaries, and with 一直带着 on the story still knew it all.
+     */
+    async memoryAfterDelete(threadId, before, after) {
+        const kept = new Set((after?.messages || []).map(m => m.id)), gone = (before?.messages || []).filter(m => !kept.has(m.id) && m.kind !== 'system');
+        if (!gone.length) return;
+        if (!(after?.messages || []).some(m => m.kind !== 'system')) return this.memoryForget(threadId);
+        const book = await this.memoryBook(threadId), next = pruneBook(book, gone.map(m => m.at), after.messages);
+        if (next !== book) await this.memoryChange(threadId, () => next);
     }
     memoryVectors(threadId) { return this.memoryStore.get('vec:' + threadId); }
     memorySaveVectors(threadId, doc) { return this.memoryStore.put([{ ...doc, id: 'vec:' + threadId, kind: 'vectors', threadId, at: Date.now() }]); }
-    async memoryForget(threadId) { await this.memoryStore.remove(bookId(threadId)); await this.memoryStore.remove('vec:' + threadId); this.emit('memory', { threadId }); }
+    async memoryForget(threadId) {
+        await this.memoryStore.transformKinds(['memory', 'vectors'], docs => {
+            const old = docs.find(row => row.id === bookId(threadId));
+            return [...docs.filter(row => row.id !== bookId(threadId) && row.id !== 'vec:' + threadId), {...emptyBook(threadId), at: Math.max(Date.now(), (old?.at || 0) + 1)}];
+        });
+        this.emit('memory', { threadId, reset: true, persisted: true });
+    }
     /** Model ids of the custom API (also a free connection check). `draft`: options not saved yet. */
     textModels(draft) { const text = activeText(this.textWith(draft)); return listModels({ text, key: this.textKeys.get(text.id) || '' }); }
 
@@ -772,210 +981,7 @@ export class TTSBackend {
         applyImageConnection(next.draw, engine);
         const map = new Map(this.imageKeys[engine]); map.delete(id); this.commitImageConnection(next, engine, map);
     }
-    /**
-     * The LoRAs of the ComfyUI scheme in use, as the drawing app lists them: each native LoRA node (name, strengths,
-     * on or off, or why it cannot be edited here), where a new one would go (auto: '' when the user has to choose),
-     * and whether the original workflow can be put back.
-     */
-    comfyLoraInfo() {
-        const c = this.settings.draw.comfy, row = c.workflows.find(p => p.id === c.activeWorkflow), workflow = row.workflow || DEFAULT_COMFY_WORKFLOW;
-        const info = inspectLoras(workflow);
-        // controls: the parameters the workflow leaves to the plugin (only these are shown); missing: what stops a picture.
-        const controls = workflowPlaceholders(workflow).map(k => k === 'clip_skip' ? 'clipSkip' : k);
-        return clone({ ...info, disabled: row.disabledLoras || [], auto: pickLoraSource(workflow), builtIn: row.id === 'default', restorable: !!row.sourceWorkflow && row.sourceWorkflow !== row.workflow,
-            controls, missing: controls.includes('model') && !c.model ? '还没有选模型：在「参数」里读取模型列表再选一个' : '' });
-    }
-    /**
-     * Changes the LoRAs of the scheme in use and saves it at once: {updates: [{id, lora_name?, strength_model?,
-     * strength_clip?}], enabled: {id: on}, remove: id, add: {lora_name, strength_model, strength_clip, source?}}.
-     * The built-in default scheme stays as it is: the first change makes a copy of it and switches to that copy.
-     */
-    editComfyLoras(change = {}) {
-        this.assertOpen();
-        const next = this.getState(), c = next.draw.comfy;
-        let row = c.workflows.find(p => p.id === c.activeWorkflow), copied = false;
-        if (row.id === 'default') {
-            if (c.workflows.length >= COMFY_LIMITS.presets) throw Error(`最多保存 ${COMFY_LIMITS.presets} 套 ComfyUI 方案，请先删掉一套`);
-            const stem = '默认工作流 · LoRA'; let name = stem, n = 2;
-            while (c.workflows.some(p => p.name === name)) name = `${stem} (${n++})`;
-            row = { ...clone(row), id: crypto.randomUUID(), name, workflow: DEFAULT_COMFY_WORKFLOW, sourceWorkflow: DEFAULT_COMFY_WORKFLOW, disabledLoras: [] };
-            c.workflows.push(row); copied = true;
-        }
-        const add = change.add ? { ...change.add, source: change.add.source || pickLoraSource(row.workflow) } : undefined;
-        if (add && !add.source) throw Error('这个工作流有好几条模型线路，请选一下 LoRA 接在哪里');
-        row.workflow = editLoras(row.workflow, { updates: change.updates || [], remove: change.remove, add });
-        const off = new Set(row.disabledLoras || []);
-        for (const [id, on] of Object.entries(change.enabled || {})) { if (on) off.delete(id); else off.add(id); }
-        if (change.remove !== undefined) off.delete(String(change.remove));
-        row.disabledLoras = normalizeDisabledLoras(row.workflow, [...off]);
-        activeLoraWorkflow(row.workflow, row.disabledLoras);
-        applyComfyWorkflow(c, row.id);
-        this.save(next);
-        return { copied, name: row.name, info: this.comfyLoraInfo() };
-    }
-    /** The scheme in use back to the workflow it was imported with (its LoRA edits undone). */
-    restoreComfyWorkflow() {
-        const next = this.getState(), c = next.draw.comfy, row = c.workflows.find(p => p.id === c.activeWorkflow);
-        if (!row.sourceWorkflow) throw Error('这套方案没有可以恢复的原始工作流');
-        row.workflow = row.sourceWorkflow; row.disabledLoras = [];
-        applyComfyWorkflow(c, row.id); this.save(next);
-        return this.comfyLoraInfo();
-    }
-    /** Import a new workflow or rename/update a saved one. LoRA nodes and custom inputs stay untouched. */
-    saveComfyWorkflow(patch) {
-        if (!patch || typeof patch !== 'object') throw Error('工作流格式无效');
-        const next = this.getState(), c = next.draw.comfy, old = c.workflows.find(p => p.id === patch.id);
-        if (patch.id === 'default') throw Error('默认工作流不能修改，请导入为新的一套');
-        if (patch.id && !old) throw Error('这套工作流已经不在了');
-        if (old && patch.expected && Object.entries(patch.expected).some(([key, value]) => JSON.stringify(old[key]) !== JSON.stringify(value))) throw Error('这套方案在其他地方改过了，请另存，或重新选择方案后再改');
-        let name = String(patch.name ?? old?.name ?? '').trim();
-        if (!name || name.length > 60) throw Error('请填写工作流名称（最多 60 字）');
-        const workflow = checkWorkflow(patch.workflow ?? old?.workflow);
-        if (!workflow) throw Error('导入的工作流不能为空');
-        if (!old && c.workflows.length >= COMFY_LIMITS.presets) throw Error(`最多保存 ${COMFY_LIMITS.presets} 套 ComfyUI 方案（含默认），请先删掉一套`);
-        if (!old) { const stem = name; let n = 2; while (c.workflows.some(p => p.name === name)) name = stem.slice(0, 54) + ` (${n++})`; }
-        const disabledLoras = normalizeDisabledLoras(workflow, patch.disabledLoras ?? old?.disabledLoras);
-        // Validate bypass wiring before acknowledging a saved scheme.
-        activeLoraWorkflow(workflow, disabledLoras);
-        const sourceWorkflow = checkWorkflow(patch.sourceWorkflow ?? old?.sourceWorkflow);
-        const row = {id: old?.id || crypto.randomUUID(), name, workflow, disabledLoras, ...(sourceWorkflow ? {sourceWorkflow} : {}), ...Object.fromEntries(COMFY_PARAM_KEYS.map(key => [key, patch.params?.[key] ?? (old || c)[key]]))};
-        if (old) c.workflows[c.workflows.indexOf(old)] = row; else c.workflows.push(row);
-        applyComfyWorkflow(c, row.id); this.save(next);
-        return clone(this.settings.draw.comfy.workflows.find(p => p.id === row.id));
-    }
-    selectComfyWorkflow(id) {
-        const next = this.getState(); applyComfyWorkflow(next.draw.comfy, id); this.save(next);
-    }
-    deleteComfyWorkflow(id) {
-        if (id === 'default') throw Error('默认工作流需要保留');
-        const next = this.getState(), c = next.draw.comfy;
-        if (!c.workflows.some(p => p.id === id)) throw Error('这套工作流已经不在了');
-        c.workflows = c.workflows.filter(p => p.id !== id);
-        if (c.activeWorkflow === id) applyComfyWorkflow(c, 'default');
-        this.save(next);
-    }
-    saveDraw(patch) {
-        if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw Error('绘图设置格式无效');
-        const next = this.getState(), draw = next.draw;
-        if ('queue' in patch) draw.queue = normalizeDraw({ queue: { ...draw.queue, ...clone(patch.queue) } }).queue;
-        for (const key of ['enabled', 'auto', 'guard', 'fold', 'strip']) if (key in patch) { if (typeof patch[key] !== 'boolean') throw Error('开关设置无效'); draw[key] = patch[key]; }
-        if ('mode' in patch) { if (!['separate', 'inline'].includes(patch.mode)) throw Error('配图方式无效'); draw.mode = patch.mode; }
-        if ('vibe' in patch) draw.vibe = normalizeVibeSettings({ ...draw.vibe, ...clone(patch.vibe || {}) });
-        if ('relay' in patch) {
-            const relay = patch.relay && typeof patch.relay === 'object' ? patch.relay : {};
-            draw.relay = { url: 'url' in relay ? relayUrl(relay.url) : draw.relay.url, assumeOpus: 'assumeOpus' in relay ? !!relay.assumeOpus : draw.relay.assumeOpus };
-            this.subscription = null;
-        }
-        if ('params' in patch) draw.params = normalizeDrawParams({ ...draw.params, ...clone(patch.params) });
-        if ('engine' in patch) { if (!DRAW_ENGINES.includes(patch.engine)) throw Error('绘图引擎无效'); draw.engine = patch.engine; }
-        if ('gpt' in patch) {
-            const g = patch.gpt && typeof patch.gpt === 'object' ? clone(patch.gpt) : {};
-            if ('url' in g) g.url = gptBase(g.url);
-            if ('model' in g && !/^[\w.:/-]{1,80}$/.test(String(g.model).trim())) throw Error('模型名称无效');
-            draw.gpt = normalizeGpt({ ...draw.gpt, ...g });
-        }
-        if ('comfy' in patch) {
-            const c = patch.comfy && typeof patch.comfy === 'object' ? clone(patch.comfy) : {};
-            if ('url' in c) c.url = comfyUrl(c.url);
-            const current = draw.comfy;
-            if ('workflow' in c) {
-                c.workflow = checkWorkflow(c.workflow);
-                if (!c.workflow) applyComfyWorkflow(current, 'default');
-                else if (current.activeWorkflow === 'default') {
-                    const row = {id: crypto.randomUUID(), name: '自定义工作流', workflow: c.workflow, ...Object.fromEntries(COMFY_PARAM_KEYS.map(key => [key, current[key]]))};
-                    current.workflows.push(row); applyComfyWorkflow(current, row.id);
-                } else { const row = current.workflows.find(p => p.id === current.activeWorkflow); row.workflow = c.workflow; row.disabledLoras = []; delete row.sourceWorkflow; }
-            }
-            draw.comfy = normalizeComfy({ ...current, ...c });
-        }
-        // The 画风 picked belongs to the engine in use.
-        if ('activeStyle' in patch) { if (!draw.styles.some(s => s.id === patch.activeStyle)) throw Error('画风预设不存在'); if (draw.engine === 'nai') draw.activeStyle = patch.activeStyle; else draw[draw.engine].style = patch.activeStyle; }
-        if ('activePreset' in patch) { if (!draw.presets.some(p => p.id === patch.activePreset)) throw Error('绘图预设不存在'); draw.activePreset = patch.activePreset; }
-        // Existing address/model controls edit the selected connection, preserving every other one.
-        for (const engine of ['nai', 'gpt']) {
-            const group = draw.connections[engine], p = group.presets.find(p => p.id === group.active);
-            Object.assign(p, engine === 'nai' ? draw.relay : {url: draw.gpt.url, model: draw.gpt.model});
-        }
-        this.save(next);
-        return clone(this.settings.draw);
-    }
-    saveStyle(value) {
-        if (!value || typeof value !== 'object' || !String(value.name || '').trim()) throw Error('请填写画风名称');
-        const next = this.getState(), style = { id: value.id || crypto.randomUUID(), name: String(value.name).trim(), artist: String(value.artist || ''), positive: String(value.positive || ''), negative: String(value.negative || '') };
-        const index = next.draw.styles.findIndex(s => s.id === style.id);
-        if (index < 0) next.draw.styles.push(style); else next.draw.styles[index] = style;
-        this.save(next);
-        return clone(this.settings.draw.styles.find(s => s.id === style.id));
-    }
-    deleteStyle(id) {
-        const next = this.getState();
-        if (next.draw.styles.length === 1) throw Error('请至少保留一个画风预设');
-        next.draw.styles = next.draw.styles.filter(s => s.id !== id);
-        return this.save(next).draw;
-    }
-    saveDrawPreset(value) {
-        if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('绘图预设格式无效');
-        // What is saved is what the user wrote: no entries are added to it as to a preset from an older version.
-        const next = this.getState(), preset = normalizeDraw({ presets: [{ ...clone(value), id: value.id || crypto.randomUUID(), rev: DRAW_PRESET_REV }] }).presets[0];
-        validateDrawPreset(preset);
-        const index = next.draw.presets.findIndex(p => p.id === preset.id);
-        if (index < 0) next.draw.presets.push(preset); else next.draw.presets[index] = preset;
-        this.save(next);
-        return clone(preset);
-    }
-    deleteDrawPreset(id) {
-        const next = this.getState();
-        if (next.draw.presets.length === 1) throw Error('请至少保留一个绘图预设');
-        next.draw.presets = next.draw.presets.filter(p => p.id !== id);
-        return this.save(next).draw;
-    }
-    previewDrawPrompt(preset) {
-        const draft = preset ? normalizeDraw({ presets: [clone(preset)] }).presets[0] : null;
-        if (draft) validateDrawPreset(draft);
-        const draw = this.settings.draw, used = draft || draw.presets.find(p => p.id === draw.activePreset) || draw.presets[0];
-        // 'separate' mode: the request made after a reply, with a stand-in for the reply.
-        if (draw.mode === 'separate') return planRequest(this.settings, { message: '（这里是刚写好的正文，第一段）\n（第二段……每一段前面会标上 [P1]、[P2]）', preset: used })
-            .map(m => `【${m.role}】\n${m.content}`).join('\n\n');
-        return drawPromptPlan(this.settings, used).map(entry => entry.text).join('\n\n');
-    }
-    async naiSubscription(refresh = false) {
-        this.assertOpen();
-        if (!this.novelai.configured) return null;
-        if (!refresh && this.subscription && Date.now() - this.subscription.checkedAt < 10 * 60 * 1000) return clone(this.subscription);
-        this.novelai.relay = this.settings.draw.relay.url;
-        const revision = this.imageConnectionRevision, subscription = await this.novelai.subscription();
-        if (revision !== this.imageConnectionRevision) return null;
-        this.subscription = subscription;
-        this.emit('draw', { subscription: this.subscription });
-        return clone(this.subscription);
-    }
-    /**
-     * The relay (or NovelAI itself) checked from the phone: the drawing route by an empty request that draws nothing,
-     * and the subscription. {relay, draw: {ok, status}, subscription: {ok, tier} | {ok: false, status, message}}.
-     */
-    async naiProbe() {
-        this.assertOpen();
-        if (!this.novelai.configured) throw Error('还没有填写 NovelAI 密钥');
-        this.novelai.relay = this.settings.draw.relay.url;
-        const draw = await this.novelai.probe();
-        let subscription;
-        try { const s = await this.naiSubscription(true); subscription = { ok: true, tier: s.tier }; }
-        catch (error) { subscription = { ok: false, status: error.status || 0, message: error.message }; }
-        return { relay: !!this.settings.draw.relay.url, draw, subscription };
-    }
-    /** Whether params cost Anlas. free: true (covered), false (costs Anlas), null (subscription unknown). */
-    drawQuote(params) {
-        const engine = this.settings.draw.engine;
-        if (engine !== 'nai') return this.engineQuote(engine, params);
-        const requested = normalizeDrawParams(params || this.settings.draw.params);
-        const effective = this.settings.draw.guard ? guardParams(requested) : requested;
-        // Through a relay that does not pass the subscription on, the user may say the account is Opus: small non-V5 images count as free.
-        const relay = this.settings.draw.relay, subscription = this.subscription || (relay.url && relay.assumeOpus ? { unlimited: true, active: true, usage: null, assumed: true } : null);
-        // Vibes: encoding one (first use) and every vibe past four cost Anlas, so such a picture is not free.
-        const vibes = this.vibePlan(effective.model), vibeAnlas = (vibes.encode + vibes.extra) * VIBE_ANLAS, free = isFree(effective, subscription);
-        return { params: effective, clamped: JSON.stringify(effective) !== JSON.stringify(requested), free: vibeAnlas && free !== false ? false : free, guard: this.settings.draw.guard,
-            v5: isV5(effective.model), usage: this.subscription?.usage ? clone(this.subscription.usage) : null, vibes, vibeAnlas };
-    }
+    // ComfyUI, 绘图 settings, 画风, 绘图预设, the prompt preview and the NovelAI subscription: core/backend-draw.js.
     // ---------- Vibes ----------
     async loadVibes() { const rows = await this.library.listVibes(); this.vibes = new Map(rows.map(row => [row.id, { ...row.meta, id: row.id, name: row.name }])); }
     listVibes() { return [...this.vibes.values()].map(clone); }
@@ -1154,8 +1160,11 @@ export class TTSBackend {
     /** What to ask before a picture that costs money, for the engine in use: {title, text, note}. */
     paidPrompt() { return this.settings.draw.engine === 'gpt' ? { title: 'GPT 生图要花钱', text: '每张图都按 OpenAI（或中转）的价格收费，确认后再画。', note: 'GPT 生图要花钱，点一下确认后再画' } : { title: '这张图会扣 Anlas', text: '超出了 NovelAI 的免费档，确认后再画。', note: '这张图会扣 Anlas，点一下确认后再画' }; }
     drawMissing() { const engine = this.settings.draw.engine; return this.drawReady() ? '' : engine === 'gpt' ? '还没有填写 GPT 生图的密钥' : engine === 'comfy' ? '还没有填写 ComfyUI 地址' : '还没有填写 NovelAI 密钥'; }
+    /** The GPT drawing models the saved relay (or OpenAI) offers. */
+    async gptModels() { this.assertOpen(); return gptModels({ fetch: this.imageFetch, settings: this.settings.draw.gpt, key: this.gptKey }); }
     /** ComfyUI: connection check and what it offers (models, samplers, schedulers). url: an address not saved yet. */
     async comfyCatalog(url) { this.assertOpen(); return comfyCatalog({ fetch: this.imageFetch, headers: this.tavernHeaders(), url: comfyUrl(url ?? this.settings.draw.comfy.url) }); }
+    async comfyClips({transport, signal} = {}) { this.assertOpen(); const c = this.settings.draw.comfy; return comfyClips({fetch: this.imageFetch, url: c.url, transport: transport ?? c.loraTransport, signal}); }
     async comfyLoras({transport, signal} = {}) { this.assertOpen(); const c = this.settings.draw.comfy; return comfyLoras({fetch: this.imageFetch, url: c.url, transport: transport ?? c.loraTransport, signal}); }
     async comfyWorkflows() { this.assertOpen(); return tavernWorkflows({ fetch: this.imageFetch, headers: this.tavernHeaders() }); }
     async comfyWorkflow(name) { this.assertOpen(); return tavernWorkflow({ fetch: this.imageFetch, headers: this.tavernHeaders(), name: String(name || '') }); }
@@ -1169,18 +1178,29 @@ export class TTSBackend {
         }
         const c = comfy || draw.comfy, seed = p.seed >= 0 ? p.seed : Math.floor(Math.random() * 4294967295);
         const text = comfyPrompt({ prompt, negative, characters });
-        const workflow = fillWorkflow(activeLoraWorkflow(c.workflow || DEFAULT_COMFY_WORKFLOW, c.disabledLoras), comfyValues(c, { prompt: text.prompt, negative: text.negative, width: p.width, height: p.height, seed }));
+        const workflow = fillWorkflow(activeLoraWorkflow(c.workflow || defaultWorkflow(c), c.disabledLoras), comfyValues(c, { prompt: text.prompt, negative: text.negative, width: p.width, height: p.height, seed }));
         const blob = await comfyGenerate({ fetch: this.imageFetch, headers: this.tavernHeaders(), url: c.url, workflow, signal });
         return { blob, seed, params: { model: c.model || '工作流', width: p.width, height: p.height, steps: c.steps, scale: c.scale, sampler: c.sampler }, prompt: text.prompt };
     }
+    /** How a picture was drawn, as the viewer's 参数 rows (kept with the album photo). */
+    pictureInfo(engine, { params = {}, seed, prompt }, { negative = '', characters = [] } = {}) {
+        return [
+            ['引擎', DRAW_ENGINE_NAMES[engine] || engine], ['模型', NAI_MODEL_NAMES[params.model] || params.model],
+            ['尺寸', params.width && params.height ? `${params.width} × ${params.height}` : ''], ['步数', params.steps], ['CFG', params.scale], ['采样器', params.sampler],
+            ['种子', seed >= 0 ? seed : ''], ['画于', new Date().toLocaleString('zh-CN', { hour12: false })],
+            ['提示词', prompt], ['负面', negative], ['角色', (characters || []).map(c => c?.prompt).filter(Boolean).join(' | ')]
+        ].filter(([, v]) => v !== undefined && v !== null && String(v).trim());
+    }
     /** Generates one image and keeps it in the album. Requests wait in the NovelAI queue (see draw-queue.js).
      *  key identifies the job in the queue (the same key joins the job already waiting); label is shown in the line. */
-    generateImage({ prompt, negative = '', characters = [], params, allowPaid = false, name = '', key, label = '' } = {}) {
+    generateImage({ prompt, negative = '', characters = [], params, allowPaid = false, name = '', key, label = '', base = null, refs = [] } = {}) {
         this.assertOpen();
         if (!String(prompt || '').trim()) return Promise.reject(Error('请先写提示词'));
         const engine = this.settings.draw.engine;
         if (!this.drawReady()) return Promise.reject(Error(this.drawMissing()));
-        const quote = this.drawQuote(params);
+        // 底图 (图生图 / 局部重绘) and 角色参考 are NovelAI's: the drawing app sends them only when NovelAI draws.
+        const extra = engine === 'nai' ? { base: !!base?.image, refs: (refs || []).filter(r => r?.image).length } : {};
+        const quote = this.drawQuote(params, extra);
         if (engine !== 'nai') {
             if (quote.free === false && !allowPaid) return Promise.reject(Object.assign(Error('GPT 生图每张都要花钱，需要确认后再生成'), { code: 'PAID' }));
             // A queued ComfyUI picture keeps the scheme it was asked with, whatever is changed while it waits.
@@ -1193,36 +1213,78 @@ export class TTSBackend {
                 const made = await this.drawWithEngine(engine, { ...picture, signal });
                 this.assertOpen();
                 const ext = made.blob.type === 'image/jpeg' ? 'jpg' : made.blob.type === 'image/webp' ? 'webp' : 'png';
-                const photo = await this.library.addPhoto({ name: (name || DRAW_ENGINE_NAMES[engine]) + '-' + (made.seed >= 0 ? made.seed : Date.now()) + '.' + ext, blob: made.blob });
+                const info = this.pictureInfo(engine, made, picture);
+                const photo = await this.library.addPhoto({ name: (name || DRAW_ENGINE_NAMES[engine]) + '-' + (made.seed >= 0 ? made.seed : Date.now()) + '.' + ext, blob: made.blob, info });
                 this.emit('library', { collection: 'photos' });
                 this.emit('draw', { phase: 'done' });
-                return { photoId: photo.id, seed: made.seed, params: made.params, prompt: made.prompt, engine, blob: made.blob };
+                return { photoId: photo.id, seed: made.seed, params: made.params, prompt: made.prompt, engine, blob: made.blob, info };
             } });
             job.catch(error => { this.emit('draw', { phase: error.cancelled ? 'cancelled' : 'error', message: error.message }); });
             return job;
         }
         if (quote.free === false && !allowPaid) return Promise.reject(Object.assign(Error('这张图会扣 Anlas，需要确认后再生成'), { code: 'PAID' }));
-        const request = buildImageRequest({ prompt, negative, characters, params: quote.params });
+        const request = buildImageRequest({ prompt, negative, characters, params: quote.params, base: extra.base ? clone(base) : null, refs: extra.refs ? clone(refs) : [] });
         const job = this.drawQueue.add({ key, label: label || String(prompt).slice(0, 40), task: async signal => {
             this.assertOpen();
             this.emit('draw', { phase: 'generating' });
-            if (quote.vibes.used.length) Object.assign(request.body.parameters, vibeParameters(await this.vibeEncodings(quote.vibes.used, request.params.model, signal)));
+            if (quote.vibes.used.length && !request.refs) Object.assign(request.body.parameters, vibeParameters(await this.vibeEncodings(quote.vibes.used, request.params.model, signal)));
             this.novelai.relay = this.settings.draw.relay.url;
-            const blob = await this.novelai.generate(request.body, signal);
+            let blob;
+            try { blob = await this.novelai.generate(request.body, signal); }
+            catch (error) {
+                // 透明背景's flags are not in NovelAI's public documents: refused, the picture is asked for once more without them.
+                const p = request.body.parameters;
+                if (!p.straight_alpha || ![400, 422, 500].includes(error?.status)) throw error;
+                delete p.straight_alpha; delete p.tag_hint_transparent_background;
+                blob = await this.novelai.generate(request.body, signal);
+            }
             this.assertOpen();
-            const photo = await this.library.addPhoto({ name: (name || 'NovelAI') + '-' + request.seed + '.png', blob });
+            const info = this.pictureInfo('nai', { params: request.params, seed: request.seed, prompt: request.body.input }, { negative, characters });
+            if (request.body.action !== 'generate') info.push(['方式', request.body.action === 'infill' ? `局部重绘 · 强度 ${request.body.parameters.strength}` : `图生图 · 强度 ${request.body.parameters.strength} · 噪声 ${request.body.parameters.noise}`]);
+            if (request.refs) info.push(['角色参考', `${request.refs} 张`]);
+            const photo = await this.library.addPhoto({ name: (name || 'NovelAI') + '-' + request.seed + '.png', blob, info });
             this.emit('library', { collection: 'photos' });
             this.emit('draw', { phase: 'done' });
             // Paid images change the Anlas balance and V5 images use up the allowance: read the subscription again next time.
             if (this.subscription && (quote.free === false || isV5(request.params.model))) this.subscription.checkedAt = 0;
-            return { photoId: photo.id, seed: request.seed, params: request.params, prompt: request.body.input, engine: 'nai', blob };
+            return { photoId: photo.id, seed: request.seed, params: request.params, prompt: request.body.input, engine: 'nai', blob, info };
+        } });
+        job.catch(error => { this.emit('draw', { phase: error.cancelled ? 'cancelled' : 'error', message: error.message }); });
+        return job;
+    }
+    /**
+     * NovelAI's tools on a picture (base64 PNG of width×height): 导演工具 (tool: a DIRECTOR_TOOLS key, with prompt, mood,
+     * defry for 上色 / 换表情) or tool 'upscale' (放大 by upscaleBy). Waits in the NovelAI queue like a drawing; the result
+     * goes into the album. They cost Anlas, so the drawing app asks first.
+     */
+    naiTool({ tool, image, width, height, prompt = '', mood = 'neutral', defry = 0, name = 'NovelAI' } = {}) {
+        this.assertOpen();
+        if (!this.novelai.configured) return Promise.reject(Error('还没有填写 NovelAI 密钥'));
+        if (!image || !(width > 0) || !(height > 0)) return Promise.reject(Error('没有图片'));
+        const scale = tool === 'upscale' ? upscaleBy(width, height) : 0;
+        if (tool === 'upscale' && !scale) return Promise.reject(Error(`这张图已经很大了，放大后会超过 ${UPSCALE_MAX} 像素`));
+        const body = tool === 'upscale' ? { image, width, height, scale } : augmentBody({ tool, image, width, height, prompt, mood, defry });
+        const label = tool === 'upscale' ? `放大 ×${scale}` : DIRECTOR_TOOLS[tool];
+        const job = this.drawQueue.add({ key: `nai-tool:${tool}:${Date.now()}`, label: '绘图 App · ' + label, task: async signal => {
+            this.assertOpen();
+            this.emit('draw', { phase: 'generating' });
+            this.novelai.relay = this.settings.draw.relay.url;
+            const blob = tool === 'upscale' ? await this.novelai.upscale(body, signal) : await this.novelai.augment(body, signal);
+            this.assertOpen();
+            const info = [['引擎', 'NovelAI'], ['工具', label], ['原图', `${width} × ${height}`], ...(body.prompt ? [['说明', body.prompt.replace(';;', ' · ')]] : []), ['画于', new Date().toLocaleString('zh-CN', { hour12: false })]];
+            const photo = await this.library.addPhoto({ name: `${name}-${label}-${Date.now()}.png`, blob, info });
+            this.emit('library', { collection: 'photos' });
+            this.emit('draw', { phase: 'done' });
+            if (this.subscription) this.subscription.checkedAt = 0;
+            return { photoId: photo.id, seed: -1, params: { width: width * (scale || 1), height: height * (scale || 1) }, prompt: label, engine: 'nai', tool };
         } });
         job.catch(error => { this.emit('draw', { phase: error.cancelled ? 'cancelled' : 'error', message: error.message }); });
         return job;
     }
     // ---------- Chat ----------
-    /** The voice tag format used for voice messages: the active voice preset's format. */
-    voiceFormat() { return (this.settings.presets.find(p => p.id === this.settings.activePreset) || this.settings.presets[0]).format || DEFAULT_FORMAT; }
+    // Voice messages and calls on the phone are read by the plugin and shown as bubbles, never as text: they keep the built-in
+    // format, whatever the 配音预设 asks of the story (a format made for a beautified card has no place in a chat bubble).
+    voiceFormat() { return DEFAULT_FORMAT; }
     saveChatPreset(value) {
         if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('聊天预设格式无效');
         const next = this.getState(), preset = validateChatPreset(normalizeChatPreset({ ...clone(value), id: value.id || crypto.randomUUID() }));
@@ -1244,10 +1306,10 @@ export class TTSBackend {
         return this.save(next).chat;
     }
     saveContact(value) {
-        const next = this.getState(), contact = validateContact(normalizeContact(clone(value || {})), next.routes);
+        const next = this.getState(), contact = validateContact(normalizeContact(clone(value || {})), this.routesHere());
         if (next.chat.contacts.some(c => c.name === contact.name && c.id !== contact.id)) throw Error('已经有同名的联系人');
         const index = next.chat.contacts.findIndex(c => c.id === contact.id);
-        if (index < 0 && this.spaceKey()) contact.space = this.spaceKey();
+        if (index < 0 && this.cardKey()) contact.space = this.cardKey();
         if (index >= 0 && next.chat.contacts[index].space) contact.space = next.chat.contacts[index].space;
         if (index < 0) next.chat.contacts.push(contact); else next.chat.contacts[index] = contact;
         this.save(next);
@@ -1264,8 +1326,16 @@ export class TTSBackend {
         }
         if (Array.isArray(patch?.starred)) next.chat.starred = patch.starred;
         if (patch?.pace !== undefined) next.chat.pace = patch.pace !== false;
+        // 主动发消息: {on, every, dailyMax}.
+        if (patch?.proactive && typeof patch.proactive === 'object') next.chat.proactive = normalizeProactive({ ...next.chat.proactive, ...patch.proactive });
         if (Array.isArray(patch?.stickers)) next.chat.stickers = normalizeStickers(patch.stickers);
         if (patch?.partition !== undefined) { if (!['none', 'card'].includes(patch.partition)) throw Error('分区方式无效'); next.chat.partition = patch.partition; }
+        // remarks (备注) and netNames (网名): {name: other name | '' | null}; empty takes it away.
+        for (const key of ['remarks', 'netNames']) if (patch?.[key] && typeof patch[key] === 'object') {
+            const merged = { ...next.chat[key] };
+            for (const [name, other] of Object.entries(patch[key])) { if (other) merged[name] = other; else delete merged[name]; }
+            next.chat[key] = normalizeNames(merged, key === 'remarks' ? 20 : 30);
+        }
         // avatars: {name: choice | null}; null goes back to the tavern's avatar (or the first letter).
         if (patch?.avatars && typeof patch.avatars === 'object') { const merged = { ...next.chat.avatars }; for (const [name, a] of Object.entries(patch.avatars)) { if (a) merged[name] = a; else delete merged[name]; } next.chat.avatars = normalizeAvatars(merged); }
         return this.save(next).chat;
@@ -1279,7 +1349,7 @@ export class TTSBackend {
     }
     /** A role from the 角色 App joins this card's contacts (the card's story has not met them yet). */
     addRoleContact(name) {
-        const route = this.settings.routes.find(r => r.name === name);
+        const route = findRoute(this.routesHere(), name);
         if (!route) throw Error('角色 App 里没有这个角色');
         if (this.spaceKey()) this.tagRoles([name], this.spaceKey());
         return clone(this.contacts());
@@ -1292,12 +1362,12 @@ export class TTSBackend {
         const other = { name: '另一位联系人', persona: '', card: '（酒馆角色卡里的设定）', voice: false };
         const group = { type: 'group', name: '群聊', members: [contact.name, other.name], messages: thread.messages };
         const lore = p.lore !== false ? '（这里是触发的世界书条目：常驻的，以及名字、最近的正文和聊天里命中关键词的）' : '';
-        return ['━━ 私聊 ━━', text(buildChatRequest({ preset: p, thread, members: [member], story, user: '{{user}}', voiceFormat: this.voiceFormat(), lore })),
-            '━━ 群聊 ━━', text(buildChatRequest({ preset: p, thread: group, members: [member, other], story, user: '{{user}}', voiceFormat: this.voiceFormat(), lore })),
-            '━━ 朋友圈（刷新时） ━━', text(buildMomentsRequest({ preset: p, people: [member, other], story, user: '{{user}}', images: this.settings.moments.images, lore })),
-            '━━ 电话（接通后第一句） ━━', text(buildCallRequest({ preset: p, mode: 'incoming', contact: { ...member, voice: true }, history: thread.messages, story, user: '{{user}}', voiceFormat: this.voiceFormat(), voiceRules: '（这里是这个角色的语音引擎朗读规则）', lore })),
-            '━━ 论坛（刷新时） ━━', text(buildForumRequest({ preset: p, people: [member, other], story, user: '{{user}}', lore })),
-            '━━ 查手机 ━━', text(buildPeekRequest({ preset: p, person: member, story, user: '{{user}}', history: thread.messages, lore }))].join('\n\n');
+        return ['━━ 私聊 ━━', text(buildChatRequest({prompts: this.settings.promptRules,  preset: p, thread, members: [member], story, user: '{{user}}', voiceFormat: this.voiceFormat(), lore })),
+            '━━ 群聊 ━━', text(buildChatRequest({prompts: this.settings.promptRules,  preset: p, thread: group, members: [member, other], story, user: '{{user}}', voiceFormat: this.voiceFormat(), lore })),
+            '━━ 朋友圈（刷新时） ━━', text(buildMomentsRequest({prompts: this.settings.promptRules,  preset: p, people: [member, other], story, user: '{{user}}', images: this.settings.moments.images, lore })),
+            '━━ 电话（接通后第一句） ━━', text(buildCallRequest({prompts: this.settings.promptRules,  preset: p, mode: 'incoming', contact: { ...member, voice: true }, history: thread.messages, story, user: '{{user}}', voiceFormat: this.voiceFormat(), voiceRules: '（这里是这个角色的语音引擎朗读规则）', lore })),
+            '━━ 论坛（刷新时） ━━', text(buildForumRequest({prompts: this.settings.promptRules,  preset: p, people: [member, other], story, user: '{{user}}', lore })),
+            '━━ 查手机 ━━', text(buildPeekRequest({prompts: this.settings.promptRules,  preset: p, person: member, story, user: '{{user}}', history: thread.messages, lore }))].join('\n\n');
     }
     /** 来电 options: {auto, every, dailyMax, ring}. */
     saveCalls(patch) {
@@ -1306,16 +1376,142 @@ export class TTSBackend {
         return this.save(next).calls;
     }
     // ---------- 音效 ----------
-    /** {enabled, ambienceVolume, sfxVolume, vary, generate, versions}. */
+    /** {enabled, ambienceVolume, sfxVolume, vary, tapOnly, generate, versions}. */
+    // ---------- 音乐 ----------
+    /** Music options: {bgm, rule, volume, duck, share, sources}. Sources are checked before they are kept. */
+    saveMusic(patch) {
+        const next = this.getState(), allowed = ['bgm', 'rule', 'volume', 'duck', 'share', 'sources'];
+        const merged = { ...next.music, ...Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key))) };
+        if (Array.isArray(patch?.sources)) { if (patch.sources.length > MUSIC_LIMITS.sources) throw Error(`最多 ${MUSIC_LIMITS.sources} 个音源`); merged.sources = patch.sources.map((s, i) => validateSource(normalizeSource(s, i))); }
+        next.music = normalizeMusic(merged);
+        const saved = this.save(next).music;
+        this.emit('music', { settings: true });
+        return saved;
+    }
+    /** A web address read from the page, else (it does not allow pages to read it) through the tavern's own proxy. */
+    async musicFetch(url, as = 'json') {
+        const read = async response => {
+            if (!response.ok) throw Object.assign(Error(`HTTP ${response.status}`), { status: response.status });
+            // Asked for a link and given the song itself: no need to download it here.
+            if (as === 'link' && isAudio(response.headers?.get?.('content-type'))) { response.body?.cancel?.().catch?.(() => {}); return AUDIO; }
+            return as === 'text' ? response.text() : response.json();
+        };
+        // A server plugin on the tavern itself: with the tavern's login and checks; there is no proxy to try then.
+        if (onTavern(url)) {
+            let response;
+            try { response = await this.musicTransport(url, { credentials: 'same-origin', headers: this.tavernHeaders() }); } catch { throw Error('连不上酒馆里的这个地址'); }
+            if (response.status === 404) throw Error('酒馆里没有这个地址：服务端插件装好了吗？（config.yaml 里 enableServerPlugins 要是 true，装完要完全重启酒馆）');
+            return read(response).catch(error => { throw Error(`酒馆里的音源回答 ${error.message}`); });
+        }
+        try { return await read(await this.musicTransport(url, { credentials: 'omit' })); }
+        catch (error) {
+            if (error?.status) throw Error(`音源回答 ${error.message}`);
+            const proxied = await this.musicTransport('/proxy/' + encodeURIComponent(url), { credentials: 'same-origin' }).catch(() => null);
+            if (!proxied) throw Error('连不上这个音源：网址不对，或者它不让网页直接读取，酒馆代理也连不上');
+            if (!proxied.ok) { const said = await proxied.text().catch(() => ''); throw Error(/CORS proxy is disabled/i.test(said) ? '这个音源不让网页直接读取：可以在酒馆的 config.yaml 里把 enableCorsProxy 改成 true 再重启酒馆' : `音源回答 HTTP ${proxied.status}`); }
+            return read(proxied);
+        }
+    }
+    musicSource(id) {
+        // A draft can be tried without changing saved sources or notifying other views.
+        if (id && typeof id === 'object') return validateSource(normalizeSource(clone(id)));
+        const s = this.settings.music.sources.find(x => x.id === id);
+        if (!s) throw Error('这个音源已经不在了');
+        return clone(s);
+    }
+    /** Searches the enabled sources (or one): {songs: [{source, sourceName, id, title, artist}], errors: [{source, message}]}. */
+    async searchMusic(query, sourceId = '') {
+        this.assertOpen();
+        const words = String(query || '').trim().slice(0, 100);
+        if (!words) throw Error('写一下想听的歌');
+        const sources = sourceId && typeof sourceId === 'object' ? [this.musicSource(sourceId)] : clone(this.settings.music.sources.filter(s => sourceId ? s.id === sourceId : s.enabled));
+        if (!sources.length) throw Error('还没有能用的音源：先在「音乐 → 设置 → 音源」里添加一个');
+        const songs = [], errors = [];
+        await Promise.all(sources.map(async s => {
+            try { songs.push(...readSearch(s, await this.musicFetch(fillSource(s.search, { query: words }))).map(x => ({ ...x, sourceName: s.name }))); }
+            catch (error) { errors.push({ source: s.name, message: error.message }); }
+        }));
+        return { songs, errors };
+    }
+    /** A playable link for a song of a source. */
+    async musicLink(sourceId, songId, hint = {}) {
+        this.assertOpen();
+        const s = this.musicSource(sourceId), address = fillSource(s.url, { id: songId, title: hint.title, artist: hint.artist });
+        // The address itself is the song: played as it is (the tavern's own address stays as it is, the page's origin).
+        const own = () => onTavern(address) ? address : playable(address, globalThis.location?.protocol);
+        if (s.direct) return own();
+        let answer = await this.musicFetch(address, 'link');
+        if (answer === AUDIO) return own();
+        let link = readLink(s, answer);
+        // No link from a NeteaseCloudMusicApi-style backend: asked once more as a Chinese IP (core/music.js asChina).
+        const again = !link && asChina(address);
+        if (again) { const second = await this.musicFetch(again, 'link').catch(() => null); if (second === AUDIO) return playable(again, globalThis.location?.protocol); if (second) { const found = readLink(s, second); if (found) { link = found; answer = second; } } }
+        if (!link) throw Error(`「${s.name}」没有给出播放链接：${missingLink(s, answer)}`);
+        const out = playable(link, globalThis.location?.protocol);
+        // Only the 30-second preview: kept, so the player can say why the song stops (core/music.js trialOnly).
+        if (trialOnly(answer)) { this.trialLinks ??= new Set(); this.trialLinks.add(out); if (this.trialLinks.size > 50) this.trialLinks.delete(this.trialLinks.values().next().value); }
+        return out;
+    }
+    /** Whether a link from musicLink is only a 30-second preview (a 会员 song, the source not logged in). */
+    musicTrial(link) { return !!this.trialLinks?.has(link); }
+    async musicLyric(sourceId, songId, hint = {}) {
+        const s = this.musicSource(sourceId);
+        if (!s.lyric) return '';
+        try { const value = pickPath(await this.musicFetch(fillSource(s.lyric, { id: songId, title: hint.title, artist: hint.artist })), s.lyricPath); return typeof value === 'string' ? value.slice(0, 60000) : ''; } catch { return ''; }
+    }
+    /** The 歌单: songs without their files. */
+    async listSongs() { this.assertOpen(); return (await this.music.list('song')).map(({ blob, ...row }) => row); }
+    async songBlob(id) { const row = await this.music.get(id); return row?.blob || null; }
+    /** Adds files ({title, artist, blob}) or source songs ({title, artist, source, songId}) to the 歌单. */
+    async addSongs(list) {
+        this.assertOpen();
+        const now = Date.now(), have = await this.listSongs();
+        if (have.length + list.length > MUSIC_LIMITS.songs) throw Error(`歌单最多 ${MUSIC_LIMITS.songs} 首`);
+        const rows = list.map((value, i) => {
+            const row = songRow({ ...value, origin: value.blob ? 'file' : 'source' }, now + i);
+            if (row.origin === 'source') { const dup = have.find(h => h.source === row.source && h.songId === row.songId); if (dup) return null; return row; }
+            let blob;
+            try { blob = Blob.prototype.slice.call(value.blob, 0, undefined, value.blob?.type || ''); } catch { throw Error(`「${row.title}」不是能用的音频文件`); }
+            if (!blob.size) throw Error(`「${row.title}」是空文件`);
+            if (blob.size > MUSIC_LIMITS.file) throw Error(`「${row.title}」太大了（一首最多 ${MUSIC_LIMITS.file / 1024 / 1024} MB）`);
+            const type = String(blob.type || '').toLowerCase();
+            if (type && !type.startsWith('audio/') && !['application/octet-stream', 'video/mp4', 'video/webm', 'video/ogg'].includes(type)) throw Error(`「${row.title}」不是音频文件`);
+            return { ...row, blob, size: blob.size, mime: type };
+        }).filter(Boolean);
+        if (rows.length) await this.music.put(rows);
+        this.emit('music', { library: true });
+        return rows.map(({ blob, ...row }) => row);
+    }
+    async updateSong(id, patch = {}) {
+        const saved = await this.music.change(id, row => {
+            if ('title' in patch) { const t = String(patch.title || '').trim().slice(0, 200); if (!t) throw Error('歌名不能空着'); row.title = t; }
+            if ('artist' in patch) row.artist = String(patch.artist || '').trim().slice(0, 200);
+            if ('lyric' in patch) { if (patch.lyric) row.lyric = String(patch.lyric).slice(0, 60000); else delete row.lyric; }
+        });
+        this.emit('music', { library: true });
+        const { blob, ...row } = saved; return row;
+    }
+    async deleteSongs(ids) { for (const id of ids) await this.music.remove(id); this.emit('music', { library: true }); return true; }
+    /** A song asked for by name (<bgm>, a shared song): the 歌单 first, then the first fitting search result. */
+    async findSong(want) {
+        // The 歌单 only when the title is the same (晴天 is not 晴天（Live）); a search may be looser.
+        const mine = bestMatch((await this.listSongs()).filter(s => matchScore(s, want) >= 2), want);
+        if (mine) return mine;
+        if (!this.settings.music.sources.some(s => s.enabled)) return null;
+        const { songs } = await this.searchMusic([want.title, want.artist].filter(Boolean).join(' ')).catch(() => ({ songs: [] }));
+        // Nothing by that name: the search's first song stands in, marked so the player shows what really plays.
+        const match = bestMatch(songs, want), found = match || songs[0];
+        return found ? { origin: 'source', source: found.source, songId: found.id, title: found.title, artist: found.artist, ...(match ? {} : { standIn: true }) } : null;
+    }
     saveSounds(patch) {
-        const next = this.getState(), allowed = ['enabled', 'ambienceVolume', 'sfxVolume', 'vary', 'generate', 'versions', 'pack', 'packHidden'];
+        const next = this.getState(), allowed = ['enabled', 'ambienceVolume', 'sfxVolume', 'vary', 'tapOnly', 'generate', 'versions', 'pack', 'packHidden'];
         next.sounds = normalizeSounds({ ...next.sounds, ...Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key))) });
         return this.save(next).sounds;
     }
     /** The shipped pack, read once (none when the plugin has no sounds folder or it cannot be read). */
     packAll() {
         if (!this.soundPack) return Promise.resolve([]);
-        this.packLoad ||= this.imageFetch(new URL('pack.json', this.soundPack).href).then(r => r.ok ? r.json() : null).then(pack => packRows(pack, this.soundPack)).catch(() => { this.packLoad = null; return []; });
+        this.packLoad ||= this.assetFetch(new URL('pack.json', this.soundPack).href).then(r => r.ok ? r.json() : null).then(pack => packRows(pack, this.soundPack)).catch(() => { this.packLoad = null; return []; });
         return this.packLoad;
     }
     /** The shipped sounds in use: none while the pack is off, and not the ones taken out. */
@@ -1331,7 +1527,7 @@ export class TTSBackend {
         if (String(id).startsWith('pack:')) {
             const row = (await this.packAll()).find(r => r.id === id);
             if (!row) return null;
-            const r = await this.imageFetch(row.url);
+            const r = await this.assetFetch(row.url);
             if (!r.ok) throw Error('读不到自带的声音（' + r.status + '）');
             return r.blob();
         }
@@ -1343,9 +1539,14 @@ export class TTSBackend {
     async addSounds(list) {
         this.assertOpen();
         const at = Date.now(), rows = (Array.isArray(list) ? list : [list]).map((value, i) => {
-            const row = soundRow(value), blob = value?.blob;
+            const row = soundRow(value);
             if (!row.name) throw Error('给声音起个名字');
-            if (!(blob instanceof Blob) || !blob.size) throw Error(`「${row.name}」不是能用的音频文件`);
+            // Files selected in the phone iframe belong to another window, so instanceof Blob rejects them.
+            // Native slice validates Blob's internal data across realms and gives storage a local Blob.
+            let blob;
+            try { blob = Blob.prototype.slice.call(value?.blob, 0, undefined, value?.blob?.type || ''); }
+            catch { throw Error(`「${row.name}」不是能用的音频文件`); }
+            if (!blob.size) throw Error(`「${row.name}」不是能用的音频文件`);
             if (blob.size > SOUND_LIMITS.file) throw Error(`「${row.name}」太大了（单个声音最多 ${SOUND_LIMITS.file / 1024 / 1024} MB）`);
             const type = String(blob.type || '').toLowerCase();
             if (type && !type.startsWith('audio/') && !['application/octet-stream', 'video/webm', 'video/ogg'].includes(type)) throw Error(`「${row.name}」不是音频文件`);
@@ -1428,6 +1629,177 @@ export class TTSBackend {
         await this.addSounds(add);
         return { added: add.length, skipped: pack.sounds.length - add.length, name: pack.name };
     }
+    // ---------- 助手 ----------
+    /** Assistant settings never contain chat history or the tavern's assembled request context. */
+    saveAssistant(patch) {
+        validateAssistantPatch(patch);
+        const next = this.getState();
+        const proposed = { ...next.assistant, ...clone(patch) };
+        if (proposed.activePreset !== 'companion' && !proposed.presets.some(p => p.id === proposed.activePreset)) throw Error('请选择存在的助手预设');
+        next.assistant = normalizeAssistant(proposed);
+        const result = this.save(next).assistant;
+        this.emit('assistant', { settings: true });
+        return result;
+    }
+    /** Assistant conversations belong to this account, independently of the open story/card. */
+    async assistantThreads() { this.assertOpen(); return (await this.apps.list('assistant')).map(assistantSummary); }
+    async assistantThread(id) {
+        this.assertOpen();
+        const thread = await this.apps.get(assistantId(id));
+        return thread?.kind === 'assistant' ? assertAssistantThread(thread) : null;
+    }
+    // Assistant books share the conversation's database so edits and summary commits can
+    // check the same revision in one transaction. Chat books keep their existing database.
+    async assistantMemoryData(id, vector = false) {
+        this.assertOpen(); assistantId(id);
+        const key = vector ? 'vec:' + id : bookId(id), rows = await this.apps.getMany([id, key]);
+        const thread = rows.get(id), doc = rows.get(key);
+        if (thread?.kind !== 'assistant' || !doc || doc.memoryRevision !== (thread.memoryRevision || 0)) return vector ? null : emptyBook(id);
+        return doc;
+    }
+    assistantMemoryBook(id) { return this.assistantMemoryData(id); }
+    assistantMemoryVectors(id) { return this.assistantMemoryData(id, true); }
+    async assistantMemoryChange(id, change, name = '', expectedRevision, expectedMemoryRevision) {
+        this.assertOpen(); assistantId(id);
+        const key = bookId(id);
+        const saved = await this.apps.changeRelated(id, [key], (thread, docs) => {
+            assertAssistantThread(thread);
+            if ((expectedRevision !== undefined && (thread.revision || 0) !== expectedRevision) || (expectedMemoryRevision !== undefined && (thread.memoryRevision || 0) !== expectedMemoryRevision)) throw Error('助手会话或记忆已变化，这次整理没有写入');
+            const old = docs.get(key), current = old?.memoryRevision === (thread.memoryRevision || 0) ? old : emptyBook(id, name);
+            const next = {...cleanBook(change(clone(current))), memoryRevision: thread.memoryRevision || 0};
+            next.threadId = id; next.id = key;
+            thread.at = thread.updatedAt = Math.max(Date.now(), (thread.updatedAt || 0) + 1);
+            docs.set(key, next); return next;
+        });
+        this.emit('memory', {threadId: id, persisted: true});
+        return saved;
+    }
+    async assistantMemorySaveVectors(id, doc, expectedRevision, expectedMemoryRevision) {
+        this.assertOpen(); assistantId(id);
+        const key = 'vec:' + id;
+        return this.apps.changeRelated(id, [key], (thread, docs) => {
+            assertAssistantThread(thread);
+            if ((expectedRevision !== undefined && (thread.revision || 0) !== expectedRevision) || (expectedMemoryRevision !== undefined && (thread.memoryRevision || 0) !== expectedMemoryRevision)) throw Error('助手会话或记忆已变化，检索缓存没有写入');
+            const next = {...clone(doc), id: key, kind: 'vectors', threadId: id, at: Date.now(), memoryRevision: thread.memoryRevision || 0};
+            docs.set(key, next); return next;
+        });
+    }
+    async assistantMemoryRevise(id, change = null) {
+        this.assertOpen(); assistantId(id);
+        const key = bookId(id), vector = 'vec:' + id;
+        const saved = await this.apps.changeRelated(id, [key, vector], (thread, docs) => {
+            assertAssistantThread(thread);
+            const old = docs.get(key), current = old?.memoryRevision === (thread.memoryRevision || 0) ? old : emptyBook(id, thread.title);
+            const next = change ? cleanBook(change(clone(current))) : null;
+            thread.memoryRevision = (thread.memoryRevision || 0) + 1;
+            thread.at = thread.updatedAt = Math.max(Date.now(), (thread.updatedAt || 0) + 1);
+            if (next) { next.threadId = id; next.id = key; next.memoryRevision = thread.memoryRevision; }
+            docs.set(key, next); docs.set(vector, null);
+            return next || emptyBook(id, thread.title);
+        });
+        this.emit('memory', {threadId: id, reset: true, persisted: true}); return saved;
+    }
+    assistantMemoryForget(id) { return this.assistantMemoryRevise(id).then(() => {}); }
+    async newAssistantThread() {
+        this.assertOpen();
+        const now = Date.now(), thread = { id: 'assistant:' + crypto.randomUUID(), kind: 'assistant', title: '新对话', createdAt: now, updatedAt: now, at: now, messages: [] };
+        const [saved] = await this.apps.put([thread]);
+        this.emit('assistant', { threadId: saved.id, persisted: true });
+        return saved;
+    }
+    async appendAssistantMessage(id, value, expectedLastId, expectedRevision) {
+        this.assertOpen();
+        if (expectedLastId != null && (typeof expectedLastId !== 'string' || !expectedLastId.trim() || expectedLastId.length > 200)) throw Error('助手消息定位无效');
+        const message = assistantMessage(value);
+        const saved = await this.apps.change(assistantId(id), thread => {
+            assertAssistantThread(thread);
+            if (expectedRevision !== undefined && (thread.revision || 0) !== expectedRevision) throw Error('助手会话已变化，这次回复没有写入');
+            // Check and append share the same IndexedDB readwrite transaction, including across tabs.
+            if (expectedLastId != null && thread.messages.at(-1)?.id !== expectedLastId) throw Error('助手会话已变化，这次回复没有写入');
+            if (thread.messages.length >= ASSISTANT_LIMITS.messages) throw Error('这条助手会话已达到 500 条消息，请新建对话后继续');
+            const now = Math.max(Date.now(), Number(thread.updatedAt || thread.at) + 1);
+            message.at = now;
+            if (message.role === 'user' && !thread.titleEdited && !thread.messages.some(item => item.role === 'user')) thread.title = (message.text || message.attachments?.[0]?.name || '新对话').replace(/\s+/g, ' ').slice(0, ASSISTANT_LIMITS.title);
+            thread.messages.push(message);
+            thread.revision = (thread.revision || 0) + 1;
+            thread.at = thread.updatedAt = now;
+        });
+        this.emit('assistant', { threadId: saved.id, persisted: true });
+        return saved;
+    }
+    async mutateAssistantThread(id, mutate, {history = true} = {}) {
+        this.assertOpen();
+        const saved = await this.apps.changeRelated(assistantId(id), [bookId(id), 'vec:' + id], (thread, docs) => {
+            assertAssistantThread(thread); mutate(thread);
+            if (history) {
+                thread.revision = (thread.revision || 0) + 1;
+                thread.memoryRevision = (thread.memoryRevision || 0) + 1;
+                docs.set(bookId(id), null); docs.set('vec:' + id, null);
+            }
+            thread.at = thread.updatedAt = Math.max(Date.now(), Number(thread.updatedAt || thread.at) + 1);
+            return thread;
+        });
+        this.emit('assistant', { threadId: saved.id, persisted: true, ...(history ? {memoryReset: true} : {}) }); return saved;
+    }
+    async renameAssistantThread(id, title) {
+        if (typeof title !== 'string' || !title.trim() || title.trim().length > ASSISTANT_LIMITS.title) throw Error('会话名字请填写 1–80 个字符');
+        return this.mutateAssistantThread(id, thread => { thread.title = title.trim(); thread.titleEdited = true; }, {history: false});
+    }
+    async editAssistantMessage(id, messageId, text, expectedText) {
+        if (typeof text !== 'string' || text.length > ASSISTANT_LIMITS.text) throw Error('消息格式无效或超过 100000 字符');
+        return this.mutateAssistantThread(id, thread => {
+            const message = thread.messages.find(m => m.id === messageId);
+            if (message?.role !== 'user') throw Error('只能编辑自己发送的消息');
+            if (expectedText !== undefined && message.text !== expectedText) throw Error('这条消息已经被修改，请重新打开编辑');
+            if (!text.trim() && !message.attachments?.length) throw Error('消息不能为空');
+            message.text = text.trim(); message.editedAt = Date.now();
+        });
+    }
+    async deleteAssistantMessage(id, messageId) {
+        return this.mutateAssistantThread(id, thread => {
+            const index = thread.messages.findIndex(m => m.id === messageId);
+            if (index < 0) throw Error('这条消息已经不在了');
+            thread.messages.splice(index, 1);
+        });
+    }
+    async selectAssistantVariant(id, messageId, selected) {
+        return this.mutateAssistantThread(id, thread => {
+            const message = thread.messages.find(m => m.id === messageId), variants = message?.variants;
+            if (message?.role !== 'assistant' || !Array.isArray(variants) || !Number.isInteger(selected) || !variants[selected]) throw Error('这个回复版本已经不在了');
+            message.selected = selected;
+            message.text = variants[selected].text; message.meta = variants[selected].meta; message.at = variants[selected].at;
+        });
+    }
+    async addAssistantVariant(id, messageId, value, expectedRevision) {
+        const result = assistantMessage({...value, role: 'assistant'});
+        return this.mutateAssistantThread(id, thread => {
+            if ((thread.revision || 0) !== expectedRevision) throw Error('助手会话已变化，这次回复没有写入');
+            const message = thread.messages.find(m => m.id === messageId);
+            if (message?.role !== 'assistant') throw Error('这条回复已经不在了');
+            const variants = message.variants || [{text: message.text, at: message.at, ...(message.meta ? {meta: message.meta} : {})}];
+            if (variants.length >= ASSISTANT_LIMITS.variants) throw Error('这条消息已有 20 个回复版本');
+            variants.push({text: result.text, at: result.at, meta: result.meta});
+            message.variants = variants; message.selected = variants.length - 1;
+            message.text = result.text; message.meta = result.meta; message.at = result.at;
+        });
+    }
+    async clearAssistantThread(id) {
+        return this.mutateAssistantThread(id, thread => {
+            thread.messages = [];
+            thread.titleEdited = false;
+            thread.title = '新对话';
+        });
+    }
+    async deleteAssistantThread(id) {
+        this.assertOpen();
+        const threadId = assistantId(id), thread = await this.apps.get(threadId);
+        if (!thread) return false;
+        assertAssistantThread(thread);
+        await this.apps.removeMany([threadId, bookId(threadId), 'vec:' + threadId]);
+        this.noteGone('assistant', [threadId], Math.max(thread.restoredAt || 0, thread.updatedAt || 0));
+        this.emit('assistant', { threadId, deleted: true, persisted: true });
+        return true;
+    }
     // ---------- 朋友圈 ----------
     /** Moments options: {auto, every, dailyMax, images, replyToMe}. */
     saveMoments(patch) {
@@ -1444,28 +1816,47 @@ export class TTSBackend {
         // The card's own characters belong to it (so they do not show up in other cards as roles no story has met).
         if (next.key && next.members.length) this.tagRoles(next.members, next.key);
         this.emit('space', { space: clone(next) });
+        this.emit('settings', { state: this.cardState() });
         if (!this.here()) return;
         this.emit('chat', { threadId: '' }); this.emit('moments', {}); this.emit('forum', {}); this.emit('peek', {});
     }
     /** The space lists are filtered by, or null when 分区 is off (or no card is open). */
     here() { return activeSpace(this.settings, this.space); }
-    /** The key new items are made under ('' = shared). */
+    /** The key lists are filtered and 查手机 is stored by ('' = shared, also when 分区 is off). */
     spaceKey() { return this.here()?.key || ''; }
+    /** The card open now, whether 分区 is on or not: new things remember the card they were made in, so turning 分区 on
+     *  later sorts them. ('' when no card is open: shared.) */
+    cardKey() { return this.space.key || ''; }
+    /** Who the picture rules name: the open card's people and the given speakers (null: everyone). */
+    drawCast(speakers = []) { return drawCast(this.cardState(), this.space, speakers); }
     /** The roles that speak in a card's story belong to that card's contacts. Saved only when something changed. */
     tagRoles(names, key = this.space.key) {
         if (!key || !names?.length) return false;
-        const want = new Set(names.map(String)), next = this.getState();
+        const want = [...new Set(names.map(n => String(n || '').trim()).filter(n => n && !isPlaceholderRole(n) && n !== NARRATOR))];
+        if (!want.length) return false;
+        const next = this.getState();
         let changed = false;
-        for (const route of next.routes) {
-            if (!want.has(route.name)) continue;
-            const cards = Array.isArray(route.cards) ? route.cards : [];
-            if (!cards.includes(key)) { route.cards = [...cards, key].slice(-100); changed = true; }
+        for (const name of want) {
+            const route = findRoute(cardRoutes(next.routes, key), name);
+            if (!route) {
+                next.routes.push(normalizeRoute({ id: crypto.randomUUID(), name, engine: 'fish', voice: '', model: '', language: '', card: key, cards: [key] }));
+                changed = true;
+            }
         }
         if (changed) this.save(next);
         return changed;
     }
     /** Contacts of the card open now (all of them when 分区 is off). */
     contacts() { return chatContacts(this.settings, this.here()); }
+    /** Who 论坛 and 朋友圈 write about. With 分区 on: the open card's own people (its characters, roles met in its
+     *  story or added to it, contacts added under it), not the roles no story has met yet, which can be added from
+     *  联系人 →「＋」. All contacts when that leaves no one. */
+    crowd() {
+        const here = this.here(), all = this.contacts();
+        if (!here) return all;
+        const own = all.filter(c => c.source === 'manual' || (here.members || []).includes(c.name) || this.routesHere(here.key).some(r => r.name === c.name));
+        return own.length ? own : all;
+    }
     /** Phone chats of the card open now. */
     async threads() { const here = this.here(); return (await this.chats.list()).filter(t => inSpace(t, here)); }
     /** Removes what was made under the open card (or everything, with 分区 off). */
@@ -1487,16 +1878,17 @@ export class TTSBackend {
         return result;
     }
     /** New posts from the board (characters and strangers), with made-up likes and 热度; the oldest go past the limit. */
-    async addForumPosts(posts, { source = 'auto' } = {}) {
+    async addForumPosts(posts, { source = 'auto', space = this.cardKey() } = {}) {
         // The first post the model wrote is shown on top (newest first).
         const now = Date.now(), id = () => crypto.randomUUID();
-        const docs = posts.map((p, i) => cleanForumPost({ ...p, source, space: this.spaceKey(), ...(source === 'me' ? { likes: 0, heat: 1 } : startingHeat(p)) }, id(), now - i * 10, id));
+        const docs = posts.map((p, i) => cleanForumPost({ ...p, source, space, ...(source === 'me' ? { likes: 0, heat: 1 } : startingHeat(p)) }, id(), now - i * 10, id));
         return this.appsMutate('forum', () => this.apps.put(docs, { keep: FORUM_LIMITS.posts }));
     }
-    async setForumHot(topics) {
+    /** id: the 热搜 of the card the request was made for (hotId() when it was asked). */
+    async setForumHot(topics, id = this.hotId()) {
         const list = [...new Set((topics || []).map(t => String(t).trim().slice(0, 40)).filter(Boolean))].slice(0, FORUM_LIMITS.hot);
         if (!list.length) return [];
-        await this.appsMutate('forum', () => this.apps.put([{ id: this.hotId(), kind: 'forum-hot', at: Date.now(), topics: list }]));
+        await this.appsMutate('forum', () => this.apps.put([{ id, kind: 'forum-hot', at: Date.now(), topics: list }]));
         return list;
     }
     /** Replies added under a post; each one makes it a little hotter. */
@@ -1511,8 +1903,9 @@ export class TTSBackend {
         }));
     }
     // ---------- 查手机 ----------
-    /** A character's phone as the model made it up; replaces the earlier one of the same person. */
-    async savePeek(snapshot) { const doc = cleanPeek({ ...snapshot, space: this.spaceKey() }, Date.now()); return (await this.appsMutate('peek', () => this.apps.put([doc])))[0]; }
+    /** A character's phone as the model made it up; replaces the earlier one of the same person. space: the card it was
+     *  looked at under (spaceKey() when the look began; the tavern may have moved to another card while it was written). */
+    async savePeek(snapshot, space = this.spaceKey()) { const doc = cleanPeek({ ...snapshot, space }, Date.now()); return (await this.appsMutate('peek', () => this.apps.put([doc])))[0]; }
 
     /** Runs a change to the moments and tells the phone. */
     async momentsMutate(task) {
@@ -1526,6 +1919,50 @@ export class TTSBackend {
         const result = await task();
         this.emit('chat', { threadId });
         return result;
+    }
+    // ---------- 删好友 ----------
+    /** The private chat with `name` on this card (made when there is none yet). */
+    async dmThread(name) {
+        const here = currentDm(await this.threads(), name);
+        return here || this.chats.create({ type: 'dm', members: [name], space: this.cardKey() });
+    }
+    /** The user deletes a contact: the chat is put away (kept), and what they send meanwhile becomes 好友申请. */
+    async unfriend(name) {
+        this.assertOpen();
+        if (!this.contacts().some(c => c.name === name)) throw Error(`联系人里没有「${name}」`);
+        const thread = await this.dmThread(name);
+        const saved = await this.chats.update(thread.id, { friend: { by: 'me', at: Date.now(), requests: [] }, pinned: false });
+        this.emit('chat', { threadId: thread.id, friend: true });
+        return saved;
+    }
+    /** Adds a deleted contact back: the chat comes back, with the 好友申请 they sent in it. */
+    async refriend(threadId) {
+        this.assertOpen();
+        const thread = await this.chats.get(threadId);
+        if (thread?.friend?.by !== 'me') throw Error('TA 已经是你的好友了');
+        const name = thread.members[0], requests = thread.friend.requests || [];
+        await this.chats.append(threadId, [{ from: 'me', kind: 'system', text: `你已添加了${name}，现在可以开始聊天了` }, ...requests.map(r => ({ from: name, kind: 'text', text: r.text }))], { read: true });
+        const saved = await this.chats.update(threadId, { friend: null });
+        this.emit('chat', { threadId, friend: true });
+        return saved;
+    }
+    /** What a deleted contact sends arrives as 好友申请 (kept until the user adds them back). */
+    async friendRequest(threadId, texts) {
+        this.assertOpen();
+        const saved = await this.chats.addRequest(threadId, texts);
+        this.emit('chat', { threadId, friend: true, request: true });
+        return saved;
+    }
+    /** The user's messages to someone who deleted them: sent, then refused with the usual note. */
+    async appendChat(id, messages, options) {
+        const thread = await this.chats.get(id);
+        let saved = await this.chats.append(id, messages, options);
+        if (thread?.friend?.by === 'them' && messages.some(m => m?.from === 'me' && m.kind !== 'system')) {
+            const name = thread.members[0];
+            saved = await this.chats.append(id, [{ from: 'me', kind: 'system', text: `消息已发出，但被对方拒收了。${name}开启了好友验证，你还不是TA的好友。请先发送好友申请，对方通过后才能聊天。` }], { read: true });
+        }
+        this.emit('chat', { threadId: id });
+        return saved;
     }
     /** Plays one voice message through the normal player (cache, favourites and the island all work). */
     speak(line) {
@@ -1556,6 +1993,7 @@ export class TTSBackend {
         const keys = Array.isArray(sources) && sources.length ? sources.filter(k => found.sources[k]) : Object.keys(found.sources);
         const gone = new Set(keys.flatMap(k => found.sources[k].ids));
         for (const id of gone) await this.library.deletePhoto(id);
+        this.noteGone('photos', [...gone]);
         if (gone.size) await this.#forgetPhotos(gone);
         this.emit('library', { collection: 'photos' });
         this.emit('phone', { preferences: await this.getPhone() });
@@ -1564,17 +2002,25 @@ export class TTSBackend {
     async #forgetPhotos(gone) {
         let posts = 0;
         for (const post of await this.moments.list()) {
-            if (!gone.has(post.photoId)) continue;
-            await this.moments.setImage(post.id, post.imageTags ? { photoId: '', imageState: 'failed', imageNote: '配图已清理' } : { photoId: '' });
+            if (![post.photoId, ...(post.imageVersions || [])].some(id => gone.has(id))) continue;
+            const imageVersions = [...new Set([...(post.imageVersions || []), post.photoId].filter(id => id && !gone.has(id)))];
+            const photoId = gone.has(post.photoId) ? imageVersions.at(-1) || '' : post.photoId;
+            await this.moments.setImage(post.id, photoId ? { photoId, imageVersions } : post.imageTags ? { photoId: '', imageVersions, imageState: 'failed', imageNote: '配图已清理' } : { photoId: '', imageVersions });
             posts++;
         }
         if (posts) this.emit('moments', {});
         // Photos in the phone chats: a drawn one can be drawn again; one of the album goes back to its words.
         for (const summary of await this.chats.list()) {
-            const thread = await this.chats.get(summary.id);
-            const hit = (thread?.messages || []).filter(m => m.kind === 'photo' && gone.has(m.photoId));
-            for (const m of hit) await this.chats.updateMessage(thread.id, m.id, m.imageTags ? { photoId: '', imageState: 'failed', imageNote: '图片已清理' } : { photoId: '' });
-            if (hit.length) this.emit('chat', { threadId: thread.id });
+            await this.chatMutate(summary.id, async () => {
+                const thread = await this.chats.get(summary.id);
+                const hit = (thread?.messages || []).filter(m => m.kind === 'photo' && [m.photoId, ...(m.imageVersions || [])].some(id => gone.has(id)));
+                for (const m of hit) {
+                    const imageVersions = [...new Set([...(m.imageVersions || []), m.photoId].filter(id => id && !gone.has(id)))];
+                    const photoId = gone.has(m.photoId) ? imageVersions.at(-1) || '' : m.photoId;
+                    await this.chats.updateMessage(thread.id, m.id, {photoId, imageVersions, imageState: photoId ? 'done' : 'failed', imageNote: photoId ? '' : '图片已清理'});
+                }
+                if (hit.length) this.emit('chat', { threadId: thread.id });
+            });
         }
         const snaps = (await this.apps.list('peek')).filter(doc => [...(doc.photos || []), doc.wallpaper].some(p => p && gone.has(p.photoId)));
         const strip = p => { if (!p || !gone.has(p.photoId)) return p; const { photoId, state, note, ...rest } = p; return rest; };
@@ -1644,14 +2090,17 @@ export class TTSBackend {
         engineCheck(engine); modelCheck(engine, connection.model);
         const current = clone(connection); TTSParameters.normalize(engine, current);
         const catalog = clone(TTSParameters.catalogs[engine]);
-        catalog.models = catalog.models.map(id => ({ id, supported: id !== 'drama-3-preview', reason: id === 'drama-3-preview' ? '尚未接入 Fish 兼容通道' : '' }));
+        catalog.models = catalog.models.map(id => ({ id, supported: true, reason: '' }));
+        // Models only on Fish's own /v1/tts: without a relay they go through the tavern's proxy, which must be on.
+        const native = engine === 'fish' && TTSParameters.fishBase(current) === FISH_API ? catalog.models.filter(m => TTSParameters.fishNative({ ...current, model: m.id })).map(m => m.id) : [];
+        catalog.modelNote = native.length && tauriTavern() ? `${native.join('、')} 现在只在 Fish 自己的接口上，网页不能直接调用。TauriTavern 现在还没有酒馆的转发功能，要在下面的「中转」里填一个 Fish 格式的中转才能用这个模型；TauriTavern 以后加上转发，或者 Fish 把它放进网页能用的接口，就不用中转了。` : native.length ? `${native.join('、')} 现在只在 Fish 自己的接口上，网页不能直接调用，要借酒馆转发：在酒馆的 config.yaml 里把 enableCorsProxy 改成 true，然后重启酒馆（用中转的不用改）。Fish 把它放进网页能用的接口以后会自动直连。` : '';
         catalog.groups = catalog.groups.map(group => ({ ...group, fields: group.fields.map(field => ({
             ...field, ...(field.type === 'select' ? { options: TTSParameters.allowed(engine, field, current) } : {}),
             unavailable: TTSParameters.unavailable(engine, field, current),
             ...(field.key === 'references' ? { help: '参考音频保存在当前浏览器，按酒馆账户隔离。' } : {}),
             ...(field.key === 'samples' ? { help: '上传 mp3 或 wav（编码后不超过 10 MB），起个名字，角色的音色填这个名字。保存在当前浏览器，按酒馆账户隔离。' } : {}),
         })) }));
-        return { engine, ...catalog, connection: current, tags: TTSParameters.tags(engine, current.model), tagNote: TTSParameters.tagNote(engine, current.model), sounds: current.model === 's1' && engine === 'fish' ? [...TTSParameters.vocab.FISH_S1_TONES, ...TTSParameters.vocab.FISH_S1_SOUNDS] : [], sourceDate: '2026-09-30' };
+        return { engine, ...catalog, connection: current, tags: TTSParameters.tags(engine, current.model), tagNote: TTSParameters.tagNote(engine, current.model), sounds: current.model === 's1' && engine === 'fish' ? [...TTSParameters.vocab.FISH_S1_TONES, ...TTSParameters.vocab.FISH_S1_SOUNDS] : [], sourceDate: engine==='doubao'?'2026-10-18':'2026-09-30' };
     }
     audioInfo(audio) {
         return { key: audio.key, line: clone(audio.line), route: clone(audio.route), bytes: audio.blob.size, fromCache: audio.fromCache };
@@ -1685,6 +2134,24 @@ export class TTSBackend {
         this.emit('library', { collection: 'favorites' });
         return favorite;
     }
+    /**
+     * 自己的接口 → 试一试: one line said with the first voice of the settings being edited (saved or not), so the
+     * address, the body and the answer can be checked before any role uses them. {voice, bytes, type}.
+     */
+    async customTest(connection) {
+        this.assertOpen();
+        this.player.stop('试一试自己的接口');
+        const unlock = Promise.resolve(this.player.sink.unlock?.());
+        const c = clone(connection || this.settings.connections.custom), voice = (c.params?.voices || []).find(v => String(v.name || '').trim());
+        const lang = languageCode(this.settings.general.defaultLanguage || 'zh').split('-')[0] || 'zh';
+        const text = ({ zh: '你好，这是一句试音。', ja: 'こんにちは、テストです。', en: 'Hello, this is a test.', ko: '안녕하세요, 테스트입니다.' })[lang] || '你好，这是一句试音。';
+        const request = buildRequest('custom', c, { voice: voice ? String(voice.name).trim() : '', language: lang }, { text, emotion: '' });
+        // A first line may load the voice's model: as long as a line in the story may take (two minutes).
+        const [blob] = await Promise.all([this.providers.synthesize(request, new AbortController().signal), unlock]);
+        this.assertOpen();
+        this.player.playBlob(blob, { speaker: voice ? String(voice.name).trim() : '自己的接口', engine: 'custom', line: { role: voice ? String(voice.name).trim() : '', text, translation: '', emotion: '' } });
+        return { voice: voice ? String(voice.name).trim() : '', bytes: blob.size, type: blob.type };
+    }
     async playFavorite(id) {
         this.assertOpen();
         // Unlock is called during the original click, before the database await.
@@ -1698,126 +2165,8 @@ export class TTSBackend {
         this.player.playBlob(favorite.blob, { speaker: favorite.role, engine: favorite.engine, requestKey: favorite.requestKey,
             line: { role: favorite.role, text: favorite.text, translation: favorite.translation, emotion: '' } });
     }
-    saveVoiceLibrary(list) {
-        const next = this.getState();
-        next.voiceLibrary = sortVoiceLibrary((list || []).map(normalizeLibraryEntry).filter(Boolean));
-        return this.save(next);
-    }
-    mergeVoiceLibrary(incoming) {
-        const next = this.getState();
-        const { added, overwritten, list } = mergeVoiceLibrary(next.voiceLibrary, incoming);
-        next.voiceLibrary = list;
-        this.save(next);
-        return { added, overwritten, count: list.length };
-    }
-    parseVoiceLibraryText(text) {
-        return parseVoiceLibraryText(text);
-    }
-    auditionVoice(voiceId, language = 'zh') {
-        const temporary = this.getState();
-        const route = normalizeRoute({
-            id: 'audition-voice',
-            name: '试听音色',
-            engine: 'fish',
-            voice: String(voiceId || '').trim(),
-            model: '',
-            language
-        });
-        temporary.routes = [route];
-        const revision = this.revision;
-        const text = ({ zh: '雨还没停，再坐一会儿吧。', en: 'The rain has not stopped. Stay a little longer.', ja: '雨はまだ止んでいません。もう少しここにいましょう。', ko: '비가 아직 그치지 않았어요.' })[languageCode(language || temporary.general.defaultLanguage)] || 'Hello.';
-        this.player.start([{ role: route.name, emotion: 'calm', text, translation: '' }], () => !this.closed && revision === this.revision, temporary);
-    }
-    saveVoicePreset(name, defaultVoice, voices) {
-        const trimmed = String(name || '').trim();
-        if (!trimmed) throw Error('预设名称不能为空');
-        const next = this.getState();
-        next.voicePresets = next.voicePresets || {};
-        next.voicePresets[trimmed] = {
-            name: trimmed,
-            defaultVoice: String(defaultVoice !== undefined ? defaultVoice : (next.defaultVoice || '')).trim(),
-            voices: clone(voices || next.routes || []),
-            updatedAt: Date.now()
-        };
-        next.activeVoicePreset = trimmed;
-        return this.save(next);
-    }
-    applyVoicePreset(name) {
-        const next = this.getState();
-        const preset = next.voicePresets?.[name];
-        if (!preset) throw Error('音声预设不存在：' + name);
-        this.player.stop('应用音声预设');
-        if (preset.defaultVoice !== undefined) next.defaultVoice = String(preset.defaultVoice || '').trim();
-        if (Array.isArray(preset.voices)) {
-            next.routes = preset.voices.map(normalizeRoute);
-        } else if (preset.voices && typeof preset.voices === 'object') {
-            const routes = [];
-            for (const [sName, sVal] of Object.entries(preset.voices)) {
-                if (!sName) continue;
-                if (typeof sVal === 'string') {
-                    routes.push(normalizeRoute({ id: crypto.randomUUID(), name: sName, engine: 'fish', voice: sVal.trim(), model: '' }));
-                } else if (sVal && typeof sVal === 'object') {
-                    const forms = {};
-                    if (sVal.forms && typeof sVal.forms === 'object') {
-                        for (const [fName, fVoice] of Object.entries(sVal.forms)) {
-                            const vStr = typeof fVoice === 'string' ? fVoice : (fVoice?.voice || '');
-                            if (vStr) forms[fName] = { voice: vStr.trim(), model: '' };
-                        }
-                    }
-                    routes.push(normalizeRoute({
-                        id: crypto.randomUUID(),
-                        name: sName,
-                        engine: 'fish',
-                        voice: String(sVal.default || sVal.voice || '').trim(),
-                        model: '',
-                        forms
-                    }));
-                }
-            }
-            next.routes = routes;
-        }
-        next.activeVoicePreset = name;
-        return this.save(next);
-    }
-    deleteVoicePreset(name) {
-        const next = this.getState();
-        if (next.voicePresets?.[name]) {
-            delete next.voicePresets[name];
-            if (next.activeVoicePreset === name) next.activeVoicePreset = '';
-            return this.save(next);
-        }
-        return next;
-    }
-    renameVoicePreset(oldName, newName) {
-        const trimmed = String(newName || '').trim();
-        if (!trimmed) throw Error('新预设名称不能为空');
-        const next = this.getState();
-        if (!next.voicePresets?.[oldName]) throw Error('预设不存在：' + oldName);
-        if (trimmed !== oldName && next.voicePresets[trimmed]) throw Error('已有同名预设：' + trimmed);
-        const preset = next.voicePresets[oldName];
-        delete next.voicePresets[oldName];
-        preset.name = trimmed;
-        preset.updatedAt = Date.now();
-        next.voicePresets[trimmed] = preset;
-        if (next.activeVoicePreset === oldName) next.activeVoicePreset = trimmed;
-        return this.save(next);
-    }
-    setDefaultVoice(voiceId) {
-        const next = this.getState();
-        next.defaultVoice = String(voiceId || '').trim();
-        return this.save(next);
-    }
-    setAutoVoice(enabled) {
-        const next = this.getState();
-        next.autoVoice = !!enabled;
-        return this.save(next);
-    }
-    matchAutoVoice(profile) {
-        const state = this.getState();
-        return pickAutoVoice(profile, state.voiceLibrary, profile?.language || state.general.defaultLanguage || 'zh');
-    }
     audition(route) {
-        const temporary = this.getState();
+        const temporary = this.cardState();
         route = normalizeRoute(clone(route));
         if (!route.name?.trim() || isPlaceholderRole(route.name)) throw Error('请填写实际角色名');
         route.name = route.name.trim();
@@ -1846,6 +2195,7 @@ export class TTSBackend {
     async deletePhotos(ids) {
         const gone = new Set((Array.isArray(ids) ? ids : [ids]).map(String).filter(Boolean));
         for (const id of gone) await this.library.deletePhoto(id);
+        this.noteGone('photos', [...gone]);
         if (gone.size) await this.#forgetPhotos(gone);
         this.emit('library', { collection: 'photos' });
         this.emit('phone', { preferences: await this.getPhone() });
@@ -1853,29 +2203,55 @@ export class TTSBackend {
     }
     async mutateLibrary(collection, method, ...args) {
         const result = await this.library[method](...args.map(clone));
+        if (method === 'deleteNote') this.noteGone('notes', [args[0]]);
+        if (method === 'deletePhoto') this.noteGone('photos', [args[0]]);
         this.emit('library', { collection });
         if (method === 'deletePhoto') this.emit('phone', { preferences: await this.getPhone() });
         return result;
     }
+    reportDiagnostic(source, detail, level = 'error') {
+        if (this.closed) return;
+        const value = detail && typeof detail.message === 'string' ? {message: detail.message, stack: detail.stack, name: detail.name, ...detail} : detail;
+        const safe = this.requestLog.clean(value), name = String(source || '小手机').slice(0, 80);
+        const signature = JSON.stringify([name, level, safe]);
+        const now = Date.now();
+        if (this.lastDiagnostic?.signature === signature && now - this.lastDiagnostic.at < 1500) return;
+        this.lastDiagnostic = {signature, at: now};
+        const id = this.requestLog.add(name, safe, ['info','warn','error'].includes(level) ? level : 'error');
+        this.requestLog.finish(id, {recorded: true});
+    }
     api() {
         const methods = {
-            getState: () => this.getState(), getSnapshot: () => this.getSnapshot(), save: (next, revision) => this.save(next, revision),
-            updateGeneral: patch => this.updateGeneral(patch), saveRoute: route => this.saveRoute(route), saveVoicePool: list => this.saveVoicePool(clone(list)), deleteRoute: id => this.deleteRoute(id),
-            switchRouteEngine, validRoleName: name => typeof name === 'string' && !!name.trim() && !isPlaceholderRole(name),
+            reportDiagnostic: (source, detail, level) => this.reportDiagnostic(source, detail, level),
+            getRequestLogs: () => this.requestLog.list(), clearRequestLogs: () => this.requestLog.clear(),
+            /** 系统提示词: one block as the user changed it ({enabled?, parts: {key: text}}), or null for the shipped one. */
+            savePromptRule: (id, rule) => {
+                const block = PROMPT_BLOCKS.find(b => b.id === id);
+                if (!block && id !== 'legacy') throw Error('未知提示词');
+                const next = this.getState(); next.promptRules = {...next.promptRules};
+                if (rule === null) delete next.promptRules[id];
+                else if (!rule || typeof rule !== 'object') throw Error('提示词格式无效');
+                else next.promptRules[id] = clone(rule);
+                next.promptRules = normalizePromptRules(next.promptRules);
+                this.save(next);
+            },
+            getState: () => this.cardState(), getSnapshot: () => ({ state: this.cardState(), revision: this.revision }), save: (next, revision) => this.save(next, revision),
+            updateGeneral: patch => this.updateGeneral(patch), saveNarration: patch => this.saveNarration(patch), saveVn: patch => this.saveVn(patch), vnCast: () => this.vnCast(), vnSpriteRequest: (name, options) => clone(spriteRequest(this.cardState(), String(name || ''), clone(options || {}))), saveRoute: route => this.saveRoute(route), saveVoicePool: list => this.saveVoicePool(clone(list)), deleteRoute: id => this.deleteRoute(id),
+            switchRouteEngine, cleanAliases, validRoleName: name => typeof name === 'string' && !!name.trim() && !isPlaceholderRole(name),
             saveConnection: (engine, patch) => this.saveConnection(engine, patch),
             savePreset: preset => this.savePreset(preset), deletePreset: id => this.deletePreset(id), selectPreset: id => this.selectPreset(id),
             validatePreset: preset => { try { validatePreset(preset); return ''; } catch (error) { return message(error); } },
-            previewPrompt: preset => this.previewPrompt(preset), promptPlan: () => clone(promptPlan(this.settings, modelRules(this.settings))), parse: text => this.parse(text),
+            previewPrompt: preset => this.previewPrompt(preset), promptPlan: () => { const s = this.cardState(); return clone(promptPlan(s, modelRules(s))); }, parse: text => this.parse(text),
             voiceBalance: (engine, refresh) => this.voiceBalance(engine, refresh), keyStatus: engine => this.keyStatus(engine), keyHint: engine => this.keyHint(engine), keyPool: engine => this.keyPool(engine), keyList: engine => this.keyList(engine), addKeys: (engine, value) => this.addKeys(engine, value), removeKey: (engine, index) => this.removeKey(engine, index), useKey: (engine, index) => this.useKey(engine, index), setKey: (engine, key) => this.setKey(engine, key), clearKey: engine => this.clearKey(engine),
             saveDraw: patch => this.saveDraw(patch), saveStyle: style => this.saveStyle(style), deleteStyle: id => this.deleteStyle(id),
             imageConnectionList: engine => this.imageConnectionList(engine), saveImageConnection: (engine, patch) => this.saveImageConnection(engine, patch), selectImageConnection: (engine, id) => this.selectImageConnection(engine, id), deleteImageConnection: (engine, id) => this.deleteImageConnection(engine, id),
-            drawReady: () => this.drawReady(), drawMissing: () => this.drawMissing(), paidPrompt: () => this.paidPrompt(), comfyCatalog: url => this.comfyCatalog(url), comfyWorkflows: () => this.comfyWorkflows(), comfyWorkflow: name => this.comfyWorkflow(name),
+            drawReady: () => this.drawReady(), drawMissing: () => this.drawMissing(), paidPrompt: () => this.paidPrompt(), comfyCatalog: url => this.comfyCatalog(url), comfyClips: options => this.comfyClips(options), comfyWorkflows: () => this.comfyWorkflows(), comfyWorkflow: name => this.comfyWorkflow(name),
             saveComfyWorkflow: patch => this.saveComfyWorkflow(patch), selectComfyWorkflow: id => this.selectComfyWorkflow(id), deleteComfyWorkflow: id => this.deleteComfyWorkflow(id),
             comfyLoraInfo: () => this.comfyLoraInfo(), editComfyLoras: change => this.editComfyLoras(clone(change || {})), restoreComfyWorkflow: () => this.restoreComfyWorkflow(),
             comfyLoras: options => this.comfyLoras(options),
             saveDrawPreset: preset => this.saveDrawPreset(preset), deleteDrawPreset: id => this.deleteDrawPreset(id), previewDrawPrompt: preset => this.previewDrawPrompt(preset),
-            naiSubscription: refresh => this.naiSubscription(refresh), naiProbe: () => this.naiProbe(), fishProbe: () => { this.assertOpen(); keyCheck('fish'); return this.providers.probeFish(clone(this.settings.connections.fish)); },
-            listVibes: () => this.listVibes(), compactVibes: () => this.compactVibes(), importVibes: (files, options) => this.importVibes(files, clone(options || {})), updateVibe: (id, patch) => this.updateVibe(id, clone(patch || {})), deleteVibe: id => this.deleteVibe(id), deleteVibes: ids => this.deleteVibes([...(ids || [])]), exportVibes: target => this.exportVibes(clone(target || {})), vibePlan: model => clone(this.vibePlan(model || this.settings.draw.params.model)), drawQuote: params => this.drawQuote(params),
+            naiSubscription: refresh => this.naiSubscription(refresh), naiProbe: () => this.naiProbe(), fishCatalog: () => this.providers.fishCatalog(), fishProbe: () => { this.assertOpen(); keyCheck('fish'); return this.providers.probeFish(clone(this.settings.connections.fish)); },
+            listVibes: () => this.listVibes(), compactVibes: () => this.compactVibes(), importVibes: (files, options) => this.importVibes(files, clone(options || {})), updateVibe: (id, patch) => this.updateVibe(id, clone(patch || {})), deleteVibe: id => this.deleteVibe(id), deleteVibes: ids => this.deleteVibes([...(ids || [])]), exportVibes: target => this.exportVibes(clone(target || {})), vibePlan: model => clone(this.vibePlan(model || this.settings.draw.params.model)), drawQuote: (params, extra) => this.drawQuote(params, extra), naiTool: input => this.naiTool(clone(input || {})),
             generateImage: input => this.generateImage(input).then(({ blob, ...result }) => result),
             drawQueue: () => this.drawQueue.list(), cancelDraw: key => this.drawQueue.cancel(key), cancelAllDraws: () => this.drawQueue.cancelAll(),
             cloudQueueError: () => this.drawQueue.remoteError, testCloudQueue: value => this.testCloudQueue(value), newRoomCode: () => newRoomCode(),
@@ -1886,7 +2262,7 @@ export class TTSBackend {
             previewRequest: (engine, connection, route, line) => { const request = buildRequest(engine, connection || this.settings.connections[engine], route, line, this.providers.references); if (request.body.provider?.options?.['fish-audio']?.references) for (const ref of request.body.provider.options['fish-audio'].references) ref.audio = '[本地参考音频]'; if (request.body.audio?.voice?.startsWith?.('data:')) request.body.audio.voice = '[本地克隆样本：' + route.voice + ']'; return request; },
             status: () => this.player.snapshot(), subscribe: listener => this.subscribe(listener), levels: () => this.player.sink.levels(),
             pendingRole: () => this.player.pending, stop: () => this.player.stop(), toggle: () => this.player.toggle(), resume: () => this.player.continuePending(),
-            saveVoiceLibrary: list => this.saveVoiceLibrary(list), mergeVoiceLibrary: list => this.mergeVoiceLibrary(list), parseVoiceLibraryText: text => this.parseVoiceLibraryText(text), auditionVoice: (id, lang) => this.auditionVoice(id, lang), saveVoicePreset: (name, defV, vList) => this.saveVoicePreset(name, defV, vList), applyVoicePreset: name => this.applyVoicePreset(name), deleteVoicePreset: name => this.deleteVoicePreset(name), renameVoicePreset: (oldN, newN) => this.renameVoicePreset(oldN, newN), setDefaultVoice: v => this.setDefaultVoice(v), setAutoVoice: v => this.setAutoVoice(v), matchAutoVoice: p => this.matchAutoVoice(p), audition: route => this.audition(route), lineState: line => this.player.lineState(line),
+            audition: route => this.audition(route), customTest: connection => this.customTest(clone(connection || null)), lineState: line => this.player.lineState(line),
             setVolume: value => this.savePhone({ volume: value }), getVolume: () => this.player.getVolume(),
             cacheStats: () => this.cache.stats(), clearCache: () => this.clearCache(), listAudio: () => this.cache.list(),
             deleteAudio: async key => { if (this.player.requestKey === key) this.player.stop('音频已删除'); if (this.prepared?.key === key) this.prepared = null; await this.cache.remove(key); this.emit('library', { collection: 'cache' }); },
@@ -1898,19 +2274,39 @@ export class TTSBackend {
             listPhotos: () => this.library.listPhotos(), addPhoto: value => this.mutateLibrary('photos', 'addPhoto', value),
             getPhoto: id => this.library.getPhoto(id), deletePhoto: id => this.deletePhotos([id]).then(n => n > 0), deletePhotos: ids => this.deletePhotos(ids),
             listNotes: () => this.library.listNotes(), saveNote: value => this.mutateLibrary('notes', 'saveNote', value), deleteNote: id => this.mutateLibrary('notes', 'deleteNote', id),
-            getPhone: () => this.getPhone(), savePhone: patch => this.savePhone(patch), libraryStats: () => this.library.stats(),
+            listBooks: () => this.library.listBooks(), getBook: id => this.library.getBook(id), saveBook: value => this.mutateLibrary('books', 'saveBook', clone(value)), deleteBook: id => this.mutateLibrary('books', 'deleteBook', id),
+            getPhone: () => this.getPhone(), savePhone: patch => this.savePhone(patch), libraryStats: () => this.library.stats(), storageBudget: () => this.budget.read(),
             generatedPhotos: () => this.generatedPhotos().then(({ count, bytes, sources }) => ({ count, bytes, sources: Object.fromEntries(Object.entries(sources).map(([k, { ids, ...rest }]) => [k, rest])) })), deleteGeneratedPhotos: sources => this.deleteGeneratedPhotos(sources),
             saveMoments: patch => this.saveMoments(clone(patch)), saveCalls: patch => this.saveCalls(clone(patch)),
+            saveAssistant: patch => this.saveAssistant(patch), assistantThreads: () => this.assistantThreads(), assistantThread: id => this.assistantThread(id),
+            newAssistantThread: () => this.newAssistantThread(), appendAssistantMessage: (id, value, expectedLastId, expectedRevision) => this.appendAssistantMessage(id, value, expectedLastId, expectedRevision),
+            renameAssistantThread: (id, title) => this.renameAssistantThread(id, title),
+            editAssistantMessage: (id, mid, text, expectedText) => this.editAssistantMessage(id, mid, text, expectedText),
+            deleteAssistantMessage: (id, mid) => this.deleteAssistantMessage(id, mid),
+            selectAssistantVariant: (id, mid, selected) => this.selectAssistantVariant(id, mid, selected),
+            deleteAssistantThread: id => this.deleteAssistantThread(id), clearAssistantThread: id => this.clearAssistantThread(id),
+            assistantMemoryBook: id => this.assistantMemoryBook(id),
+            assistantMemoryEdit: (id, nodeId, text) => {
+                const value = String(text ?? '').trim();
+                if (value.length < 2 || value.length > 6000) throw Error('记忆内容请填写 2–6000 个字符');
+                return this.assistantMemoryRevise(id, book => { const node = book.nodes.find(n => n.id === nodeId); if (!node) throw Error('这条记忆已经不在了'); node.text = value; node.edited = true; return book; });
+            },
+            assistantMemoryRemove: (id, nodeId) => this.assistantMemoryRevise(id, book => removeNode(book, nodeId)),
+            assistantMemoryForget: id => this.assistantMemoryForget(id),
+            saveMusic: patch => this.saveMusic(clone(patch || {})), searchMusic: (query, sourceId) => this.searchMusic(query, clone(sourceId)), musicLink: (sourceId, songId, hint) => this.musicLink(clone(sourceId), songId, clone(hint || {})), musicLyric: (sourceId, songId, hint) => this.musicLyric(sourceId, songId, clone(hint || {})),
+            listSongs: () => this.listSongs(), songBlob: id => this.songBlob(id), addSongs: list => this.addSongs(list), updateSong: (id, patch) => this.updateSong(id, clone(patch || {})), deleteSongs: ids => this.deleteSongs([...(ids || [])]),
             saveSounds: patch => this.saveSounds(clone(patch)), listSounds: () => this.listSounds(), soundBlob: id => this.soundBlob(id), addSounds: list => this.addSounds(list), updateSound: (id, patch) => this.updateSound(id, clone(patch || {})), deleteSounds: ids => this.deleteSounds([...(ids || [])]),
             packInfo: () => this.packInfo(), soundMissing: () => this.soundMissing(), dismissMissing: (type, name) => this.dismissMissing(type, name), generateSound: input => this.generateSound(clone(input || {})), exportSounds: (ids, name) => this.exportSounds(ids ? [...ids] : null, name), importSounds: (file, options) => this.importSounds(file, clone(options || {})),
             saveText: patch => this.saveText(clone(patch)), setTextKey: (id, key) => this.setTextKey(id, key), clearTextKey: id => this.clearTextKey(id), textKeyHint: id => this.textKeyHint(id), textModels: draft => this.textModels(clone(draft || {})),
             syncStatus: () => this.syncStatus(), saveSync: patch => this.saveSync(clone(patch)), syncNow: () => this.syncNow().then(() => this.syncStatus()), clearSyncFiles: () => this.clearSyncFiles(),
             listMoments: async () => { const here = this.here(); return (await this.moments.list()).filter(p => inSpace(p, here)); }, getMoment: id => this.moments.get(id),
-            postMoment: ({ text, photoId } = {}) => this.momentsMutate(async () => (await this.moments.add([{ author: 'me', source: 'me', text, photoId, space: this.spaceKey() }]))[0]),
+            postMoment: ({ text, photoId } = {}) => this.momentsMutate(async () => (await this.moments.add([{ author: 'me', source: 'me', text, photoId, space: this.cardKey() }]))[0]),
             likeMoment: (id, on = true) => this.momentsMutate(() => this.moments.like(id, 'me', on)),
+            // One of the pictures drawn for a post becomes the one shown.
+            momentsPickImage: (id, photoId) => this.momentsMutate(async () => { const post = await this.moments.get(id); if (!post || ![post.photoId, ...(post.imageVersions || [])].includes(photoId)) throw Error('这张配图已经不在了'); return this.moments.setImage(id, { photoId }); }),
             commentMoment: (id, { text, to } = {}) => this.momentsMutate(() => this.moments.comment(id, { from: 'me', text, to })),
-            deleteMoment: id => this.momentsMutate(() => this.moments.remove(id)), deleteMomentComment: (id, commentId) => this.momentsMutate(() => this.moments.removeComment(id, commentId)),
-            clearMoments: () => this.momentsMutate(() => this.clearHere(() => this.moments.list(), id => this.moments.remove(id), () => this.moments.clear())),
+            deleteMoment: id => this.momentsMutate(async () => { const done = await this.moments.remove(id); this.noteGone('moments', [id]); return done; }), deleteMomentComment: (id, commentId) => this.momentsMutate(async () => { const post = await this.moments.removeComment(id, commentId); this.noteGone('moments', [`${id}/${commentId}`]); return post; }),
+            clearMoments: () => this.momentsMutate(() => this.dropping('moments', () => this.moments.list(), () => this.clearHere(() => this.moments.list(), id => this.moments.remove(id), () => this.moments.clear()))),
             listForum: async () => { const here = this.here(); return (await this.apps.list('forum')).filter(p => inSpace(p, here)); }, getForumPost: id => this.apps.get(id),
             forumHot: async () => (await this.apps.get(this.hotId()))?.topics || [],
             postForum: async ({ title = '', text = '' } = {}) => (await this.addForumPosts([{ author: 'me', title, text }], { source: 'me' }))[0],
@@ -1932,18 +2328,20 @@ export class TTSBackend {
             sendPaid: (threadId, message) => this.sendPaid(threadId, message), takeSent: (threadId, messageId, accept) => this.takeSent(threadId, messageId, accept !== false),
             shopCatalog: () => clone({ premium: PREMIUM, kinds: DECOR_KINDS, gifts: shopGifts(this.settings.chat.wallet), ledgerKinds: LEDGER_KINDS }), saveContact: contact => this.saveContact(contact), deleteContact: id => this.deleteContact(id), chatContacts: all => clone(all ? chatContacts(this.settings) : this.contacts()), addRoleContact: name => this.addRoleContact(name),
             listThreads: () => this.threads(), getThread: id => this.chats.get(id), chatUnread: async () => (await this.threads()).reduce((n, t) => n + (t.muted ? 0 : t.unread), 0),
-            createThread: value => this.chatMutate(null, () => this.chats.create({ ...clone(value), space: this.spaceKey() })),
+            createThread: value => this.chatMutate(null, () => this.chats.create({ ...clone(value), space: this.cardKey() })),
             updateThread: (id, patch) => this.chatMutate(id, () => this.chats.update(id, clone(patch))),
-            deleteThread: id => this.chatMutate(id, async () => { const done = await this.chats.remove(id); await this.memoryForget(id).catch(() => {}); return done; }),
+            deleteThread: id => this.chatMutate(id, async () => { const done = await this.chats.remove(id); this.noteGone('chats', [id]); await this.memoryForget(id).catch(() => {}); return done; }),
             // 记忆: what a chat remembers; a summary can be corrected or deleted (what it covered is used again).
             memoryBook: threadId => this.memoryBook(threadId),
             memoryEdit: (threadId, nodeId, text) => { const value = String(text ?? '').trim(); if (value.length < 2) throw Error('写点内容再保存'); return this.memoryChange(threadId, book => { const node = book.nodes.find(n => n.id === nodeId); if (!node) throw Error('这条记忆已经不在了'); node.text = value; node.edited = true; return book; }); },
             memoryRemove: (threadId, nodeId) => this.memoryChange(threadId, book => removeNode(book, nodeId)),
             memoryForget: threadId => this.memoryForget(threadId),
             saveEmbed: patch => this.saveEmbed(clone(patch)), embedReady: () => this.embedReady(), embedModels: draft => this.embedModels(clone(draft || {})),
+            gptModels: () => this.gptModels(),
             embedTest: async draft => { const [v] = await this.embed(['测试一下向量模型'], clone(draft || {})); return v.length; },
-            appendChat: (id, messages, options) => this.chatMutate(id, () => this.chats.append(id, clone(messages), clone(options || {}))),
-            deleteChatMessages: (id, ids) => this.chatMutate(id, () => this.chats.removeMessages(id, clone(ids))),
+            appendChat: (id, messages, options) => { this.assertOpen(); return this.appendChat(id, clone(messages), clone(options || {})); },
+            unfriend: name => this.unfriend(name), refriend: threadId => this.refriend(threadId),
+            deleteChatMessages: (id, ids) => this.chatMutate(id, async () => { const before = await this.chats.get(id); const thread = await this.chats.removeMessages(id, clone(ids)); this.noteGone('chats', (ids || []).map(m => `${id}/${m}`)); await this.memoryAfterDelete(id, before, thread).catch(() => {}); return thread; }),
             updateChatMessage: (id, messageId, patch) => this.chatMutate(id, () => this.chats.updateMessage(id, messageId, clone(patch || {}))),
             markThreadRead: id => this.chatMutate(id, () => this.chats.markRead(id)),
             speak: line => this.speak(clone(line)), voiceFormat: () => this.voiceFormat(),
@@ -1954,7 +2352,7 @@ export class TTSBackend {
             defaultVoicePreset: Object.freeze((({ id, ...rest }) => rest)(freshState().presets[0])), defaultDrawPreset: Object.freeze((({ id, ...rest }) => rest)(defaultDraw().presets[0])),
             drawCatalog: Object.freeze({ models: NAI_MODELS, modelNames: NAI_MODEL_NAMES, samplers: NAI_SAMPLERS, schedules: NAI_SCHEDULES, engines: DRAW_ENGINES, engineNames: DRAW_ENGINE_NAMES, gptModels: GPT_IMAGE_MODELS, gptQualities: GPT_QUALITIES, comfyWorkflow: DEFAULT_COMFY_WORKFLOW }),
             phoneCatalog: Object.freeze({ apps: PHONE_APPS, wallpapers: PHONE_WALLPAPERS, glyphs: PHONE_GLYPHS, skins: PHONE_SKINS }),
-            ...Object.fromEntries(Object.entries(methods).map(([name, fn]) => [name, (...args) => { this.assertOpen(); return fn(...args); }])),
+            ...Object.fromEntries(Object.entries(methods).map(([name, fn]) => [name, (...args) => { if(name==='reportDiagnostic'&&this.closed)return; this.assertOpen(); const failed = error => { if (!['reportDiagnostic','getRequestLogs','clearRequestLogs'].includes(name)) this.reportDiagnostic('小手机操作', {operation: name, message: error?.message || String(error), stack: error?.stack}, error?.name === 'AbortError'||error?.operation==='subscription' ? 'warn' : 'error'); throw error; }; try { const result = fn(...args); return result?.catch ? result.catch(failed) : result; } catch (error) { return failed(error); } }])),
         });
     }
     async close() {
@@ -1966,8 +2364,10 @@ export class TTSBackend {
         this.apps.close();
         this.memoryStore.close();
         this.sounds.close();
+        this.music.close();
         this.drawQueue.cancelAll();
         this.closing = Promise.all([this.player.close(), this.cache.close(), this.library.close(), Promise.resolve(this.keyStore.flush?.()).then(() => this.keyStore.close?.())]);
         await this.closing;
     }
 }
+installDrawSettings(TTSBackend);

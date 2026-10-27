@@ -1,7 +1,8 @@
-import {createView, esc, engines, btn, heading, empty, size, field, input, textArea, groupTitle, avatar} from './common.js';
+import {createView, esc, engines, btn, heading, empty, size, field, input, textArea, groupTitle, avatar, help, pictureCopies} from './common.js';
 import {icon, wave, halo} from './icons.js';
 import {openAlbum} from './album-viewer.js';
-import {saveFile} from '../download.js';
+import {swipeRow, mountSwipeList} from './swipe-list.js';
+import {saveFile, shareFile, canShareFiles, zipFiles} from '../download.js';
 import {decodeMono, joinClips, encodeWav, JOIN_RATE} from '../core/audio-join.js';
 
 const NOTE_COLORS = ['#fff4b0', '#ffd9e6', '#d9ecff', '#e3f5d9', '#efe0ff', '#ffe6cc'];
@@ -12,7 +13,22 @@ const dateLabel = time => new Date(time).toLocaleDateString('zh-CN', {month: 'nu
 
 export function libraryApp(ctx) {
   const {api} = ctx, v = createView(ctx, 'library');
-  let tab = 'favorites', role = '', epoch = 0;
+  let tab = 'favorites', role = '', epoch = 0, swipe = null, preview = null, playing = '';
+  const stopPreview = () => { if (preview) { preview.pause(); ctx.win.URL.revokeObjectURL(preview.src); } preview = null; playing = ''; v.root.querySelectorAll('.audio-row.playing').forEach(r => r.classList.remove('playing')); };
+  const dispose = v.dispose;
+  v.dispose = () => { stopPreview(); swipe?.dispose(); dispose(); };
+  /** A cached line heard here (tap again to stop). */
+  async function listen(key) {
+    const was = playing;
+    stopPreview();
+    if (was === key) return;
+    const {blob} = await api.audioFile({key});
+    preview = new ctx.win.Audio(ctx.win.URL.createObjectURL(blob));
+    playing = key;
+    v.root.querySelector(`.sw-row[data-swipe="${CSS.escape(key)}"] .audio-row`)?.classList.add('playing');
+    preview.addEventListener('ended', stopPreview);
+    await preview.play();
+  }
   async function render() {
     const ticket = ++epoch;
     const [rows, cache, library] = await Promise.all([tab === 'favorites' ? api.listFavorites() : api.listAudio(), api.cacheStats(), api.libraryStats().catch(() => null)]);
@@ -25,33 +41,57 @@ export function libraryApp(ctx) {
     let body;
     if (tab === 'favorites') {
       body = shown.length
-        ? '<div class="group">' + shown.map(r => `<div class="audio-row" data-engine="${esc(r.engine)}">${btn('play-favorite', icon('play', true), 'play-round', `data-id="${esc(r.id)}" aria-label="播放收藏"`)}<div><p>“${esc(r.translation || r.text)}”</p><small>${esc(r.role)} · ${engines[r.engine] || r.engine} · ${size(r.size)} · ${dateLabel(r.createdAt)}</small></div><span class="row-tools">${btn('download-favorite', icon('download'), 'text-button', `data-id="${esc(r.id)}" aria-label="下载到本地"`)}${btn('delete-favorite', icon('trash'), 'text-button', `data-id="${esc(r.id)}" aria-label="删除收藏"`)}</span></div>`).join('') + '</div>'
+        ? '<div class="group" data-audio-list>' + shown.map(r => swipeRow(r.id, `<div class="audio-row" data-engine="${esc(r.engine)}"><span class="disc play">${icon('play', true)}</span><div><p>“${esc(r.translation || r.text)}”</p><small>${esc(r.role)} · ${engines[r.engine] || r.engine} · ${size(r.size)} · ${dateLabel(r.createdAt)}</small></div></div>`,
+          [{key: 'download', label: '下载', icon: 'download'}, {key: 'delete', label: '删除', icon: 'trash', danger: true}], {label: r.translation || r.text})).join('') + '</div>'
         : empty('把喜欢的对白留在这里', '在听取里点爱心，就能把生成过的台词收藏起来。', 'heart');
     } else {
-      const used = library?.limit ? Math.min(100, cache.bytes / library.limit * 100) : 0, fav = library?.limit ? Math.min(100, library.bytes / library.limit * 100) : 0;
+      // One bar for the whole room (本地资料's and the cache's together): 收藏与资料 then the cache.
+      const room = (library?.limit || 0) + (cache.limit || 0), fav = room && library ? Math.min(100, library.bytes / room * 100) : 0, used = room ? Math.min(100 - fav, cache.bytes / room * 100) : 0;
       body = `<div class="group pad"><strong>本机音频</strong><div class="storage-meter"><i style="width:${fav}%;background:var(--pink)"></i><i style="width:${used}%;background:var(--accent)"></i></div>
           <div class="legend"><span style="--c:var(--pink)">收藏与资料 ${library ? size(library.bytes) : '无法读取'}</span><span style="--c:var(--accent)">缓存 ${cache.available ? cache.count + ' 段 · ' + size(cache.bytes) : '不可用'}</span></div></div>`
         + (shown.length
-          ? '<div class="group">' + shown.map(r => { const line = r.metadata?.line || {}; return `<div class="audio-row" data-engine="${esc(r.metadata?.route?.engine || 'none')}"><span class="disc">${icon('wave')}</span><div><p>${esc(line.translation ? '“' + line.translation + '”' : '早期缓存的音频')}</p><small>${esc(line.role || '未知角色')} · ${size(r.bytes)}</small></div><span class="row-tools">${btn('download-cache', icon('download'), 'text-button', `data-id="${esc(r.key)}" aria-label="下载到本地"`)}${btn('favorite-cache', icon('heart'), 'text-button', `data-id="${esc(r.key)}" aria-label="收藏"`)}${btn('delete-cache', icon('trash'), 'text-button', `data-id="${esc(r.key)}" aria-label="清理"`)}</span></div>`; }).join('') + '</div>'
+          ? '<div class="group" data-audio-list>' + shown.map(r => { const line = r.metadata?.line || {}; return swipeRow(r.key, `<div class="audio-row${playing === r.key ? ' playing' : ''}" data-engine="${esc(r.metadata?.route?.engine || 'none')}"><span class="disc">${icon('wave')}</span><div><p>${esc(line.translation ? '“' + line.translation + '”' : '早期缓存的音频')}</p><small>${esc(line.role || '未知角色')} · ${size(r.bytes)}</small></div></div>`,
+            [{key: 'download', label: '下载', icon: 'download'}, {key: 'favorite', label: '收藏', icon: 'heart'}, {key: 'delete', label: '清理', icon: 'trash', danger: true}], {label: line.translation || ''}); }).join('') + '</div>'
           : empty('还没有音频缓存', '点聊天里的声波生成过的台词会暂存在这里。'))
         + `<div class="actions">${btn('clear-cache', icon('trash') + '清理全部缓存', 'danger')}</div><p class="hint">收藏和缓存分开保存，清理缓存不会删掉收藏。</p>`;
     }
+    swipe?.dispose(); swipe = null;
     v.draw(heading('音频收藏', '', 'Voice Library') + tabs + filters + body);
+    const list = v.root.querySelector('[data-audio-list]');
+    const acts = tab === 'favorites' ? '下载、删除' : '下载、收藏、清理';
+    if (list) swipe = mountSwipeList(list, {ctx, hint: `点一下播放；左滑：${acts}；右滑：多选`, mouseHint: `点一下播放；右键或 ⋯：${acts}；按住 Ctrl 点：多选`,
+      onTap: id => (tab === 'favorites' ? api.playFavorite(id) : listen(id)).catch(error => ctx.notify(error.message, {error: true})),
+      onAction: (key, id) => act(key, [id]).catch(error => ctx.notify(error.message, {error: true})),
+      bulk: tab === 'favorites' ? [{key: 'download', label: '下载', icon: 'download'}, {key: 'delete', label: '删除', icon: 'trash', danger: true}]
+        : [{key: 'favorite', label: '收藏', icon: 'heart'}, {key: 'download', label: '下载', icon: 'download'}, {key: 'delete', label: '清理', icon: 'trash', danger: true}],
+      onBulk: (key, ids) => act(key, ids)});
+  }
+  /** One line or several: downloaded (several in one zip), kept in 收藏, or deleted. */
+  async function act(key, ids) {
+    const ref = id => tab === 'favorites' ? {favorite: id} : {key: id};
+    if (key === 'download') {
+      if (ids.length === 1) return saveAs(ctx, api.audioFile(ref(ids[0])));
+      const files = [];
+      for (const id of ids) { const {blob, name} = await api.audioFile(ref(id)); files.push({name, blob}); }
+      ctx.notify('已下载 ' + await saveFile(ctx.doc, await zipFiles(files), `音频收藏-${ids.length}段.zip`));
+      return;
+    }
+    if (key === 'favorite') { for (const id of ids) await api.favoriteAudio(id); ctx.notify(ids.length > 1 ? `收藏了 ${ids.length} 段` : '已加入收藏'); return; }
+    if (key === 'delete') {
+      const what = tab === 'favorites' ? '收藏' : '缓存';
+      if (!await ctx.confirm(ids.length > 1 ? `删除这 ${ids.length} 段${what}？` : `删除这段${what}？`)) return;
+      if (ids.includes(playing)) stopPreview();
+      for (const id of ids) await (tab === 'favorites' ? api.deleteFavorite(id) : api.deleteAudio(id));
+      await render();
+    }
   }
   v.refresh = render;
   v.on('click', '[data-action]', async el => {
-    const id = el.dataset.id;
     switch (el.dataset.action) {
-      case 'tab': tab = el.dataset.tab; role = ''; await render(); break;
+      case 'tab': stopPreview(); tab = el.dataset.tab; role = ''; await render(); break;
       case 'role': role = el.dataset.role; await render(); break;
-      case 'play-favorite': await api.playFavorite(id); break;
-      case 'download-favorite': await v.busy(el, () => saveAs(ctx, api.audioFile({favorite: id}))); break;
-      case 'download-cache': await v.busy(el, () => saveAs(ctx, api.audioFile({key: id}))); break;
-      case 'favorite-cache': await v.busy(el, () => api.favoriteAudio(id)); ctx.notify('已加入收藏'); break;
-      case 'delete-cache': if (await ctx.confirm('清理这段缓存？')) { await api.deleteAudio(id); await render(); } break;
-      case 'delete-favorite': if (await ctx.confirm('删除这段收藏？')) { await api.deleteFavorite(id); await render(); } break;
       case 'clear-cache':
-        if (await ctx.confirm('清理语音缓存？', '正在播放的音频会停止，收藏和其他资料会保留。')) { await v.busy(el, () => api.clearCache()); await render(); ctx.notify('语音缓存已清理'); }
+        if (await ctx.confirm('清理语音缓存？', '正在播放的音频会停止，收藏和其他资料会保留。')) { stopPreview(); await v.busy(el, () => api.clearCache()); await render(); ctx.notify('语音缓存已清理'); }
         break;
     }
   });
@@ -79,7 +119,7 @@ export function galleryApp(ctx) {
     const tools = selecting ? btn('select-cancel', '取消', 'chip-button') : (rows.length ? btn('select', icon('check') + '选择', 'chip-button') : '') + importButton;
     v.draw(heading('相册', `<span class="gallery-tools">${tools}</span>`, `Album · ${rows.length}`) + (rows.length
       ? `<div class="photo-grid${selecting ? ' selecting' : ''}">${rows.map(r => `<button data-action="photo" data-id="${esc(r.id)}" aria-label="${selecting ? '选择' : '查看'} ${esc(r.name)}"${selecting ? ` aria-pressed="${selecting.has(r.id)}"` : ''}><img loading="lazy" data-photo="${esc(r.id)}" alt="${esc(r.name)}"></button>`).join('')}</div>`
-        + (selecting ? `<div class="select-bar"><span data-select-count>${countText()}</span>${btn('select-all', allText(), 'text-button')}${btn('select-delete', icon('trash') + '删除', 'danger', selecting.size ? '' : 'disabled')}</div>` : '')
+        + (selecting ? `<div class="select-bar"><span data-select-count>${countText()}</span>${btn('select-all', allText(), 'text-button')}${btn('select-download', icon('download') + '下载', 'secondary', selecting.size ? '' : 'disabled')}${btn('select-delete', icon('trash') + '删除', 'danger', selecting.size ? '' : 'disabled')}</div>` : '')
       : empty('留住喜欢的画面', '从本地导入照片，也可以设为手机壁纸。', 'image')));
     for (const row of rows) {
       const photo = await api.getPhoto(row.id);
@@ -96,16 +136,20 @@ export function galleryApp(ctx) {
     if (count) count.textContent = countText();
     if (all) all.textContent = allText();
     if (del) del.disabled = !selecting.size;
+    const down = v.root.querySelector('[data-action=select-download]');
+    if (down) down.disabled = !selecting.size;
   }
   /** Opens a photo full screen; the others of the grid are a swipe away. */
-  function openPhoto(id) {
+  function openPhoto(id, from = null) {
     album?.close();
     let changed = false;
-    album = openAlbum({ctx, host: v.root.closest('.screen') || ctx.doc.body, ids: shown, index: Math.max(0, shown.indexOf(id)),
+    album = openAlbum({ctx, host: v.root.closest('.screen') || ctx.doc.body, ids: shown, index: Math.max(0, shown.indexOf(id)), from,
+      to: id => [...v.root.querySelectorAll('.photo-grid [data-id]')].find(b => b.dataset.id === id)?.getBoundingClientRect(),
       load: id => api.getPhoto(id),
       actions: [
         {key: 'wallpaper', icon: 'image', label: '设为壁纸', run: async id => { await api.savePhone({wallpaper: {kind: 'photo', photoId: id}}); ctx.notify('已设为壁纸'); }},
-        {key: 'download', icon: 'download', label: '下载', run: async id => { const {source, name} = await photoFile(id); await saveAs(ctx, {blob: source, name}); }},
+        {key: 'download', icon: 'download', label: '下载', run: async id => { const {source, name} = await photoFile(id); const [file] = await pictureCopies(ctx, [{blob: source, name}]) || []; if (file) await saveAs(ctx, file); }},
+        ...(canShareFiles(ctx.win) ? [{key: 'share', icon: 'share', label: '分享', run: async id => { const {source, name} = await photoFile(id); try { await shareFile(ctx.doc, source, name); } catch (error) { ctx.notify(error.message, {error: !/已取消/.test(error.message)}); } }}] : []),
         {key: 'delete', icon: 'trash', label: '删除', danger: true, run: async id => {
           if (!await ctx.confirm('删除这张照片？', '使用它的壁纸和图标会恢复默认。')) return;
           await api.deletePhoto(id); changed = true; ctx.notify('已删除');
@@ -134,9 +178,27 @@ export function galleryApp(ctx) {
     switch (el.dataset.action) {
       case 'photo':
         if (selecting) { const id = el.dataset.id; if (selecting.has(id)) selecting.delete(id); else selecting.add(id); syncSelection(); break; }
-        openPhoto(el.dataset.id); break;
+        openPhoto(el.dataset.id, (el.querySelector('img') || el).getBoundingClientRect()); break;
       case 'select': selecting = new Set(); await render(); break;
       case 'select-cancel': selecting = null; await render(); break;
+      // 下载 the ticked photos: one is saved as it is, several go in one .zip (a phone keeps only the first of many
+      // downloads started at once), so the album can be emptied after.
+      case 'select-download': {
+        const ids = shown.filter(id => selecting.has(id));
+        if (!ids.length) break;
+        await v.busy(el, async () => {
+          let files = [];
+          for (const id of ids) { const photo = await api.getPhoto(id); if (photo?.blob) files.push({name: photo.name, blob: photo.blob}); }
+          if (!files.length) throw Error('选中的照片已经不在了');
+          files = await pictureCopies(ctx, files);
+          if (!files) return;
+          if (files.length === 1) { ctx.notify('已下载 ' + await saveFile(ctx.doc, files[0].blob, files[0].name)); return; }
+          const d = new Date(), stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+          const name = await saveFile(ctx.doc, await zipFiles(files), `ST-iPhonie 相册 ${stamp} ${files.length} 张`);
+          ctx.notify(`已打包下载 ${files.length} 张：${name}`);
+        });
+        break;
+      }
       case 'select-all': selecting = selecting.size === shown.length ? new Set() : new Set(shown); syncSelection(); break;
       case 'select-delete': {
         const ids = [...selecting];
@@ -208,21 +270,23 @@ export function notesApp(ctx) {
 export function listenApp(ctx) {
   const {api} = ctx, v = createView(ctx, 'listen');
   let latest = {id: -1, lines: []}, epoch = 0, playbackRevision = 0, currentIndex = -1;
+  const selected = () => api.currentDialogue?.() || api.latest();
+  const sameReply = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const ACTIVE = ['playing', 'paused', 'generating', 'waiting'];
   const indexOf = state => state.source !== 'dialogue' || !state.line ? -1 : latest.lines.findIndex((l, i) => l.role === state.line.role && l.text === state.line.text && (state.line.uiIndex === undefined || state.line.uiIndex === i));
 
   async function render() {
     const ticket = ++epoch;
-    latest = api.latest();
-    v.draw(heading('听取', btn('refresh', icon('refresh') + '刷新', 'chip-button'), 'Now Playing')
+    latest = selected();
+    v.draw(heading('听取', help('点台词播放单句，也可以整条播放和导出。默认显示最新一条带语音的回复。点对话框右下角的小三角，可以选择其他有语音台词的楼层；选中后整条播放和导出都使用该楼层。隐藏正文点击按钮不影响这里播放。') + btn('refresh', icon('refresh') + '刷新', 'chip-button'), 'Now Playing')
       + `<div class="listen-stage"><div class="portrait"><span class="ring"></span><span class="ring"></span>${halo()}<span data-portrait></span></div><span class="chip emotion" data-emotion hidden></span><div class="visualizer" aria-hidden="true">${'<i></i>'.repeat(32)}</div></div>
-        <div class="dialogue-box"><span class="plate" data-speaker-plate><span></span></span><span class="dialogue-engine" data-engine-label></span><p class="play-caption" data-playback-line aria-live="polite"></p><div class="dialogue-foot"><span data-playback-message></span><svg viewBox="0 0 14 14" fill="currentColor" aria-hidden="true"><path d="M1 3h12L7 12z"/></svg></div></div>
+        <div class="dialogue-box"><span class="plate" data-speaker-plate><span></span></span><span class="dialogue-engine" data-engine-label></span><p class="play-caption" data-playback-line aria-live="polite"></p><div class="dialogue-foot"><span data-playback-message></span>${btn('toggle-replies', '<svg viewBox="0 0 14 14" fill="currentColor" aria-hidden="true"><path d="M1 3h12L7 12z"/></svg>', 'reply-picker-toggle', 'aria-label="选择语音楼层" aria-expanded="false" aria-controls="listen-reply-picker"')}</div><div id="listen-reply-picker" class="reply-picker" role="group" aria-label="有语音台词的楼层" hidden></div></div>
         <div class="actions" data-waiting hidden>${btn('configure', icon('mic') + '去给这个角色选音色', 'primary')}</div>
         <div class="transport">${btn('favorite', icon('heart'), '', 'aria-label="收藏这一句"')}${btn('download', icon('download'), '', 'aria-label="下载这一句"')}${btn('prev', icon('prev', true), '', 'aria-label="上一句"')}${btn('main-play', icon('play', true), 'main-play', 'aria-label="播放"')}${btn('next', icon('skip', true), '', 'aria-label="下一句"')}${btn('stop', icon('stop', true), '', 'aria-label="停止"')}</div>
         ${latest.lines.length
-          ? groupTitle('本条回复', `<span class="title-tools">${btn('export-all', icon('download') + '导出', 'chip-button', 'aria-label="导出整条：把这条回复的台词拼成一个音频文件"')}${btn('play-all', icon('play', true) + '整条播放', 'chip-button')}</span>`)
+          ? groupTitle(`回复 #${latest.id}`, `<span class="title-tools">${btn('export-all', icon('download') + '导出', 'chip-button', 'aria-label="导出整条：把这条回复的台词拼成一个音频文件"')}${btn('play-all', icon('play', true) + '整条播放', 'chip-button')}</span>`)
             + `<div class="group">${latest.lines.map((l, i) => `<div class="dialogue-row" data-row="${i}" data-engine="${ctx.engineOf(l.role)}"><div><small>${esc(l.role)}</small><p>${esc(l.translation)}</p></div>${btn('play-line', wave, 'wave-button', `data-index="${i}" data-state="ungenerated" aria-label="朗读 ${esc(l.role)} 的台词"`)}</div>`).join('')}</div>`
-          : empty('等一句真正说出口的话', '回到聊天，点台词旁的声波；最新一条回复的台词会出现在这里。')}`);
+          : empty('还没有可播放的台词')}`);
     v.onPlayback(api.status());
     for (let i = 0; i < latest.lines.length; i++) {
       const state = await api.lineState(latest.lines[i]);
@@ -233,6 +297,7 @@ export function listenApp(ctx) {
   }
 
   v.onPlayback = state => {
+    if (!sameReply(selected(), latest)) { render().catch(e => ctx.notify(e.message)); return; }
     const revision = ++playbackRevision, on = ACTIVE.includes(state.phase);
     currentIndex = indexOf(state);
     for (const b of v.root.querySelectorAll('[data-action=play-line]')) {
@@ -251,7 +316,7 @@ export function listenApp(ctx) {
     if (q('[data-portrait]')) q('[data-portrait]').outerHTML = `<span data-portrait>${avatar(speaker || '听', engine, 106)}</span>`;
     if (q('[data-speaker-plate] span')) q('[data-speaker-plate] span').textContent = speaker || '听取';
     if (q('[data-engine-label]')) q('[data-engine-label]').textContent = engine === 'none' ? (speaker ? '未配置' : '') : engines[engine];
-    if (q('[data-playback-line]')) q('[data-playback-line]').textContent = state.line?.translation ? '“' + state.line.translation + '”' : '点下面的台词，或者按整条播放。';
+    if (q('[data-playback-line]')) q('[data-playback-line]').textContent = state.line?.translation ? '“' + state.line.translation + '”' : '';
     if (q('[data-playback-message]')) q('[data-playback-message]').textContent = state.message || (currentIndex >= 0 ? `${currentIndex + 1} / ${latest.lines.length}` : '等待播放');
     const emotion = q('[data-emotion]');
     if (emotion) { emotion.hidden = !state.line?.emotion; emotion.textContent = state.line?.emotion || ''; }
@@ -270,10 +335,35 @@ export function listenApp(ctx) {
   };
   v.refresh = render;
 
-  // The latest reply as one audio file, from the lines already generated (no new requests, no quota).
+  function closeReplies(focus = false) {
+    const menu = v.root.querySelector('.reply-picker'), button = v.root.querySelector('[data-action=toggle-replies]');
+    if (menu) { menu.hidden = true; menu.replaceChildren(); }
+    button?.setAttribute('aria-expanded', 'false');
+    if (focus) button?.focus();
+  }
+  function toggleReplies() {
+    const menu = v.root.querySelector('.reply-picker'), button = v.root.querySelector('[data-action=toggle-replies]');
+    if (!menu.hidden) { closeReplies(); return; }
+    const rows = api.listDialogueReplies?.() || [];
+    menu.innerHTML = rows.length ? rows.map(row => btn('select-reply', `<span><strong>回复 #${row.id} · ${esc(row.name)}</strong><small>${esc(row.preview)}</small></span><span class="reply-count">${row.count} 句</span>`, 'reply-choice', `data-id="${row.id}" data-token="${esc(row.token)}" aria-pressed="${row.id === latest.id}"`)).join('') : '<span class="reply-picker-empty">还没有可播放的楼层</span>';
+    menu.hidden = false; button.setAttribute('aria-expanded', 'true');
+    const current = menu.querySelector('[aria-pressed="true"]');
+    if (current) menu.scrollTop = current.getBoundingClientRect().top - menu.getBoundingClientRect().top;
+  }
+  v.on('keydown', '.dialogue-box', (el, event) => {
+    if (event.key === 'Escape' && !v.root.querySelector('.reply-picker').hidden) { event.stopPropagation(); closeReplies(true); }
+  });
+  v.on('pointerdown', '*', el => { if (!el.closest('.dialogue-box')) closeReplies(); });
+
+  // Pin the displayed reply before any async lookup, so another selection cannot change the exported file.
+  function displayedReply() {
+    if (!sameReply(selected(), latest)) { render().catch(e => ctx.notify(e.message)); throw Error('聊天内容已变化，请重新选择台词'); }
+    return latest;
+  }
+  // The selected reply as one audio file, from the lines already generated (no new requests, no quota).
   async function exportReply() {
-    const now = api.latest();
-    if (!now.lines.length) throw Error('最新的回复里没有台词');
+    const now = displayedReply();
+    if (!now.lines.length) throw Error('这条回复里没有台词');
     const found = [], missing = [];
     for (const line of now.lines) {
       try { found.push((await api.audioFile({line})).blob); }
@@ -288,12 +378,16 @@ export function listenApp(ctx) {
     ctx.notify(`已下载 ${name}（${found.length} 句）`);
   }
   function play(index) {
-    const now = api.latest();
-    if (JSON.stringify(now) !== JSON.stringify(latest)) { render().catch(e => ctx.notify(e.message)); ctx.notify('聊天内容已变化，请重新选择台词'); return; }
-    api.play(latest.id, index);
+    const now = displayedReply();
+    api.play(now.id, index);
   }
   v.on('click', '[data-action]', async el => {
     switch (el.dataset.action) {
+      case 'toggle-replies': toggleReplies(); break;
+      case 'select-reply':
+        try { api.selectDialogue(Number(el.dataset.id), el.dataset.token); }
+        finally { closeReplies(); await render(); v.root.querySelector('[data-action=toggle-replies]')?.focus(); }
+        break;
       case 'refresh': await render(); break;
       case 'play-all': play(); break;
       case 'export-all': await v.busy(el, exportReply); break;

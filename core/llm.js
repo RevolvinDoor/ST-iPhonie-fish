@@ -4,13 +4,14 @@
 // Several custom connections can be kept as presets (address, model, temperature, length), one of them in use.
 // Each preset's key lives with the other keys (core/keys.js, engine 'llm', one line per preset) and never appears in
 // settings, requests shown to the user, or error messages.
+import {proxyAddress} from './proxy-url.js';
 
 // idle: a streamed answer may go this long without sending anything (thinking counts as sending); whole: the longest
 // any request may take; timeout: an answer that is not streamed (it says nothing until it is done).
-export const TEXT_LIMITS = Object.freeze({maxTokens: [64, 32000], temperature: [0, 2], idle: 90000, whole: 600000, timeout: 300000});
+export const TEXT_LIMITS = Object.freeze({maxTokens: [64, 128000], temperature: [0, 2], idle: 90000, whole: 600000, timeout: 300000});
 
 export function defaultTextPreset(id = 'default', name = '自定义接口') {
-  return {id, name, url: '', model: '', temperature: 0.9, maxTokens: 1200, thinking: 'auto'};
+  return {id, name, url: '', model: '', temperature: 0.9, maxTokens: 1200, thinking: 'auto', stream: true};
 }
 export function defaultText() {
   return {source: 'tavern', active: 'default', presets: [defaultTextPreset()]};
@@ -22,7 +23,9 @@ function normalizePreset(value, index) {
   return {id: TEXT_PRESET_ID.test(String(value?.id || '')) ? String(value.id) : crypto.randomUUID(), name: String(value?.name || '').trim().slice(0, 40) || '接口 ' + (index + 1),
     url: String(value?.url || '').trim().slice(0, 500), model: String(value?.model || '').trim().slice(0, 200),
     temperature: Math.round(count(value?.temperature, TEXT_LIMITS.temperature, base.temperature, false) * 100) / 100, maxTokens: count(value?.maxTokens, TEXT_LIMITS.maxTokens, base.maxTokens),
-    thinking: value?.thinking === 'off' ? 'off' : 'auto'};
+    thinking: value?.thinking === 'off' ? 'off' : 'auto',
+    // 流式: on unless turned off (some providers, Gemini behind some relays, cut a streamed answer short).
+    stream: value?.stream !== false};
 }
 export function normalizeText(value) {
   const base = defaultText();
@@ -43,21 +46,42 @@ export function activeText(value) {
 export function apiBase(url) {
   let base = String(url || '').trim().replace(/\/+$/, '');
   base = base.replace(/\/(chat\/completions|completions|models)$/i, '');
-  if (!/^https?:\/\/[^\s/]+/i.test(base)) throw Error('请填写接口地址，例如 https://api.openai.com/v1');
+  if (!proxyAddress(base) && !/^https?:\/\/[^\s/]+/i.test(base)) throw Error('请填写接口地址，例如 https://api.openai.com/v1');
   return base;
 }
 
 /** The messages to send: prompts are message lists already; a plain string becomes one user message. */
 export function asMessages(prompt) {
-  if (Array.isArray(prompt)) return prompt.filter(m => m && typeof m.content === 'string').map(m => ({role: ['system', 'user', 'assistant'].includes(m.role) ? m.role : 'user', content: m.content}));
+  if (Array.isArray(prompt)) return prompt.filter(m => m && (typeof m.content === 'string' || Array.isArray(m.content))).map(m => ({role: ['system', 'user', 'assistant'].includes(m.role) ? m.role : 'user', content: typeof m.content === 'string' ? m.content : m.content.filter(p => p?.type === 'text' && typeof p.text === 'string' || p?.type === 'image_url' && typeof p.image_url?.url === 'string').map(p => p.type === 'text' ? {type: 'text', text: p.text} : {type: 'image_url', image_url: {url: p.image_url.url}})}));
   return [{role: 'user', content: String(prompt ?? '')}];
 }
+
+// Manual image-prompt writing only: some tavern wrappers may stringify message
+// arrays. Use generateRaw's string + systemPrompt form at this boundary while
+// leaving the custom API's structured messages and all other features intact.
+export function tavernTextRequest(request){
+  const {plainText,...out}=request;
+  if(!plainText||!Array.isArray(out.prompt))return out;
+  const messages=asMessages(out.prompt).map(m=>{
+    if(Array.isArray(m.content)&&m.content.some(p=>p.type!=='text'))throw Error('绘图提示词请求中包含非文字内容');
+    return {...m,content:typeof m.content==='string'?m.content:m.content.map(p=>p.text).join('\n')};
+  });
+  const system=[out.systemPrompt,...messages.filter(m=>m.role==='system').map(m=>m.content)].filter(Boolean).join('\n\n');
+  const body=messages.filter(m=>m.role!=='system');
+  return {...out,systemPrompt:system,prompt:body.length===1&&body[0].role==='user'?body[0].content:body.map(m=>`[${m.role}]\n${m.content}`).join('\n\n')};
+}
+
+/**
+ * How long an answer may be: what the task needs at least (responseLength, worked out from its size), or the user's own
+ * 最长回复 when that is more. The user's number is a ceiling they chose, so a task never cuts below it.
+ */
+export const answerRoom = (asked, own) => Math.max(Number(asked) || 0, Number(own) || 0) || undefined;
 
 export function chatBody(text, prompt, responseLength) {
   if (!text.model) throw Error('请先在「引擎 → 文字模型」里填写模型名');
   // 关掉思考: the switches the providers that think by default read (硅基流动 and 通义: enable_thinking; 智谱, 火山方舟: thinking).
   const quiet = text.thinking === 'off' ? {enable_thinking: false, thinking: {type: 'disabled'}} : {};
-  return {model: text.model, messages: asMessages(prompt), temperature: text.temperature, max_tokens: responseLength || text.maxTokens, ...quiet, stream: false};
+  return {model: text.model, messages: asMessages(prompt), temperature: text.temperature, max_tokens: answerRoom(responseLength, text.maxTokens), ...quiet, stream: false};
 }
 
 /** The reply text of a Chat Completions answer (reasoning kept apart by the provider is left out). */
@@ -103,7 +127,9 @@ export async function streamText(response, info = {}) {
     const choice = json?.choices?.[0];
     if (choice?.delta?.reasoning_content || choice?.delta?.reasoning || json?.candidates?.[0]?.content?.parts?.some?.(p => p?.thought)) info.thought = true;
     if (choice?.finish_reason) info.finish = choice.finish_reason;
-    text += chunkText(json);
+    info.onChunk?.(json);
+    text += info.chunkText ? info.chunkText(json) : chunkText(json);
+    info.onProgress?.(text);
   };
   const end = () => { info.raw = events ? '' : raw.trim(); return text; };
   if (!reader) { for (const block of (await response.text()).split(/\r?\n\r?\n/)) take(block); return end(); }
@@ -119,6 +145,7 @@ export async function streamText(response, info = {}) {
 
 /** A readable reason for a failed request. The key is never part of it. */
 export function failure(status, body, key = '') {
+  if (status === 403 && /CORS proxy is disabled/i.test(typeof body === 'string' ? body : JSON.stringify(body))) return Error('酒馆的跨域代理未开启：在 config.yaml 里把 enableCorsProxy 改成 true，然后重启酒馆');
   let detail = '';
   try { const json = typeof body === 'string' ? JSON.parse(body) : body; detail = json?.error?.message || json?.message || json?.detail || ''; } catch { detail = String(body || '').slice(0, 200); }
   detail = String(detail).slice(0, 300);
@@ -144,8 +171,15 @@ const thoughtOnly = finish => Error(finish === 'length'
  * asked again (it would be paid twice). A network error in a browser is usually the API refusing web pages (CORS) or a
  * wrong address; the message says so.
  */
-export async function customRequest({text, key, prompt, responseLength, fetch: send = globalThis.fetch, signal}) {
+// 火山方舟 (checked 2026-10-06): no list of models (the browser's check for /models gets 404, so it cannot even ask),
+// and its error answers (a wrong key or model) carry no CORS header, so the browser cannot read them either: both look
+// like "cannot connect". Chatting itself is allowed from web pages.
+const ARK = /volces\.com|volcengine/i;
+const ARK_MODEL = '火山方舟没有模型列表：在「模型」里直接填推理接入点 ID（ep- 开头）或模型名（比如 doubao-seed-1-6-250615），在火山方舟控制台的「在线推理」或「开通管理」里能看到';
+export async function customRequest({text, key, prompt, responseLength, fetch: send = globalThis.fetch, signal, details = false, onProgress}) {
   const base = apiBase(text.url), body = chatBody(text, prompt, responseLength);
+  const meta = {requestedModel: text.model};
+  const finish = answer => details ? {text: answer, meta} : answer;
   const post = async stream => {
     const idle = new AbortController();
     let timer = 0;
@@ -160,6 +194,7 @@ export async function customRequest({text, key, prompt, responseLength, fetch: s
     } catch (error) {
       clearTimeout(timer);
       if (error?.name === 'AbortError' || error?.name === 'TimeoutError') throw Error(TOO_SLOW);
+      if (ARK.test(base)) throw Error('文字模型：火山方舟没有回答。它在密钥不对、模型名不对、没开通这个模型时返回的错误浏览器读不到，看起来就像连不上：请检查密钥，以及「模型」填的是不是推理接入点 ID（ep- 开头）或开通了的模型名');
       throw Error('文字模型：连不上这个接口。可能是地址写错了，或者这个接口不允许网页直接访问（CORS）');
     }
     /** Reads the answer while the timer keeps watch; clears it whatever happens. */
@@ -174,6 +209,7 @@ export async function customRequest({text, key, prompt, responseLength, fetch: s
   const fromJson = raw => {
     let json;
     try { json = JSON.parse(raw); } catch { throw Error('文字模型：接口返回的不是 JSON，地址可能填错了'); }
+    if (details) responseMetadata(json, meta);
     let reply = '';
     try { reply = replyText(json); } catch { /* no text */ }
     if (reply.trim()) return reply;
@@ -181,22 +217,24 @@ export async function customRequest({text, key, prompt, responseLength, fetch: s
     if (choice?.message?.reasoning_content || choice?.message?.reasoning) throw thoughtOnly(choice.finish_reason);
     return '';
   };
-  const first = await post(true);
-  if (!first.response.ok) {
+  // 不用流式: asked the ordinary way at once.
+  const first = text.stream === false ? null : await post(true);
+  if (!first) { /* below */ }
+  else if (!first.response.ok) {
     const raw = await first.read(() => first.response.text());
     // An API that refuses streaming: asked the ordinary way.
     if (!(first.response.status === 400 || first.response.status === 422) || !/stream/i.test(raw)) throw failure(first.response.status, raw, key);
   } else if (/json/i.test(first.response.headers?.get?.('content-type') || '')) {
     // Streaming not supported but not refused either: an ordinary answer came back.
     const reply = fromJson(await first.read(() => first.response.text()));
-    if (reply) return reply;
+    if (reply) return finish(reply);
   } else {
-    const info = {};
+    const info = details ? {onChunk: json => responseMetadata(json, meta), onProgress: content => onProgress?.(content, meta)} : {};
     const reply = await first.read(alive => streamText(first.response, Object.assign(info, {alive})));
-    if (reply.trim()) return reply;
+    if (reply.trim()) return finish(reply);
     if (info.thought) throw thoughtOnly(info.finish);
     // Not a stream after all: an ordinary answer that did not say so.
-    if (info.raw) { const plain = fromJson(info.raw); if (plain) return plain; }
+    if (info.raw) { const plain = fromJson(info.raw); if (plain) return finish(plain); }
   }
   // Nothing yet: once more without streaming.
   const second = await post(false);
@@ -204,7 +242,7 @@ export async function customRequest({text, key, prompt, responseLength, fetch: s
   if (!second.response.ok) throw failure(second.response.status, raw, key);
   const reply = fromJson(raw);
   if (!reply) throw Error('文字模型：接口没有返回内容（流式请求和普通请求都试过了）');
-  return reply;
+  return finish(reply);
 }
 
 /** Model ids the API lists (GET /models): for picking a model and checking the connection. Listing costs nothing. */
@@ -212,17 +250,30 @@ export async function listModels({text, key, fetch: send = globalThis.fetch}) {
   const base = apiBase(text.url);
   let response;
   // Some APIs (火山方舟 among them) have no list of models: the model is written by hand then.
-  const byHand = /volces\.com|volcengine/i.test(base)
-    ? '火山方舟的接口读不出模型列表：在「模型」里直接填模型名（比如 doubao-seed-1-6-250615、deepseek-v3-250324）或推理接入点 ID（ep- 开头），在火山方舟控制台的「在线推理」或「开通管理」里能看到'
-    : '这个接口读不出模型列表：在「模型」里直接填模型名就行（接口的文档或控制台里能找到）';
+  // 火山方舟 has none to read: said at once, without asking.
+  if (ARK.test(base)) throw Error('文字模型：' + ARK_MODEL);
+  const byHand = '这个接口读不出模型列表：在「模型」里直接填模型名就行（接口的文档或控制台里能找到）';
   try { response = await send(base + '/models', {headers: key ? {Authorization: 'Bearer ' + key} : {}}); }
   catch { throw Error('文字模型：连不上这个接口。可能是地址写错了，或者这个接口不允许网页直接访问（CORS）'); }
   const raw = await response.text();
   if (response.status === 404 || response.status === 405) throw Error('文字模型：' + byHand);
-  if (!response.ok) { const error = failure(response.status, raw, key); if (/volces\.com|volcengine/i.test(base) && response.status !== 401) error.message += '。' + byHand; throw error; }
+  if (!response.ok) throw failure(response.status, raw, key);
   let json;
   try { json = JSON.parse(raw); } catch { throw Error('文字模型：' + byHand); }
   const list = Array.isArray(json?.data) ? json.data : Array.isArray(json?.models) ? json.models : Array.isArray(json) ? json : [];
   if (!list.length) throw Error('文字模型：' + byHand);
   return [...new Set(list.map(m => typeof m === 'string' ? m : m?.id || m?.name).filter(Boolean).map(String))].sort().slice(0, 500);
+}
+
+/** Only explicit upstream metadata; a model's self-description is never used as identification. */
+export function responseMetadata(json, meta = {}) {
+  const model = json?.model || json?.message?.model || json?.modelVersion;
+  if (typeof model === 'string') meta.reportedModel = model.slice(0, 200);
+  if (typeof json?.provider === 'string') meta.provider = json.provider.slice(0, 200);
+  const choice = json?.choices?.find(c => !c.index) || json?.choices?.[0];
+  const delta = choice?.delta || choice?.message;
+  const thought = delta?.reasoning_content || delta?.reasoning || json?.delta?.thinking ||
+    json?.candidates?.[0]?.content?.parts?.filter(p => p.thought).map(p => p.text || '').join('') || '';
+  if (typeof thought === 'string') meta.reasoning = ((meta.reasoning || '') + thought).slice(0, 100000);
+  return meta;
 }

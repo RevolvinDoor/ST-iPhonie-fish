@@ -12,10 +12,11 @@
 //   位置 Pn (only when pictures are planned after the reply: which paragraph the picture follows)
 // Two ways to get blocks (draw.mode): 'separate' asks the model in its own request after the reply is written and
 // inserts the blocks; 'inline' injects the rules into the story request so the reply carries the blocks itself.
+import {promptText, promptTemplate} from './prompt-rules.js';
 import {defaultDrawParams, normalizeDrawParams, guardParams, relayUrl, NAI_MODEL_NAMES} from './novelai.js';
 import {tokenBudget, counterNow, estimateTokens, countField, tagCost} from './tokens.js';
 import {strength as vibeStrength} from './vibes.js';
-import {DRAW_ENGINES, defaultGpt, normalizeGpt, defaultComfy, normalizeComfy} from './image-engines.js';
+import {DRAW_ENGINES, DRAW_ENGINE_NAMES, defaultGpt, normalizeGpt, defaultComfy, normalizeComfy} from './image-engines.js';
 import {escapeHTML, isPlaceholderRole} from './protocol.js';
 
 const BLOCK = ['<img>', '画幅：竖 / 横 / 方', '场景：英文 tag', '角色：名字｜这一刻的 tag｜不要出现的 tag｜站位（画面里每个人单独一行，每一行都以「角色：」开头）', '新外貌：名字｜固定外貌 tag（只在名单外的新角色第一次出现时写）', '</img>'];
@@ -268,21 +269,9 @@ export const V05_DRAW_ENTRIES = [
 export const DEFAULT_DRAW_RULE = DEFAULT_DRAW_ENTRIES.map(e => e.text).join('\n\n');
 
 /** Appended to the rules in 'inline' mode: the reply itself carries exactly `count` blocks. */
-export const drawContract = count => [
-  '【出图硬性规则】',
-  `这条回复必须正好写 ${count} 个出图块，不能多也不能少。每个出图块单独成段，放在它所画的那一段正文后面${count > 1 ? '，几个出图块分散在正文不同位置' : ''}。`,
-  '出图块严格照这个格式写并闭合：',
-  '{{出图格式}}',
-  '已登记角色的名字只能从名单里选，一字不差。写完正文后自己数一遍出图块，不对就补上或删掉。不输出核对过程。'
-].join('\n');
+export const drawContract = (count, prompts = {}) => promptText(prompts, 'draw-story', 'contract', {'出图数量': count, '几张': count > 1});
 /** Appended to the rules in 'separate' mode: the reply is already written; answer with blocks only. */
-export const planContract = count => [
-  '【出图硬性规则】',
-  `下面的正文已经写好，每一段前面标了 [P1]、[P2]…… 按上面的规则挑 ${count} 个画面，正好输出 ${count} 个出图块，每块第一行写「位置：P几」，表示这张图放在哪一段后面。`,
-  '出图块严格照这个格式写并闭合：',
-  '{{出图格式}}',
-  '只输出出图块，不要复述正文，不要解释，不要放进代码块。已登记角色的名字只能从名单里选，一字不差。'
-].join('\n');
+export const planContract = (count, prompts = {}) => promptText(prompts, 'draw-story', 'plan', {'出图数量': count});
 
 // Rule texts shipped earlier. A preset that still holds one of them word for word gets the current default rules.
 const OLD_DEFAULT_RULES = [
@@ -294,6 +283,11 @@ const OLD_DEFAULT_RULES = [
     '竖线后写画面里出现的角色名，用逗号分隔，只写这些名字：{{角色列表}}。画面里没有这些角色时，连同竖线一起省略。', '不要解释这些标签，也不要放进代码块。']
 ].map(lines => lines.join('\n'));
 
+// The NovelAI parameters a 画风 keeps: an artist string often wants its own model, sampler, steps and CFG. Picking the
+// 画风 puts them back; changing them while it is in use changes its own. The size and the seed belong to each picture.
+export const STYLE_PARAM_KEYS = Object.freeze(['model', 'steps', 'scale', 'sampler', 'schedule', 'cfgRescale', 'variety']);
+/** The part of the drawing parameters a 画风 keeps. */
+export const styleParams = params => { const p = normalizeDrawParams(params); return Object.fromEntries(STYLE_PARAM_KEYS.map(k => [k, p[k]])); };
 const DEFAULT_STYLE = {id: 'default', name: '默认画风', artist: '', positive: 'masterpiece, best quality, very aesthetic, absurdres', negative: 'lowres, bad anatomy, bad hands, text, error, missing fingers, extra digits, cropped, worst quality, jpeg artifacts, signature, watermark, blurry'};
 // rev 2 (0.6.1): presets made earlier get the 张力 entry once, after 角色; deleting it afterwards sticks.
 // rev 3 (0.6.49): the engine entries (用 tag 写, GPT, NovelAI / ComfyUI / GPT 的角色写法) are added once.
@@ -381,8 +375,12 @@ export function normalizeDraw(value) {
   }
   d.vibe = normalizeVibeSettings(d.vibe);
   d.params = normalizeDrawParams(d.params);
-  d.styles = (Array.isArray(d.styles) && d.styles.length ? d.styles : base.styles).map(s => ({id: String(s.id || crypto.randomUUID()), name: text(s.name, 60) || '画风', artist: text(s.artist, 4000), positive: text(s.positive, 4000), negative: text(s.negative, 4000)}));
+  d.styles = (Array.isArray(d.styles) && d.styles.length ? d.styles : base.styles).map(s => ({id: String(s.id || crypto.randomUUID()), name: text(s.name, 60) || '画风', artist: text(s.artist, 4000), positive: text(s.positive, 4000), negative: text(s.negative, 4000),
+    ...(s.params && typeof s.params === 'object' ? {params: styleParams({...d.params, ...s.params})} : {})}));
   d.activeStyle = d.styles.some(s => s.id === d.activeStyle) ? d.activeStyle : d.styles[0].id;
+  // From before 画风 kept parameters: the one in use keeps the parameters in use now.
+  const using = d.styles.find(s => s.id === d.activeStyle);
+  if (!using.params) using.params = styleParams(d.params);
   for (const key of ['gpt', 'comfy']) if (!d.styles.some(s => s.id === d[key].style)) d[key].style = '';
   d.presets = (Array.isArray(d.presets) && d.presets.length ? d.presets : base.presets).map(p => {
     let entries = Array.isArray(p.entries) ? p.entries : [];
@@ -454,13 +452,40 @@ export function castList(settings, only = null) {
   if (!roles.length) return wanted ? '（这段剧情里还没有登记的角色）' : '（还没有登记的角色）';
   return roles.map(r => !r.appearance?.trim() ? `${r.name}（还没有外貌）` : genderOf(r.appearance) ? `${r.name}（${genderOf(r.appearance)}）` : r.name).join('；');
 }
+/**
+ * Who the picture rules name: the open card's own people (its characters, the roles met in its story) and who speaks
+ * now. Every registered role across all cards made a long list to pick from. null (everyone) when there is no card
+ * and nobody speaks. space: the card open now ({key, members}); speakers: names from the recent story.
+ */
+export function drawCast(settings, space, speakers = []) {
+  const names = new Set((speakers || []).map(n => String(n).trim()).filter(Boolean));
+  if (space?.key) {
+    for (const n of space.members || []) names.add(String(n));
+    for (const r of settings.routes || []) if (Array.isArray(r.cards) && r.cards.includes(space.key)) names.add(r.name);
+  }
+  return names.size || space?.key ? [...names] : null;
+}
 function ruleText(settings, p, format, contract, only = null) {
   const count = countOf(p), list = castList(settings, only);
   const fill = t => t.replaceAll('{{出图格式}}', format).replaceAll('{{角色列表}}', list).replaceAll('{{出图数量}}', String(count));
   const engine = settings.draw?.engine || 'nai', entries = p.entries.filter(e => e.enabled && e.text.trim() && forEngine(e, engine));
   const budget = budgetText(settings, only);
-  return {entries, fill, tail: fill(contract(count)) + (budget ? '\n\n' + budget : '')};
+  return {entries, fill, tail: fill(contract(count, settings.promptRules)) + (budget ? '\n\n' + budget : '')};
 }
+/**
+ * What the 助手 needs to write pictures the way this plugin draws them: the engine and 画风 in use, the user's own
+ * 绘图预设 rules for that engine (without 「挑画面」, which is about picking moments of a reply), the 出图块 format
+ * and the NovelAI length budget. A block written this way draws exactly like one in the story.
+ */
+export function assistantDrawGuide(settings) {
+  const draw = settings.draw, p = activePreset(draw);
+  if (!draw || !p) return '';
+  const engine = draw.engine || 'nai', style = activeStyle(draw) || {}, format = promptTemplate(settings.promptRules, 'draw-story', 'format');
+  const {entries, fill} = ruleText(settings, {...p, count: 1}, format, () => '');
+  return promptText(settings.promptRules, 'assistant', 'drawGuide', {'引擎': DRAW_ENGINE_NAMES[engine] || engine, '画风': style.name || '默认画风',
+    '绘图规则': entries.filter(e => e.id !== 'pick').map(e => fill(e.text)).join('\n\n'), '出图格式': format, '名单': castList(settings), 'tag长度': budgetText(settings)});
+}
+
 /**
  * 【tag 长度】 for NovelAI: how much of the model's prompt budget is left for what the model writes, so it can write
  * long, detailed pictures without NovelAI cutting the end off. Counted with the real tokenizer once it has loaded
@@ -479,11 +504,7 @@ export function budgetNumbers(settings, only = null) {
 export function budgetText(settings, only = null) {
   const n = budgetNumbers(settings, only);
   if (!n) return '';
-  const {head, looks, left, tags} = n, b = n;
-  return ['【tag 长度】',
-    `现在用 NovelAI ${n.name}：一张图的正面 tag（场景加上画面里每个角色的，合在一起算）上限约 ${b.limit} token，超出的部分会被截掉、画不出来。`,
-    `画风已经占了约 ${head}${looks.length ? `；已登记角色的固定外貌会自动加进去，各占：${looks.join('、')}` : ''}。`,
-    `所以每张图里你写的场景 tag 和角色 tag，加上画面里那几个人的固定外貌，一共还有约 ${left} token，大约 ${tags} 个英文 tag。这是上限，不是目标：写准、写具体，画面里有的都写清楚（动作、姿势、表情、视线、服装和配饰、光线、镜头、背景），但不为了凑长度重复、堆近义词或加画面里没有的东西；不要超过。`].join('\n');
+  return promptText(settings.promptRules, 'draw-story', 'budget', {'模型': n.name, '上限': n.limit, '画风占用': n.head, '外貌占用': n.looks.join('、'), '剩余': n.left, '标签数': n.tags});
 }
 
 /** Prompt entries injected with the story request ('inline' mode only). Keys share the sttts.entry. prefix. */
@@ -492,7 +513,7 @@ export function drawPromptPlan(settings, preset, only = null) {
   if (!preset && (!draw?.enabled || draw.mode !== 'inline')) return [];
   const p = activePreset(draw, preset);
   if (!p) return [];
-  const {entries, fill, tail} = ruleText(settings, p, PIC_TAG_FORMAT, drawContract, only);
+  const {entries, fill, tail} = ruleText(settings, p, promptTemplate(settings.promptRules, 'draw-story', 'format'), drawContract, only);
   return entries.map((e, index) => {
     const i = e.injection || p.injection;
     return {
@@ -579,28 +600,26 @@ export function paragraphs(message) {
   return (story.length ? story : out).map(({aside, ...p}) => p);
 }
 /** Chat-style request asking for the picture blocks of one reply. before: [{name, text}] earlier messages. */
-export function planRequest(settings, {message, before = [], preset} = {}) {
+export function planRequest(settings, {message, before = [], preset, only = null, lore = ''} = {}) {
   const p = activePreset(settings.draw, preset);
-  const {entries, fill, tail} = ruleText(settings, p, PLAN_TAG_FORMAT, planContract);
+  const {entries, fill, tail} = ruleText(settings, p, promptTemplate(settings.promptRules, 'draw-story', 'planFormat'), planContract, only);
   const system = entries.map(e => fill(e.text)).join('\n\n') + '\n\n' + tail;
-  const context = before.length ? `【前情】\n${before.map(m => `${m.name}：${m.text}`).join('\n')}\n\n` : '';
-  const body = paragraphs(message).map((x, i) => `[P${i + 1}] ${x.text}`).join('\n');
-  return [{role: 'system', content: system}, {role: 'user', content: `${context}【这段正文】\n${body}\n\n（请输出 ${countOf(p)} 个出图块。）`}];
+  // 世界书: the entries the tavern would turn on for this story (the phone's choice of books), for era, places and looks.
+  const ask = promptText(settings.promptRules, 'draw-story', 'planAsk', {'世界书': lore.trim(), '前情': before.map(m => `${m.name}：${m.text}`).join('\n'),
+    '正文': paragraphs(message).map((x, i) => `[P${i + 1}] ${x.text}`).join('\n'), '出图数量': countOf(p)});
+  return [{role: 'system', content: system}, {role: 'user', content: ask}];
 }
 /** 「从剧情生成」 in the drawing app: a request of its own (no story preset, no chain of thought), worded for the engine. */
-export function suggestRequest(settings, {before = []} = {}) {
+export function suggestRequest(settings, {before = [], only = null} = {}) {
   const gpt = settings.draw?.engine === 'gpt';
-  const system = [
-    '你是绘图提示词助手。根据给出的剧情，写出最有画面感的一幕的绘图提示词。',
-    gpt ? '用英文写，逗号分隔，danbooru tag 和简短的英文短语都可以：人数、动作、表情、服装、场景、光线、构图。不写露骨内容。'
-      : '用英文 danbooru tag，逗号分隔：人数（1girl、2girls 等）、动作、表情、服装、场景、光线、构图。',
-    ...peopleRules(settings),
-    ...sentenceRule(settings),
-    '不写画师名和质量词。只输出提示词，不要思考过程、解释、标题或任何标签。',
-    ...(n => n ? [`现在用 NovelAI ${n.name}，上限约 ${n.limit} token，画风已占约 ${n.head}，这一行还能写约 ${n.left} token（大约 ${n.tags} 个 tag）。这是上限，不是目标：写准、写具体，画面里有的都写清楚（动作、姿势、表情、视线、服装和配饰、光线、镜头、背景），但不为了凑长度重复、堆近义词或加画面里没有的东西；不要超过。`] : [])(gpt ? null : budgetNumbers(settings))
-  ].join('\n');
+  const system = promptText(settings.promptRules, 'draw-prompt', 'suggest', {'GPT': gpt, '人物规则': peopleRules(settings, [], only), '描述句规则': sentenceRule(settings), '长度': gpt ? '' : lengthLine(settings)});
   const story = before.length ? before.map(m => `${m.name}：${m.text}`).join('\n') : '（还没有剧情）';
-  return [{role: 'system', content: system}, {role: 'user', content: `【最近的剧情】\n${story}\n\n只输出提示词：`}];
+  return [{role: 'system', content: system}, {role: 'user', content: promptText(settings.promptRules, 'draw-prompt', 'suggestAsk', {'剧情': story})}];
+}
+/** How long the line may be, for NovelAI ('' for the other engines). */
+function lengthLine(settings) {
+  const n = budgetNumbers(settings);
+  return n ? promptText(settings.promptRules, 'draw-prompt', 'length', {'模型': n.name, '上限': n.limit, '画风占用': n.head, '剩余': n.left, '标签数': n.tags}) : '';
 }
 /**
  * Who may be in a prompt line: works' characters by the tag the model knows; registered people by name only (their
@@ -618,48 +637,44 @@ export function sentenceCount(settings) {
   return /diffusion-5/.test(model) ? 3 : /diffusion-4/.test(model) ? 1 : 0;
 }
 function sentenceRule(settings) {
+  // Whatever the model: the point of the picture has to be in the shot. V4 / V4.5 read sentences poorly: where things
+  // are has to be said with things it knows.
   const n = sentenceCount(settings);
-  // Whatever the model: the point of the picture has to be in the shot.
-  const seen = '想法里最要紧的东西要让它在画面里看得见。办法有很多，按画面挑最自然的一种：换个摆法（伞斜着撑、把手里的东西举起来、人侧过身），换个角度或景别（侧面、稍微俯视或仰视、近一点），或者让它离镜头近一点；不一定要用夸张的角度。视线和动作也别和它冲突。';
-  // V4 / V4.5 read sentences poorly: where things are has to be said with things it knows.
-  const concrete = '这个模型读句子的能力弱，空间关系最好也能用具体的 tag 说出来，比如透明的东西（transparent umbrella）、印花和图案（cloud print）、倒影（reflection）、透出来或照进来的光（light through …），按画面挑合适的，不用都写；那一句英文作补充。';
-  if (!n) return [seen];
-  return [`tag 写全之后，可以在这一行最后补${n > 1 ? '两三句' : '一句'}简短的英文描述句（这个模型读得懂英文句子${n > 1 ? '' : '，但上限只有 512 token，句子很占地方，所以只补一句'}），只写 tag 说不清的东西：位置和空间关系（什么在什么里面、谁在哪一边）、明暗和冷暖的对比、几样东西之间的关系。比如 Inside the umbrella there is a clear blue sky with sunlight, while outside it is a dark heavy storm.`,
-    '描述句的规矩：tag 是主体，句子只补充不代替；不写人名，用 the girl、the boy、the woman、the man 这类；不写比喻（不用 like、as if、resembling 这类词）；不写画不出来的抽象词（孤独、温柔、命运这类），每句只写看得见的东西。',
-    seen, ...(n === 1 ? [concrete] : [])];
+  return promptText(settings.promptRules, 'draw-prompt', 'sentences', {'句数': n, '多句': n > 1, '只一句': n === 1});
 }
-function peopleRules(settings, cast = []) {
-  const known = drawable(settings).map(r => r.name).filter(n => !cast.some(c => sameName(c, n)));
-  return [
-    cast.length ? `画面里的人：${cast.join('、')}。插件会另外加上他们各自的固定外貌，你不用写外貌，写人数 tag 和他们在做什么。` : '',
-    known.length ? `登记好外貌的人物：${known.join('、')}。画面里有他们时，提示词里不写外貌，在最后单独写一行「人物：名字、名字」（名字一字不差），插件会按名字补上外貌；没有就不写这一行。` : '',
-    '已有作品里的角色（动画、游戏、小说），提示词里写模型认得的英文识别 tag「角色名 (作品名)」，比如 hatsune miku (vocaloid)，放在这个人的 tag 最前面；原创角色的中文名画图模型不认得，不要写进提示词。'
-  ].filter(Boolean);
+function peopleRules(settings, cast = [], only = null) {
+  const known = drawable(settings).map(r => r.name).filter(n => (!only || only.includes(n)) && !cast.some(c => sameName(c, n)));
+  return promptText(settings.promptRules, 'draw-prompt', 'people', {'画面里的人': cast.join('、'), '登记的人': known.join('、')});
 }
 /**
  * 帮我写: the user says in a few words (Chinese is fine) what they want drawn, the model writes the prompt line —
  * filled out to the NovelAI budget like the story's pictures. cast: the names of the people added in the 角色 tab
  * (their looks are added by the plugin; the model only writes what they do).
  */
-export function writeRequest(settings, {idea = '', cast = []} = {}) {
-  const gpt = settings.draw?.engine === 'gpt', n = gpt ? null : budgetNumbers(settings);
-  const system = [
-    '你是绘图提示词助手。把用户想画的画面写成一行绘图提示词。',
-    gpt ? '用英文写，逗号分隔，danbooru tag 和简短的英文短语都可以。不写露骨内容。'
-      : '用英文 danbooru tag，逗号分隔：人数（1girl、2girls、1boy 1girl 等）、动作、姿势、表情、视线、服装和配饰、场景和背景、光线、镜头和构图、氛围。',
-    '用户写的可能是中文、可能很短：按这个意思补成一幅完整、有画面感的图，没说的细节你来定，但不要改掉想要的东西。',
-    ...peopleRules(settings, cast),
-    ...sentenceRule(settings),
-    '不写画师名和质量词。只输出提示词，不要思考过程、解释、标题或任何标签。',
-    n ? `现在用 NovelAI ${n.name}，上限约 ${n.limit} token，画风已占约 ${n.head}，这一行还能写约 ${n.left} token（大约 ${n.tags} 个 tag）。这是上限，不是目标：写准、写具体，画面里有的都写清楚（动作、姿势、表情、视线、服装和配饰、光线、镜头、背景），但不为了凑长度重复、堆近义词或加画面里没有的东西；不要超过。` : ''
-  ].filter(Boolean).join('\n');
-  return [{role: 'system', content: system}, {role: 'user', content: `想画的：${String(idea).trim()}\n\n只输出提示词：`}];
+export function writeRequest(settings, {idea = '', cast = [], only = null} = {}) {
+  const gpt = settings.draw?.engine === 'gpt';
+  const system = promptText(settings.promptRules, 'draw-prompt', 'write', {'GPT': gpt, '人物规则': peopleRules(settings, cast, only), '描述句规则': sentenceRule(settings), '长度': gpt ? '' : lengthLine(settings)});
+  return [{role: 'system', content: system}, {role: 'user', content: promptText(settings.promptRules, 'draw-prompt', 'writeAsk', {'想画的': String(idea).trim()})}];
 }
+/**
+ * 改提示词再画: the prompt in Chinese to read ('translate'), or rewritten the way the user asked in their own words
+ * ('revise', wish: what they said; with no wish, the Chinese they wrote in it is made tags).
+ */
+export function tagTextRequest(settings, text, mode = 'translate', wish = '') {
+  const gpt = settings.draw?.engine === 'gpt', prompt = String(text ?? '').trim();
+  if (mode !== 'revise') return [{role: 'system', content: promptText(settings.promptRules, 'draw-prompt', 'translate', {'GPT': gpt})}, {role: 'user', content: prompt}];
+  return [{role: 'system', content: promptText(settings.promptRules, 'draw-prompt', 'revise', {'GPT': gpt})},
+    {role: 'user', content: promptText(settings.promptRules, 'draw-prompt', 'reviseAsk', {'提示词': prompt, '想怎么改': String(wish ?? '').trim() || '把里面写的中文换成英文 tag，别的不动'})}];
+}
+/** The answer of tagTextRequest: without thinking, a code fence around it or 「翻译：」 in front. */
+export const tagTextAnswer = reply => String(reply ?? '').replace(/<(think|thinking|reasoning)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '').trim()
+  .replace(/^```[\w-]*\n([\s\S]*?)\n```$/, '$1').replace(/^(?:翻译|中文|改好的(?:内容)?)\s*[:：]\s*\n?/, '').trim();
 /**
  * A 帮我写 / 从剧情生成 reply: the prompt line and the registered people its 人物 line names (as registered), so the
  * drawing app can add them with their looks.
  */
 export function readSuggestion(settings, text) {
+  if (typeof text !== 'string') throw Error('模型没有返回可用的绘图提示词，请查看日志后重试');
   const people = [];
   const rest = String(text || '').split('\n').filter(line => {
     const m = line.trim().match(/^(?:人物|角色)\s*[:：]\s*(.*)$/);
@@ -670,7 +685,11 @@ export function readSuggestion(settings, text) {
     }
     return false;
   }).join('\n');
-  return {prompt: cleanSuggestion(rest), people};
+  const prompt = cleanSuggestion(rest);
+  // A request that reached the model as "[object Object]" comes back as that, or as a lecture about it, not as tags.
+  const debugging = /JavaScript objects?.{0,160}(?:converted|string|toString)|JSON\.stringify\s*\(\s*yourData|console\.dir\s*\(\s*yourData/i;
+  if (/\[object\s+Object\]/i.test(prompt) || debugging.test(prompt)) throw Error('模型返回了程序调试说明，没有生成绘图提示词；原提示词已保留，请重试或查看日志');
+  return {prompt, people};
 }
 /** How long the answer may be: room for the whole budget of tags (a few hundred tokens otherwise). */
 export function promptLength(settings) {
@@ -678,10 +697,18 @@ export function promptLength(settings) {
   const n = settings.draw?.engine === 'gpt' ? null : budgetNumbers(settings);
   return n ? Math.min(6000, Math.round(n.left * 1.5) + 1500) : 1500;
 }
+/**
+ * Room for the picture blocks of one reply (回复后单独配图): each block's tags up to the budget, and room for a model
+ * that thinks first (its thinking counts toward the limit; too little room cut the blocks off before </img>).
+ */
+export function planLength(settings, count = 1) {
+  const n = settings.draw?.engine === 'gpt' ? null : budgetNumbers(settings);
+  return Math.min(8000, 1500 + Math.max(1, count) * (n ? Math.round(n.left * 1.5) + 300 : 600));
+}
 /** The follow-up asking for a fuller line: what it holds now and how much room is left. */
-export function fillUpRequest(prompt, {line, people = [], used, left, tags, sentences = 0}) {
+export function fillUpRequest(prompt, {prompts = {}, line, people = [], used, left, tags, sentences = 0}) {
   return [...prompt, {role: 'assistant', content: line + (people.length ? `\n人物：${people.join('、')}` : '')},
-    {role: 'user', content: `这一行现在约 ${used} token，离上限还差约 ${left - used} token（大约 ${tags} 个 tag）。保留上面所有内容，再补充更多具体的细节：服装和配饰的细节、发型、表情和视线、姿势和手的动作、背景里的物件、光线和色调、镜头和构图。只补和这个画面相符、想法或剧情里有依据（或能合理推出）的东西；不重复已有的 tag，不堆近义词，不加画面里没有的人和物。${sentences ? `末尾的英文描述句加起来不超过 ${sentences} 句。` : ''}写到上限的八九成，但不要超过。输出扩写后的完整一行${people.length ? '，最后一行照旧写「人物：…」' : ''}，不要解释。`}];
+    {role: 'user', content: promptText(prompts, 'draw-prompt', 'fillUp', {'已用': used, '还差': left - used, '标签数': tags, '句数': sentences, '人物': people.length > 0})}];
 }
 /** The prompt line out of a reply: thinking blocks, tags, code fences and labels taken out. */
 export function cleanSuggestion(text) {
@@ -697,10 +724,17 @@ export function cleanSuggestion(text) {
 /** Puts planned blocks into the reply after their paragraphs. Blocks without a usable 位置 go after the last one. */
 export function insertPlanned(message, reply) {
   const source = String(message), paras = paragraphs(source), blocks = [];
-  for (const m of String(reply).matchAll(/<img\b[^<>]*>([^<]*)<\/img\s*>/gi)) {
-    const at = m[1].match(/(?:^|\n)\s*位置\s*[:：]\s*P?\s*(\d+)/i);
-    const body = m[1].replace(/(?:^|\n)\s*位置\s*[:：][^\n]*/i, '').trim();
-    if (!parseBlock(body)) continue;
+  // A model that thinks out loud may write sample blocks in its thinking: only the answer counts.
+  const answer = String(reply ?? '').replace(/<(think|thinking|reasoning)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '');
+  const bodies = [...answer.matchAll(/<img\b[^<>]*>([^<]*)<\/img\s*>/gi)].map(m => m[1]);
+  // Cut off at the length limit: the last block, without its unfinished line, when it is the only one.
+  const open = !bodies.length && answer.match(/<img\b[^<>]*>([^<]*)$/i);
+  if (open) bodies.push(/\n\s*$/.test(open[1]) ? open[1] : open[1].replace(/\n[^\n]*$/, ''));
+  for (const raw of bodies) {
+    const at = raw.match(/(?:^|\n)\s*位置\s*[:：]\s*P?\s*(\d+)/i);
+    const body = raw.replace(/(?:^|\n)\s*位置\s*[:：][^\n]*/i, '').trim();
+    const spec = parseBlock(body);
+    if (!spec || !spec.tags && !spec.cast.length && !spec.nl) continue;
     const index = Math.min(paras.length, Math.max(1, Number(at?.[1]) || paras.length)) - 1;
     blocks.push({end: paras[index]?.end ?? source.length, text: `<img>\n${body}\n</img>`});
   }
@@ -787,11 +821,17 @@ export function parsePictures(message) {
 }
 
 /** Replaces picture blocks with placeholders that the host fills in after rendering. */
-export function renderPictures(message, marker) {
+export function renderPictures(message, marker, {passive = false, pictures = {}} = {}) {
   const tags = parsePictures(message);
   if (!tags.length) return message;
   let out = '', at = 0;
   for (const tag of tags) {
+    if (passive) {
+      const record = pictures[tag.hash], versions = record?.versions || (record?.url ? [record] : []);
+      const picture = versions[Math.min(versions.length - 1, Math.max(0, record?.index ?? versions.length - 1))];
+      out += message.slice(at, tag.start) + (picture?.url ? `<img src="${escapeHTML(picture.url)}" alt="${escapeHTML(tag.prompt)}" loading="lazy">` : '');
+      at = tag.end; continue;
+    }
     out += message.slice(at, tag.start) + `<span class="sttts-pic" data-sttts-pic="${tag.index}" data-sttts-hash="${escapeHTML(tag.hash)}" data-sttts-token="${escapeHTML(marker)}"></span>`;
     at = tag.end;
   }
@@ -830,6 +870,41 @@ export function pictureRoles(settings, tag, text = '') {
   const before = String(text).slice(Math.max(0, (tag.start ?? 0) - 600), tag.start ?? undefined).toLowerCase();
   const seen = roles.map(r => [r, before.lastIndexOf(r.name.toLowerCase())]).filter(([, at]) => at >= 0).sort((a, b) => b[1] - a[1]).map(([r]) => r);
   return seen.slice(0, peopleCount(tag.prompt) || 1);
+}
+
+/**
+ * A phone photo's tags as they are drawn: when its description is of a thing and shows nobody (小猫在窗台上晒太阳) the person tags a
+ * model added anyway (1boy, selfie, solo, portrait…) go, and no humans keeps the picture to what was described.
+ * names: everyone who could be in it.
+ */
+export function photoTags({text = '', tags = '', owner = '', names = []}) {
+  const said = String(text || '').trim(), list = String(tags || '').split(',').map(t => t.trim()).filter(Boolean);
+  if (!said || !list.length) return String(tags || '');
+  // The caption names the subject. A stray selfie tag must not replace that person with the sender.
+  const other = names.some(n => n && n !== '我' && !sameName(n, owner) && said.includes(n));
+  if (other && !/自拍|合照|合影|我们|我和|和我|selfie/i.test(said)) return list.filter(t => !/\bselfie\b/i.test(t)).join(', ');
+  const people = /自拍|合照|合影|对镜|镜子|样子|模样|造型|我和|和我|我们|自己|本人|[他她]|人|男|女|孩|宝宝|朋友|同学|闺蜜|兄弟|姐|妹|哥|弟|爸|妈|手|脸|腿|脚|身|穿|selfie|\b(?:me|him|her|us|people|person|man|woman|boy|girl)\b/i;
+  const thing = /猫|狗|宠物|鸟|鱼|兔|仓鼠|花|草|树|叶|风景|景色|天空|云|夕阳|日落|日出|月亮|星|海|山|河|湖|雨|雪|街|路|楼|房间|窗|饭|菜|吃的|甜点|蛋糕|奶茶|咖啡|饮料|早餐|午餐|晚餐|夜宵|零食|水果|面|书|电脑|屏幕|游戏|礼物|桌|床|车|cat|dog|food|view|sky/i;
+  if (!thing.test(said) || people.test(said) || [owner, ...names].some(n => n && n !== '我' && said.includes(n))) return String(tags || '');
+  const person = /^(?:\d+\+?\s*(?:girls?|boys?|others?)|solo|selfie|portrait|upper body|cowboy shot|full body|looking at viewer|smile|smiling|holding phone|v|peace sign)$/i;
+  const kept = list.filter(t => !person.test(t.replace(/[()\[\]{}]/g, '').replace(/:[\d.]+$/, '').trim()));
+  if (!kept.some(t => /^no humans$/i.test(t))) kept.unshift('no humans');
+  return kept.join(', ');
+}
+
+/**
+ * Who a phone photo (查手机相册, a chat photo, a 朋友圈 picture) shows, as names for pictureInputs: nobody when its tags
+ * show no person (a view, a meal); the people its description names (registered roles, the user); the owner too when
+ * it is a selfie or a photo together, or when nobody else is named. names: everyone who could be in it.
+ */
+export function photoCast({text = '', tags = '', owner = '', names = []}) {
+  if (!/(\d+(?:girl|boy|other)s?|solo|selfie|portrait|upper body|cowboy shot)/i.test(tags)) return [];
+  const said = String(text);
+  const others = [...new Set(names)].filter(n => n && n !== '我' && n !== owner && !sameName(n, owner))
+    .map(n => [n, said.indexOf(n)]).filter(([, at]) => at >= 0).sort((a, b) => a[1] - b[1]).map(([n]) => n);
+  const self = !others.length || (owner && said.includes(owner)) || /自拍|合照|合影|我们|我和|和我|selfie/i.test(said);
+  const cast = [...(self && owner ? [owner] : []), ...others], n = peopleCount(tags);
+  return n ? cast.slice(0, n) : cast;
 }
 
 /** 站位 A1–E5 (column A–E left to right, row 1–5 top to bottom) as NovelAI's 5×5 grid index; -1 when not given. */

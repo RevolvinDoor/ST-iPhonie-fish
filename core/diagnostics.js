@@ -1,7 +1,7 @@
 // The self-check report: facts gathered in the tavern page become sections of findings and a plain-text report that
 // can be copied and sent to whoever is helping. Nothing here reads or prints keys.
 
-const ENGINE_NAMES = {fish: 'Fish Audio', mini: 'MiniMax', eleven: 'ElevenLabs', mimo: '小米 MiMo', nai: 'NovelAI', gpt: 'GPT 生图'};
+const ENGINE_NAMES = {fish: 'Fish Audio', mini: 'MiniMax', eleven: 'ElevenLabs', mimo: '小米 MiMo', doubao: '豆包语音', custom: '自己的接口', nai: 'NovelAI', gpt: 'GPT 生图'};
 const DRAW_NAMES = {nai: 'NovelAI', gpt: 'GPT 生图', comfy: 'ComfyUI'};
 const MARKS = {ok: '✓', warn: '⚠', error: '✗', info: '·'};
 const item = (level, label, detail = '') => ({level, label, detail: String(detail ?? '')});
@@ -76,7 +76,8 @@ export function buildReport(f) {
     if (!r.tags && !r.lines) items.push(item(v.enabled === false ? 'info' : 'warn', '没有语音标签', '模型没有按格式写台词。可以重新生成，或者检查预设是不是插进去了。'));
     else items.push(item(r.lines ? 'ok' : 'warn', `认出 ${r.lines} 句台词`));
     for (const p of r.problems || []) items.push(item('warn', `${p.role || '未写角色'}：${p.reason}`, p.snippet));
-    if (r.lines && v.enabled !== false) {
+    if (r.lines && v.wavesHidden) items.push(item('info', '正文点击按钮已隐藏', '可以在「听取」里播放；设置 → 配音 → 隐藏正文点击按钮。'));
+    if (r.lines && v.enabled !== false && !v.wavesHidden) {
       if (!r.inChat) items.push(item('error', '在聊天区里找不到这条消息', '可能被美化主题或前端卡换了显示方式。'));
       else if (!r.waves) items.push(item('error', '认出了台词，但正文里没有画出声波',
         r.iframes ? `这条消息里有 ${r.iframes} 个内嵌页面（前端卡或酒馆助手的界面），声波可能被放进去了，里面的点击传不到插件。` : '刷新页面试试；还不行就把这份报告发出来。'));

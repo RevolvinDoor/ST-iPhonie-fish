@@ -1,25 +1,54 @@
-import {createView, esc, btn, field, input, select, textArea, toggle, heading, help, groupTitle, plate, empty} from './common.js';
+import {createView, esc, btn, field, input, select, textArea, toggle, heading, help, groupTitle, plate, empty, menu} from './common.js';
 import {icon, glyph} from './icons.js';
 import {APPS} from './apps.js';
+import {MARK_CHOICES} from '../core/voice-fx.js';
+import {CONTRACT_PROMPT, READING_PROMPT, DEFAULT_PROMPT, DEFAULT_FORMAT, FREE_FORMAT, FREE_PROMPT, FREE_CONTRACT_PROMPT} from '../core/protocol.js';
+import {saveFile} from '../download.js';
+import {promptRulesSheet} from './prompt-rules.js';
+// The voice preset's rule entries that can go back to what ships.
+const RULE_DEFAULTS = {contract: CONTRACT_PROMPT, reading: READING_PROMPT};
 
 const positions = [['in_chat', '聊天内'], ['before_prompt', '主提示词之前'], ['in_prompt', '主提示词之后']];
 const roles = [['system', '系统'], ['user', '用户'], ['assistant', '助手']];
 // Preset kinds: voice (dialogue tags), chat (phone chat replies, 朋友圈, and bringing chats into the story), drawing
 // (<img> tags in the chat text). A chat rule says where it is used: 私聊, 群聊, 朋友圈.
-const KINDS = [['tts', '配音', 'listen'], ['voice', '音声方案', 'roles'], ['voicelib', '音色库', 'roles'], ['chat', '聊天', 'chat'], ['draw', '绘图', 'draw']];
-const USES = [['dm', '私聊'], ['group', '群聊'], ['moments', '朋友圈'], ['call', '电话'], ['forum', '论坛'], ['peek', '查手机']];
+const KINDS = [['tts', '配音', 'listen'], ['chat', '聊天', 'chat'], ['draw', '绘图', 'draw']];
+const USES = [['dm', '私聊'], ['group', '群聊'], ['moments', '朋友圈'], ['call', '电话'], ['forum', '论坛'], ['peek', '查手机'], ['story', '正文']];
 // Drawing rules: which engines an entry is sent with (none ticked or all ticked: every engine).
 const ENGINE_USES = [['nai', 'NovelAI'], ['gpt', 'GPT 生图'], ['comfy', 'ComfyUI']];
-const engineScope = e => e.engines?.length ? ' · 只给 ' + ENGINE_USES.filter(([k]) => e.engines.includes(k)).map(([, l]) => l).join('、') : '';
+// One preset as a file (导出 / 导入): to keep, to share, or to hand to an AI to rewrite and bring back.
+export const PRESET_FILE = 'st-iphonie-preset';
+/**
+ * A preset file read back: {kind, preset} (no id: it is saved as a new preset). A bare preset (an AI may hand back
+ * just that) counts as the kind being shown. Entries are checked here; the rest is checked when it is saved.
+ */
+export function readPresetFile(text, shownKind) {
+  let data; try { data = JSON.parse(String(text).replace(/^\uFEFF/, '')); } catch { throw Error('这个文件不是预设（不是有效的 JSON）'); }
+  const wrapped = data?.format === PRESET_FILE, preset = wrapped ? data.preset : data, kind = wrapped ? data.kind : shownKind;
+  if (!KINDS.some(k => k[0] === kind)) throw Error('认不出这是哪一类预设');
+  if (!preset || typeof preset !== 'object' || Array.isArray(preset) || !Array.isArray(preset.entries)) throw Error('文件里没有预设的条目');
+  const ids = new Set(), entries = preset.entries.filter(e => e && typeof e === 'object' && typeof e.text === 'string').map(e => {
+    let id = typeof e.id === 'string' && /^[\w-]{1,64}$/.test(e.id) && !ids.has(e.id) ? e.id : crypto.randomUUID();
+    ids.add(id);
+    return {...e, id, title: String(e.title ?? '').slice(0, 80), enabled: e.enabled !== false};
+  });
+  if (!entries.length) throw Error('文件里没有预设的条目');
+  const {id, ...rest} = preset;
+  return {kind, preset: {...rest, name: String(rest.name || '').trim().slice(0, 60) || '导入的预设', entries}};
+}
 
 export function presetsApp(ctx) {
   const {api} = ctx, v = createView(ctx, 'presets'), drafts = new Map();
+  v.on('click', '[data-action=system-rules]', () => promptRulesSheet(ctx));
   let current = null, currentKind = 'tts', kind = 'tts';
-  const mark = () => { const el = v.root.querySelector('[data-save-state]'); if (el) el.textContent = '未保存'; };
+  // Drafts changed since they were opened or saved: their bar says 未保存, also after the page is drawn again.
+  const dirty = new Set(), draftKey = () => currentKind + ':' + (current?.id || 'new');
+  const mark = () => { dirty.add(draftKey()); const el = v.root.querySelector('[data-save-state]'); if (el) el.textContent = '未保存'; };
   /** A fresh copy of the shipped preset of a kind: new entry ids, no preset id. */
   const shipped = k => {
     const base = structuredClone(k === 'chat' ? api.defaultChatPreset : k === 'draw' ? api.defaultDrawPreset : api.defaultVoicePreset);
-    base.entries = base.entries.map(e => ({...e, id: e.id && k !== 'tts' ? e.id : crypto.randomUUID()}));
+    // The voice preset's built-in entries keep their ids (the rules and 心声和电话 are known by them); others get new ones.
+    base.entries = base.entries.map(e => ({...e, id: e.id && (k !== 'tts' || ['dialogue', 'reading', 'contract', 'effects'].includes(e.id)) ? e.id : crypto.randomUUID()}));
     return base;
   };
   const tile = app => { const [t1, t2, tac] = APPS[app].colors; return `<span class="mini-tile" style="--t1:${t1};--t2:${t2};--tac:${tac}">${glyph(app)}</span>`; };
@@ -45,22 +74,21 @@ export function presetsApp(ctx) {
     {
       const o = ops(kind), active = o.active();
       const draw = api.getState().draw;
-      body = (kind === 'draw' && !draw.enabled ? '<p class="hint">正文出图没有开启，在「设置 · 绘图」里打开后，使用中的绘图预设才会加进聊天请求。</p>' : '')
+      body = (kind === 'draw' && !draw.enabled ? '<p class="hint">正文出图没有开启，在「设置 · 正文」里打开后，使用中的绘图预设才会加进聊天请求。</p>' : '')
         + o.list().map(p => `<button class="preset-card" data-action="edit-preset" data-kind="${kind}" data-id="${esc(p.id)}"${p.id === active ? ' data-active' : ''}>${tile(app)}<span><strong>${esc(p.name || '未命名预设')}</strong><small>${kind === 'chat' ? `读正文 ${p.context} 条 · 聊天记录 ${p.history} 条` : kind === 'draw' ? `每条回复 ${p.count} 张 · ${p.entries.length} 条规则` : `${p.entries.length} 条规则 · ${esc(positions.find(x => x[0] === p.injection.position)?.[1] || '')}`}</small></span>${p.id === active ? plate('使用中') : icon('next')}</button>`).join('')
-        + `<div class="actions">${btn('restore-default', icon('refresh') + '恢复默认预设', 'secondary')}</div>`
-        + `<p class="hint">${kind === 'draw'
+        + `<div class="actions">${btn('restore-default', icon('refresh') + '加回默认预设', 'text-button')}${help(kind === 'draw'
           ? '绘图预设是给正文模型看的出图规则：什么时候出图、标签怎么写。画师串和固定 tag 在绘图 App 的“画风”里。'
           : kind === 'chat'
           ? '聊天预设决定手机里的联系人怎么回消息、朋友圈怎么发、能看到多少剧情，以及“带进剧情”时怎么写进下一次正文。每条规则可以选用在私聊、群聊还是朋友圈。手机聊天和朋友圈单独生成，不会写进正文。'
-          : '配音预设让模型把台词写成带 TTS 标签的格式。角色配音不在预设里，切换预设不会改动角色。'}</p>`;
+          : '配音预设让模型把台词写成带 TTS 标签的格式。角色配音不在预设里，切换预设不会改动角色。')}</div>`;
     }
-    v.draw(heading('预设', btn('add-preset', icon('add'), 'round-button', `aria-label="新增${label}预设"`), 'Preset · 3 类') + tabs + body);
+    v.draw(heading('预设', btn('add-menu', icon('add'), 'round-button', `aria-label="新增${label}预设"`), 'Preset · 3 类') + tabs + `<button class="list-row" data-action="system-rules">${icon('sliders')}<span><strong>系统提示词</strong><small>输出格式、附加规则与请求模板</small></span>${icon('next')}</button>` + body);
   }
 
   /** The 世界书 line: how much is left out (picked in a sheet), and the tags cleaned away (status bars). */
   function loreFields(p) {
     const books = (p.loreSkipBooks || []).length, entries = (p.loreSkipEntries || []).length;
-    return `<div class="setting-row"><span class="row-text"><strong>手机读哪些世界书</strong><small>${books || entries ? `不读 ${books} 本、${entries} 条` : '现在开着的都读'}</small></span>${btn('lore-pick', '选择', 'chip-button')}</div>
+    return `<div class="setting-row"><span class="row-text"><strong>手机读哪些世界书</strong><small>${books || entries ? `不读 ${books} 本、${entries} 条` : '按触发条件读取'}</small></span>${btn('lore-pick', '选择', 'chip-button')}</div>
       ${field('清洗标签', input('cleanTags', Array.isArray(p.cleanTags) ? p.cleanTags.join(', ') : String(p.cleanTags ?? ''), 'text', 'placeholder="比如 status, 状态栏" autocomplete="off"'), '写标签名，逗号隔开。世界书里用这些标签包住的内容（比如 <status>…</status>）不给手机，手机回复里要是写了也会去掉。')}`;
   }
   /** A sheet listing the books turned on now and their entries: switch one off and the phone leaves it out. */
@@ -87,7 +115,7 @@ export function presetsApp(ctx) {
       d.body.querySelector('[data-lore-list]').scrollTop = keep;
     };
     d.body.innerHTML = `<div class="vibe-search">${icon('search')}<input type="search" data-lore-search placeholder="搜索书名、条目标题、关键词" aria-label="搜索世界书"></div>
-      <p class="hint" style="padding:6px 2px">列出的是现在开着的世界书（全局、角色卡、聊天、人设绑定的）和里面启用的条目。关掉的手机就不读，正文照常用。改完点「保存预设」才生效。</p>
+      <p class="hint" style="padding:6px 2px">列出的是现在开着的世界书（全局、角色卡、聊天、人设绑定的）和里面启用的条目。勾选表示允许读取，仍按常驻、关键词、扫描深度和预算触发；不会强制全文载入。关掉的手机就不读，正文照常用。改完点「保存预设」才生效。</p>
       <div class="lore-list" data-lore-list></div>`;
     paint();
     d.body.addEventListener('input', e => { if (e.target.matches('[data-lore-search]')) { query = e.target.value.trim().toLowerCase(); paint(); } });
@@ -109,13 +137,13 @@ export function presetsApp(ctx) {
   function memoryFields(p) {
     const m = p.memory || {}, on = m.enabled !== false;
     const num = (key, label, value, min, max, note) => field(label, input('memory.' + key, value, 'number', `min="${min}" max="${max}" step="1"`), note);
-    return `<details data-group="preset-memory"><summary>记忆 ${help('聊得久了，最近几十条之外的消息模型就看不到了。打开记忆后，更早的消息会自动整理成摘要，摘要多了再合成阶段总结、长期总览（每整理一次调用一次文字模型）；回消息、打电话、查手机和朋友圈都会带上。每段聊天的记忆在右上角菜单 → 记忆 里看和改。')}</summary><div class="group pad">
+    return `<details data-group="preset-memory"><summary>记忆 ${help('聊得久了，最近几十条之外的消息模型就看不到了。打开记忆后，更早的消息会自动整理成摘要，摘要多了再合成阶段总结、长期总览（每整理一次调用一次文字模型）；回消息、打电话、查手机和朋友圈都会带上。每段聊天的记忆在右上角菜单 → 记忆 里看和改。')}<small class="fold-note">${on ? '开' : '关'}</small></summary><div class="fold-body">
       ${toggle('memory.enabled', '记住更早的聊天', on)}
       ${on ? num('batch', '每次整理多少条', m.batch ?? 40, 10, 200, '「读取聊天记录」那么多条之外的消息，攒够这么多条整理成一段聊天摘要。')
         + num('stage', '几段摘要合成一份阶段总结', m.stage ?? 5, 2, 20, '')
         + num('epic', '几份总结再合成长期总览', m.epic ?? 4, 2, 20, '长期总览也会继续往上合，记忆再长也不会越带越多。')
         + num('recall', '每次想起几段旧聊天', m.recall ?? 3, 0, 10, '按最近几句话，从更早的原话里找出最相关的几段一起带上（0 不找）。默认在本地找，不花钱；在「引擎 → 向量模型」里填了 Embedding 接口后按意思找，更准。')
-        + toggle('memory.story', '正文也带上手机里的事', m.story === true, '写正文时，把你和当前角色卡里的角色在手机上聊过的事（记忆和最近 10 条聊天）告诉模型，插在「带进剧情」的位置。会多占一些正文的上下文。') : ''}
+        + '<p class="hint">想让正文一直记得某段聊天：在那段聊天里点「带进剧情」→「一直带着」。</p>' : ''}
       ${storyFields(m)}
     </div></details>`;
   }
@@ -132,31 +160,94 @@ export function presetsApp(ctx) {
       ${api.storySources ? `<div class="actions" style="margin:6px 0 0">${btn('story-sources', icon('refresh') + (list ? '重新读取' : '读取当前注入的内容'), 'secondary')}</div>` : ''}
       ${list ? `<div class="story-sources">${rows}</div>` : ''}</div>`;
   }
+  /** How this preset's story writes 心声 and 电话 besides the emotion word: the marks wrapped around them. */
+  function marksFields(p) {
+    const m = p.marks || {inner: [], phone: []};
+    const row = (kind, label, info) => {
+      const mine = m[kind] || [], own = mine.filter(x => !MARK_CHOICES.includes(x));
+      return `<div class="field"><span>${label}${help(info)}</span><div class="use-row">${MARK_CHOICES.map(c => `<label class="use-chip"><input type="checkbox" data-mark="${kind}" data-pair="${esc(c)}" ${mine.includes(c) ? 'checked' : ''}><span>${esc(c)}</span></label>`).join('')}</div><input type="text" data-mark-own="${kind}" aria-label="${label}：其他写法" value="${esc(own.join(' '))}" placeholder="其他写法，如 《…》"></div>`;
+    };
+    return row('inner', '心声怎么认', '台词的情绪字段写了「心声·」的，一直会当心声念（带回响）。\n\n有的正文预设有自己的心声写法，比如用 *星号* 或 `反引号` 包住心声：勾上对应的写法，包在里面的台词也当心声念；列表里没有的，在下面的框里写开头和结尾，中间用 … 隔开。\n\n很多预设用 *星号* 写动作，那样就别勾星号。正文预设根本不写心声的话，可以停用下面的「心声和电话」条目。')
+      + row('phone', '电话怎么认', '情绪字段写了「电话·」的，会念成电话听筒里的声音。正文预设用别的符号标电话里的话（比如【…】）的话，在这里勾上它。');
+  }
   const storyName = key => storyList?.find(x => x.key === key)?.name || ({bakemono_memory: '剧情剪辑台', '1_memory': '酒馆总结'})[key] || key;
   let storyList = null;
+  // The editor keeps to what is changed most (name, format, the rules); the rest folds away, each rule is one row that
+  // opens in a sheet, and what is rare (发送预览, 恢复成默认内容, 删除预设) sits in the 「⋯」 of the title.
+  const ruleHelp = (e, draw, chat) => draw ? '可以用 {{出图格式}}、{{出图数量}}、{{角色列表}}。插件会在最后自动加上格式和张数的硬性要求。'
+    : chat ? '可以用 {{用户}}、{{对象}}；写语音消息规则时用 {{语音格式}}（手机固定用默认的台词格式，不跟配音预设走）、{{可发语音}}。用在朋友圈的规则只能用 {{用户}}。插件会在最后自动加上输出格式的硬性要求。'
+    : e.id === 'reading' ? '{{朗读规则}} 会换成这段剧情里每个说话者按自己的引擎和模型该怎么写（情绪、语气标签）。可以在前后加字；不想要就停用这一条。'
+    : e.id === 'contract' ? '{{格式}} 换成上面的台词格式；{{错误示例}} {{正确示例}} 会按台词格式自动写出例子，改了格式也不会对不上。可以随便改，改乱了点「恢复这一条」。'
+    : '启用规则的合计文字需包含 {{格式}} 和 {{语言}}。';
+  /** The small line under a rule's row: where it goes, or how it starts. */
+  function ruleNote(e, draw, chat) {
+    if (chat) { const used = USES.filter(([u]) => (e.use || []).includes(u)).map(([, l]) => l); return used.length ? used.join(' · ') : '哪里都没用'; }
+    if (draw) return e.engines?.length ? '只给 ' + ENGINE_USES.filter(([k]) => e.engines.includes(k)).map(([, l]) => l).join('、') : '三个引擎都用';
+    const text = String(e.text || '').replace(/\s+/g, ' ').trim();
+    return (e.injection ? '单独插入位置 · ' : '') + (text ? text.slice(0, 40) : '还是空的');
+  }
+  const fold = (group, title, note, body, info = '') => `<details data-group="${group}"><summary>${esc(title)}${info ? ' ' + help(info) : ''}${note ? `<small class="fold-note">${esc(note)}</small>` : ''}</summary><div class="fold-body">${body}</div></details>`;
   function renderEditor() {
     const p = current, o = ops(currentKind), draw = currentKind === 'draw', chat = currentKind === 'chat';
     const used = p.id && p.id === o.active();
-    v.draw(heading(p.id ? '编辑预设' : '新预设', '', draw ? 'Drawing Preset' : chat ? 'Chat Preset' : 'Voice Preset')
-      + `<div class="group pad">${field('名称', input('name', p.name))}${chat
-        ? `${field('读取最近的正文', input('context', p.context, 'number', 'min="0" max="40" step="1"'), '回消息时参考最近几条正文，0 表示不看剧情。')}${field('读取聊天记录', input('history', p.history, 'number', 'min="2" max="200" step="1"'), '回消息时带上最近多少条手机聊天。')}${field('每次刷新朋友圈最多几条', input('posts', p.posts ?? 2, 'number', 'min="1" max="5" step="1"'), '在动态里刷新时，由模型挑 1 到这么多个人发动态。')}${toggle('lore', '带上世界书', p.lore !== false, '聊天、电话和朋友圈也带上酒馆的世界书：和写正文时一样，常驻的条目，以及在名字、最近的正文和聊天里触发关键词的条目（当前角色卡的世界书、全局和聊天绑定的世界书都算）。人设写在世界书里的话要打开。\n\n条目多的话会多占一些上下文。')}${p.lore !== false ? loreFields(p) : ''}${field('带进剧情的写法', textArea('bring', p.bring, 'class="code" rows="4"'), '选中的聊天消息会按这段文字注入下一次正文，只用一次。需要包含 {{聊天记录}}；也可以用 {{用户}}、{{对象}}。')}`
-        : draw
-        ? `${field('每条回复出图数量', input('count', p.count ?? 1, 'number', `min="1" max="${api.drawCountMax}" step="1"`), '每条回复固定出这么多张图。规则里写 {{出图数量}} 会换成这个数字；插件还会在规则最后加一段硬性要求，让张数更稳定。张数越多，出图越久。')}<div class="field"><span>出图块格式${help('规则里写 {{出图格式}} 会换成下面这段（回复后单独配图时，还会多一行「位置」）；{{角色列表}} 会换成已登记的角色和他们的固定外貌；{{出图数量}} 换成张数。别的插件要排除出图内容时，排除标签填 <img></img>。')}</span><pre class="code-preview" style="margin:0">${esc(api.picTagFormat)}</pre></div>`
-        : field('台词格式', textArea('format', p.format, 'class="code"'), '{译文}、{角色}、{情绪}、{文本} 各保留一次。译文供阅读，原语言供语音生成。默认格式是成对的 <tts></tts>，别的插件要排除语音原文时，排除标签填 <tts></tts>。')}</div>
-        ${chat ? memoryFields(p) : ''}
-        <details data-group="preset-injection"><summary>${chat ? '带进剧情的插入位置' : '默认插入设置'} ${help(chat ? '带进剧情的文字插在正文请求的哪里。深度与身份仅在聊天内插入时生效。' : '深度与身份仅在聊天内插入时生效；条目可以单独覆盖。')}</summary><div>${injection(p.injection)}</div></details>
-        ${groupTitle(draw ? '出图规则' : chat ? '聊天与朋友圈规则' : '提示词条目', btn('add-entry', icon('add') + '条目', 'chip-button'))}
-        ${p.entries.map((e, i) => `<details data-group="entry:${esc(e.id)}" ${i === 0 ? 'open' : ''}><summary>${esc(e.title || '未命名条目')}${draw ? esc(engineScope(e)) : ''}${e.enabled ? '' : ' · 已停用'}</summary><div data-entry="${i}">
-          ${toggle('enabled', '启用此条目', e.enabled)}
-          ${field('条目名称', input('title', e.title))}
-          ${draw ? `<div class="field"><span>用在哪个引擎${help('勾了哪个，用那个引擎画图时才把这条规则发给模型。都勾或都不勾就是三个都用。在绘图 App 顶上选用哪个画。')}</span><div class="use-row">${ENGINE_USES.map(([u, l]) => `<label class="use-chip"><input type="checkbox" data-engine-use="${u}" ${!e.engines?.length || e.engines.includes(u) ? 'checked' : ''}><span>${l}</span></label>`).join('')}</div></div>` : ''}
-          ${chat ? `<div class="field"><span>用在</span><div class="use-row">${USES.map(([u, l]) => `<label class="use-chip"><input type="checkbox" data-use="${u}" ${(e.use || []).includes(u) ? 'checked' : ''}><span>${l}</span></label>`).join('')}</div></div>` : ''}${field(draw || chat ? '规则' : '提示词', textArea('text', e.text, 'class="code"'), draw ? '可以用 {{出图格式}}、{{出图数量}}、{{角色列表}}。插件会在最后自动加上格式和张数的硬性要求。' : chat ? '可以用 {{用户}}、{{对象}}；写语音消息规则时用 {{语音格式}}、{{可发语音}}。用在朋友圈的规则只能用 {{用户}}。插件会在最后自动加上输出格式的硬性要求。' : '启用规则的合计文字需包含 {{格式}} 和 {{语言}}。')}
-          ${chat ? '' : toggle('customInjection', '单独设置插入位置', !!e.injection)}${!chat && e.injection ? injection(e.injection, i) : ''}
-          <div class="entry-tools">${btn('entry-up', icon('up') + '上移', 'text-button', `data-index="${i}" ${i === 0 ? 'disabled' : ''}`)}${btn('entry-down', icon('down') + '下移', 'text-button', `data-index="${i}" ${i === p.entries.length - 1 ? 'disabled' : ''}`)}${btn('delete-entry', icon('trash') + '删除', 'text-button', `data-index="${i}"`)}</div>
-        </div></details>`).join('')}
-        <div class="actions">${btn('prompt-preview', icon('eye') + '发送预览', 'secondary')}${p.id ? btn('use-preset', used ? '正在使用' : '保存并使用', 'secondary', used ? 'disabled' : '') : ''}</div>
-        <div class="savebar"><span class="save-state" data-save-state>草稿</span>${btn('save-preset', '保存预设', 'primary')}</div>
-        <div class="actions">${btn('reset-content', icon('refresh') + '恢复成默认内容', 'secondary')}${p.id ? btn('delete-preset', '删除预设', 'danger') : ''}</div>`);
+    const books = (p.loreSkipBooks || []).length, entries = (p.loreSkipEntries || []).length;
+    const basics = chat ? ''
+      : draw ? field('每条回复出图数量', input('count', p.count ?? 1, 'number', `min="1" max="${api.drawCountMax}" step="1"`), '每条回复固定出这么多张图。规则里写 {{出图数量}} 会换成这个数字；插件还会在规则最后加一段硬性要求，让张数更稳定。张数越多，出图越久。\n\n规则里写 {{出图格式}} 会换成下面这段（回复后单独配图时，还会多一行「位置」）；{{角色列表}} 会换成已登记的角色和他们的固定外貌。别的插件要排除出图内容时，排除标签填 <img></img>。\n\n' + api.picTagFormat)
+      : field('正文显示', select('voiceLayout', p.format===FREE_FORMAT?'free':'paired', [['paired','译文与原文配对'],['free','自由正文 · 只渲染 tts 标签']]), '自由正文保留对白的语言和排版，英语、双语括号都可以。标签内仍写角色、情绪、朗读原文。') + field('台词格式', textArea('format', p.format, 'class="code short" rows="3"'), '配对模式：{译文}、{角色}、{情绪}、{文本} 各保留一次。自由正文模式：<tts>{角色}|{情绪}|{文本}</tts>，前面的正文不限制格式。译文供阅读，原语言供语音生成。默认格式是成对的 <tts></tts>，别的插件要排除语音原文时，排除标签填 <tts></tts>。\n\n这里的格式只管正文；手机里的语音消息和电话固定用默认格式，不跟着改。');
+    const marks = p.marks || {inner: [], phone: []}, marked = (marks.inner || []).length + (marks.phone || []).length;
+    const folds = chat
+      ? fold('preset-read', '读多少', `正文 ${p.context} 条 · 聊天 ${p.history} 条`,
+          `${field('读取最近的正文', input('context', p.context, 'number', 'min="0" max="100" step="1"'), '回消息时参考最近几条正文，0 表示不看剧情。')}${field('读取聊天记录', input('history', p.history, 'number', 'min="2" max="500" step="1"'), '回消息时带上最近多少条手机聊天。')}
+          ${field('每条正文最多（字）', input('storyEach', p.storyEach ?? 4000, 'number', 'min="0" step="500"'), '一条正文太长时只取前面这么多字。0 表示不限制。中文大约一个字一个 token。')}${field('正文一共最多（字）', input('storyTotal', p.storyTotal ?? 20000, 'number', 'min="0" step="1000"'), '最近的正文优先，加起来超过这么多字就不再往前读。0 表示不限制。')}
+          ${field('每次刷新朋友圈最多几条', input('posts', p.posts ?? 2, 'number', 'min="1" max="5" step="1"'), '在动态里刷新时，由模型挑 1 到这么多个人发动态。')}`)
+        + fold('preset-lore', '世界书', p.lore === false ? '不带' : books || entries ? `不读 ${books} 本、${entries} 条` : '按触发条件读取',
+          `${toggle('lore', '带上世界书', p.lore !== false, '聊天、电话、朋友圈、论坛和查手机按触发条件带上酒馆的世界书：和写正文时一样，常驻的条目，以及在名字、最近的正文和聊天里触发关键词的条目（当前角色卡的世界书、全局和聊天绑定的世界书都算）。人设写在世界书里的话要打开。\n\n条目多的话会多占一些上下文。')}${p.lore !== false ? loreFields(p) + field('世界书最多（字）', input('loreMax', p.loreMax ?? 30000, 'number', 'min="0" step="1000"'), '手机读世界书时最多放这么多字，只放整条。0 表示插件不另外限制，只按酒馆「世界书」设置里的预算（占上下文的百分比）来。手机的每次请求（聊天、朋友圈、论坛、查手机、电话）都按这些条件读取世界书，放得越多越费 token，也越慢。') : ''}`)
+        + memoryFields(p)
+        + fold('preset-bring', '带进剧情', '', `${field('带进剧情的写法', textArea('bring', p.bring, 'class="code" rows="4"'), '选中的聊天消息会按这段文字注入下一次正文，只用一次。需要包含 {{聊天记录}}；也可以用 {{用户}}、{{对象}}。')}${injection(p.injection)}`, '带进剧情的文字插在正文请求的哪里。深度与身份仅在聊天内插入时生效。')
+      : (draw ? '' : fold('preset-marks', '心声和电话', marked ? `多认 ${marked} 种写法` : '看情绪字段', marksFields(p)))
+        + fold('preset-injection', '默认插入设置', positions.find(x => x[0] === p.injection.position)?.[1] || '', injection(p.injection), '深度与身份仅在聊天内插入时生效；条目可以单独覆盖。');
+    v.draw(heading(p.id ? '编辑预设' : '新预设', btn('preset-more', icon('more'), 'round-button', 'aria-label="更多"'), draw ? 'Drawing Preset' : chat ? 'Chat Preset' : 'Voice Preset')
+      + `<div class="group pad">${field('名称', input('name', p.name))}${basics}</div>${folds}
+        ${groupTitle(draw ? '出图规则' : chat ? '规则' : '提示词条目', btn('add-entry', icon('add') + '条目', 'chip-button'))}
+        <div class="group entry-list">${p.entries.map((e, i) => `<div class="setting-row entry-row${e.enabled ? '' : ' off'}"><button type="button" class="entry-open" data-action="open-entry" data-index="${i}"><span class="row-text"><strong>${esc(e.title || '未命名条目')}</strong><small>${esc(ruleNote(e, draw, chat))}</small></span></button><input class="switch" type="checkbox" data-entry-on="${i}" aria-label="启用「${esc(e.title || '未命名条目')}」" ${e.enabled ? 'checked' : ''}></div>`).join('') || '<p class="hint">还没有规则，点右上角「条目」加一条。</p>'}</div>
+        <div class="savebar"><span class="save-state" data-save-state>${dirty.has(draftKey()) ? '未保存' : '草稿'}</span>${p.id && !used ? btn('use-preset', '使用', 'secondary') : ''}${btn('save-preset', '保存预设', 'primary')}</div>`);
+  }
+  /** One rule in a sheet: name, where it goes, the text; moving and deleting at the bottom. */
+  function openEntry(i) {
+    const e = current?.entries[i];
+    if (!e) return;
+    const draw = currentKind === 'draw', chat = currentKind === 'chat';
+    const d = ctx.dialog(e.title || '未命名条目', `<div data-entry="${i}">
+      ${field('名称', input('title', e.title))}
+      ${draw ? `<div class="field"><span>用在哪个引擎${help('勾了哪个，用那个引擎画图时才把这条规则发给模型。都勾或都不勾就是三个都用。在绘图 App 顶上选用哪个画。')}</span><div class="use-row">${ENGINE_USES.map(([u, l]) => `<label class="use-chip"><input type="checkbox" data-engine-use="${u}" ${!e.engines?.length || e.engines.includes(u) ? 'checked' : ''}><span>${l}</span></label>`).join('')}</div></div>` : ''}
+      ${chat ? `<div class="field"><span>用在${help('私聊、群聊、朋友圈、电话、论坛、查手机都是各自单独的一次请求。勾了哪几个，这条规则就在那几次请求里各出现一次。勾「正文」的话，写正文时也带上。')}</span><div class="use-row">${USES.map(([u, l]) => `<label class="use-chip"><input type="checkbox" data-use="${u}" ${(e.use || []).includes(u) ? 'checked' : ''}><span>${l}</span></label>`).join('')}</div></div>` : ''}
+      ${field(draw || chat ? '规则' : '提示词', textArea('text', e.text, 'class="code" rows="10"'), ruleHelp(e, draw, chat))}
+      ${!draw && !chat ? toggle('customInjection', '单独设置插入位置', !!e.injection) + (e.injection ? injection(e.injection, i) : '') : ''}
+      <div class="entry-tools">${btn('entry-up', icon('up') + '上移', 'text-button', i === 0 ? 'disabled' : '')}${btn('entry-down', icon('down') + '下移', 'text-button', i === current.entries.length - 1 ? 'disabled' : '')}${!draw && !chat && RULE_DEFAULTS[e.id] ? btn('entry-default', icon('refresh') + '恢复这一条', 'text-button') : ''}${btn('delete-entry', icon('trash') + '删除', 'text-button danger-text')}</div></div>`);
+    let next = null;
+    d.onClose(() => { render(); if (next !== null) openEntry(next); });
+    d.body.addEventListener('input', ev => { const el = ev.target; if (el.matches('[data-field]') && el.type !== 'checkbox' && el.tagName !== 'SELECT') update(el, false); });
+    d.body.addEventListener('change', ev => {
+      const el = ev.target;
+      if (el.matches('[data-use]')) setUse(el);
+      else if (el.matches('[data-engine-use]')) setEngines(el);
+      else if (el.matches('[data-field]') && (el.type === 'checkbox' || el.tagName === 'SELECT')) { update(el, false); if (el.dataset.field === 'customInjection') { next = i; d.close(); } }
+    });
+    d.body.addEventListener('click', async ev => {
+      const action = ev.target.closest('[data-action]')?.dataset.action;
+      if (action === 'entry-up' || action === 'entry-down') {
+        const to = i + (action === 'entry-up' ? -1 : 1);
+        if (to < 0 || to >= current.entries.length) return;
+        [current.entries[i], current.entries[to]] = [current.entries[to], current.entries[i]];
+        mark(); next = to; d.close();
+      } else if (action === 'entry-default') {
+        current.entries[i] = {...current.entries[i], text: current.format===FREE_FORMAT&&e.id==='contract'?FREE_CONTRACT_PROMPT:RULE_DEFAULTS[e.id]};
+        d.body.querySelector('[data-field=text]').value = current.entries[i].text;
+        mark(); ctx.notify('这一条换回默认了，记得保存');
+      } else if (action === 'delete-entry') {
+        if (await ctx.confirm('删除这条规则？', '保存预设后生效。')) { current.entries.splice(i, 1); mark(); render(); }
+      }
+    });
   }
 
   const render = () => current ? renderEditor() : renderList();
@@ -174,6 +265,12 @@ export function presetsApp(ctx) {
 
   function update(el, redraw) {
     const key = el.dataset.field, index = el.closest('[data-entry]')?.dataset.entry;
+    if(key==='voiceLayout') {
+      const free=el.value==='free';current.format=free?FREE_FORMAT:DEFAULT_FORMAT;
+      const pairs=[[DEFAULT_PROMPT,FREE_PROMPT],[CONTRACT_PROMPT,FREE_CONTRACT_PROMPT]];
+      for(const entry of current.entries)for(const [paired,open] of pairs)if(entry.text===(free?paired:open))entry.text=free?open:paired;
+      mark();render();return;
+    }
     if (el.dataset.injectionOwner !== undefined) {
       const owner = el.dataset.injectionOwner === 'preset' ? current : current.entries[Number(el.dataset.injectionOwner)];
       owner.injection[key] = key === 'depth' ? Number(el.value) : el.value;
@@ -187,15 +284,13 @@ export function presetsApp(ctx) {
     if (redraw) render();
   }
   v.on('input', '[data-field]', el => { if (current && el.type !== 'checkbox' && el.tagName !== 'SELECT') update(el, false); });
-  v.on('change', '[data-engine-use]', el => {
+  function setEngines(el) {
     const entry = current?.entries[Number(el.closest('[data-entry]')?.dataset.entry)];
     if (!entry) return;
     const list = [...el.closest('.use-row').querySelectorAll('[data-engine-use]')].filter(x => x.checked).map(x => x.dataset.engineUse);
     if (!list.length || list.length === ENGINE_USES.length) delete entry.engines; else entry.engines = list;
-    const summary = el.closest('details')?.querySelector('summary');
-    if (summary) summary.textContent = (entry.title || '未命名条目') + engineScope(entry) + (entry.enabled ? '' : ' · 已停用');
     mark();
-  });
+  }
   v.on('change', '[data-story-key]', el => {
     if (!current) return;
     const keys = new Set(current.memory?.storyKeys || []);
@@ -205,18 +300,37 @@ export function presetsApp(ctx) {
     const line = el.closest('.story-field')?.querySelector('small.hint');
     if (line) line.textContent = keys.size ? '在读：' + [...keys].map(storyName).join('、') : '没有在读';
   });
-  v.on('change', '[data-use]', el => {
+  function setUse(el) {
     const entry = current?.entries[Number(el.closest('[data-entry]')?.dataset.entry)];
     if (!entry) return;
     entry.use = USES.map(([u]) => u).filter(u => u === el.dataset.use ? el.checked : (entry.use || []).includes(u));
+    mark();
+  }
+  // A rule's switch on its row.
+  v.on('change', '[data-entry-on]', el => {
+    const entry = current?.entries[Number(el.dataset.entryOn)];
+    if (!entry) return;
+    entry.enabled = el.checked;
+    el.closest('.entry-row')?.classList.toggle('off', !el.checked);
     mark();
   });
   v.on('change', '[data-field]', el => {
     if (current && (el.type === 'checkbox' || el.tagName === 'SELECT')) update(el, true);
   });
+  /** 心声怎么认 / 电话怎么认: the ticked marks and the user's own, kept on the draft. */
+  function setMarks(kind) {
+    if (!current) return;
+    const ticked = [...v.root.querySelectorAll(`[data-mark="${kind}"]`)].filter(x => x.checked).map(x => x.dataset.pair);
+    const own = (v.root.querySelector(`[data-mark-own="${kind}"]`)?.value || '').split(/[\s,，、]+/).filter(Boolean);
+    current.marks = {inner: [], phone: [], ...current.marks, [kind]: [...new Set([...ticked, ...own])]};
+    mark();
+  }
+  v.on('change', '[data-mark]', el => setMarks(el.dataset.mark));
+  v.on('input', '[data-mark-own]', el => setMarks(el.dataset.markOwn));
   function save() {
-    const key = currentKind + ':' + (current.id || 'new');
+    const key = draftKey();
     current = ops(currentKind).save(current);
+    dirty.delete(key);
     drafts.delete(key);
     drafts.set(currentKind + ':' + current.id, current);
     render();
@@ -226,190 +340,22 @@ export function presetsApp(ctx) {
   v.on('click', '[data-action]', async el => {
     const index = Number(el.dataset.index);
     switch (el.dataset.action) {
-      case 'save-default-voice': {
-        const val = v.root.querySelector('input[data-field="default-voice-val"]')?.value?.trim() || '';
-        api.setDefaultVoice(val);
-        ctx.notify('默认音色已更新');
-        break;
-      }
-      case 'pick-default-voice': {
-        const state = api.getState();
-        const libEntries = state.voiceLibrary || [];
-        const dialog = ctx.dialog('选择默认音色', `<div class="field"><input class="search" type="search" placeholder="搜索音色"></div><div class="group" data-voices>${libEntries.map(r => `<button class="list-row" data-voice="${esc(r.id)}"><span class="disc">${icon('wave')}</span><span style="min-width:0;flex:1;text-align:left"><strong>${esc(r.name)}</strong><small class="mono">${esc(r.id)}</small></span>${icon('next')}</button>`).join('') || '<p class="hint">音色库为空</p>'}</div>`);
-        dialog.body.addEventListener('click', e => {
-          const b = e.target.closest('button[data-voice]');
-          if (b) {
-            api.setDefaultVoice(b.dataset.voice);
-            dialog.close();
-            render();
-            ctx.notify('已设为默认音色');
-          }
-        });
-        break;
-      }
-      case 'auto-voice-toggle': {
-        const cur = api.getState().autoVoice;
-        api.setAutoVoice(!cur);
-        render();
-        ctx.notify(!cur ? '已开启未绑定角色智能匹配' : '已关闭智能匹配');
-        break;
-      }
-      case 'save-current-as-preset': {
-        const name = (await ctx.prompt('保存当前角色为音声方案', '例如：日常角色包、战斗剧场', ''))?.trim();
-        if (!name) break;
-        api.saveVoicePreset(name);
-        ctx.notify(`已保存方案「${name}」`);
-        render();
-        break;
-      }
-      case 'apply-voice-preset': {
-        const name = el.dataset.name;
-        if (await ctx.confirm('应用音声方案？', `将覆盖当前的角色音色绑定为方案「${name}」。`)) {
-          api.applyVoicePreset(name);
-          ctx.notify(`已应用方案「${name}」`);
-          render();
-        }
-        break;
-      }
-      case 'rename-voice-preset': {
-        const oldName = el.dataset.name;
-        const newName = (await ctx.prompt('重命名音声方案', '', oldName))?.trim();
-        if (!newName || newName === oldName) break;
-        api.renameVoicePreset(oldName, newName);
-        ctx.notify('方案已重命名');
-        render();
-        break;
-      }
-      case 'delete-voice-preset': {
-        const name = el.dataset.name;
-        if (await ctx.confirm('删除方案？', `确定删除音声方案「${name}」？当前的角色音色不受影响。`)) {
-          api.deleteVoicePreset(name);
-          ctx.notify('已删除方案');
-          render();
-        }
-        break;
-      }
-      case 'export-voice-presets': {
-        const state = api.getState();
-        const data = { type: 'fish_dialogue_voice_presets', version: 1, presets: state.voicePresets || {} };
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'voice-presets.json'; a.click();
-        ctx.notify('音声方案已导出');
-        break;
-      }
-      case 'import-voice-presets': {
-        const inputEl = document.createElement('input'); inputEl.type = 'file'; inputEl.accept = '.json,application/json';
-        inputEl.onchange = async () => {
-          const file = inputEl.files?.[0];
-          if (!file) return;
-          try {
-            const parsed = JSON.parse(await file.text());
-            const incoming = parsed.presets || (parsed.name ? { [parsed.name]: parsed } : null);
-            if (!incoming || typeof incoming !== 'object') throw new Error('无效的预设 JSON 格式');
-            for (const [k, v] of Object.entries(incoming)) {
-              if (v && v.name) api.saveVoicePreset(v.name, v.defaultVoice, v.voices);
-            }
-            ctx.notify('音声方案导入完成');
-            render();
-          } catch (e) {
-            ctx.notify('导入失败：' + e.message);
-          }
-        };
-        inputEl.click();
-        break;
-      }
-      case 'add-lib-single': {
-        const dialog = ctx.dialog('添加音色到库', `
-          <div class="field"><label>音色 ID</label><input data-id class="text" placeholder="Fish 音色 ID"></div>
-          <div class="field"><label>音色名称</label><input data-name class="text" placeholder="例如：少女音、低沉大叔"></div>
-          <div class="field"><label>主语言分类</label><select data-category><option value="zh">中文</option><option value="ja">日语</option><option value="en">英语</option></select></div>
-          <div class="field"><label>小类/标签</label><input data-sub class="text" placeholder="例如：温柔、御姐、热血（选填）"></div>
-          <div class="field"><label>描述/关键词</label><textarea data-desc rows="2" placeholder="声音特征描述，用于智能匹配（选填）"></textarea></div>
-          <div class="actions">${btn('confirm-add-lib', '添加', 'primary')}</div>
-        `);
-        dialog.body.addEventListener('click', e => {
-          if (e.target.closest('button[data-action="confirm-add-lib"]')) {
-            const id = dialog.body.querySelector('[data-id]').value.trim();
-            const name = dialog.body.querySelector('[data-name]').value.trim();
-            const category = dialog.body.querySelector('[data-category]').value;
-            const sub = dialog.body.querySelector('[data-sub]').value.trim();
-            const desc = dialog.body.querySelector('[data-desc]').value.trim();
-            if (!id || !name) { ctx.notify('音色 ID 和名称不能为空'); return; }
-            api.mergeVoiceLibrary([{ id, name, category, sub, desc }]);
-            dialog.close();
-            render();
-            ctx.notify('已添加到音色库');
-          }
-        });
-        break;
-      }
-      case 'batch-lib-text': {
-        const dialog = ctx.dialog('批量文本导入音色', `
-          <p class="hint">支持 FISH-TTS-TT 文本格式：<br>第一行写分类，如 <code>中文/低沉</code> 或 <code>日语</code>；后续行写 <code>{音色ID} {音色名称}</code></p>
-          <div class="field"><textarea data-batch-text rows="8" placeholder="中文/温柔&#10;7f92e5544d6d4048少女温柔音&#10;日语/御姐&#10;8823901a88bb3321女王"></textarea></div>
-          <div class="actions">${btn('confirm-batch-lib', '解析并导入', 'primary')}</div>
-        `);
-        dialog.body.addEventListener('click', e => {
-          if (e.target.closest('button[data-action="confirm-batch-lib"]')) {
-            const text = dialog.body.querySelector('[data-batch-text]').value;
-            const { entries, invalid } = api.parseVoiceLibraryText(text);
-            if (!entries.length) { ctx.notify('未解析出有效音色，请检查分类标题与音色行格式'); return; }
-            const { added, overwritten } = api.mergeVoiceLibrary(entries);
-            dialog.close();
-            render();
-            ctx.notify(`批量导入完成：新增 ${added} 条，更新 ${overwritten} 条${invalid.length ? '，' + invalid.length + ' 行无法识别' : ''}`);
-          }
-        });
-        break;
-      }
-      case 'export-lib-json': {
-        const state = api.getState();
-        const data = { type: 'fish_dialogue_voice_library', version: 1, voices: state.voiceLibrary || [] };
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'voice-library.json'; a.click();
-        ctx.notify('音色库已导出');
-        break;
-      }
-      case 'import-lib-json': {
-        const inputEl = document.createElement('input'); inputEl.type = 'file'; inputEl.accept = '.json,application/json';
-        inputEl.onchange = async () => {
-          const file = inputEl.files?.[0];
-          if (!file) return;
-          try {
-            const parsed = JSON.parse(await file.text());
-            const rawList = Array.isArray(parsed) ? parsed : (parsed.voices || parsed.library || []);
-            if (!Array.isArray(rawList)) throw new Error('未找到有效音色列表');
-            const { added, overwritten } = api.mergeVoiceLibrary(rawList);
-            ctx.notify(`音色库导入完成：新增 ${added} 条，更新 ${overwritten} 条`);
-            render();
-          } catch (e) {
-            ctx.notify('导入失败：' + e.message);
-          }
-        };
-        inputEl.click();
-        break;
-      }
-      case 'audition-lib-item': {
-        api.auditionVoice(el.dataset.id, el.dataset.lang || 'zh');
-        break;
-      }
-      case 'delete-lib-item': {
-        const id = el.dataset.id;
-        const state = api.getState();
-        const next = (state.voiceLibrary || []).filter(x => x.id !== id);
-        api.saveVoiceLibrary(next);
-        render();
-        ctx.notify('音色已从库中删除');
-        break;
-      }
-
       case 'kind': kind = el.dataset.kind; render(); break;
-      case 'add-preset':
-        currentKind = kind;
-        current = drafts.get(kind + ':new') || {...shipped(kind), name: kind === 'chat' ? '新聊天预设' : kind === 'draw' ? '新出图规则' : '新预设'};
-        drafts.set(kind + ':new', current);
-        render();
+      // ＋: a new preset, or one from a file (a label holds the file input, so phones open the picker on the tap).
+      case 'add-menu': {
+        const label = KINDS.find(k => k[0] === kind)[1];
+        const d = ctx.dialog('新增' + label + '预设', `<div class="pick-list">
+          <button type="button" class="list-row" data-pick="new">${icon('add')}<span><strong>新建</strong><small>从默认内容开始改</small></span></button>
+          <label class="list-row file-button">${icon('import')}<span><strong>从文件导入</strong><small>导出过的预设文件，或 AI 改好的</small></span><input type="file" accept=".json,application/json,text/plain" aria-label="选择预设文件"></label></div>`);
+        d.body.querySelector('[data-pick=new]').addEventListener('click', () => { d.close(); newPreset(); });
+        d.body.querySelector('input[type=file]').addEventListener('change', async e => {
+          const file = e.target.files?.[0];
+          if (!file) return;
+          d.close();
+          try { await importPreset(file); } catch (error) { ctx.notify(error.message, {error: true}); }
+        });
         break;
+      }
       case 'edit-preset': edit(el.dataset.kind || 'tts', el.dataset.id); break;
       // Adds the shipped preset again, for when it was deleted or edited beyond repair. Nothing else changes.
       case 'restore-default': {
@@ -421,48 +367,81 @@ export function presetsApp(ctx) {
         render();
         break;
       }
-      // Puts the shipped rules, format and insertion back into this preset; its name stays. Saving makes it stick.
-      case 'reset-content':
-        if (await ctx.confirm('恢复成默认内容？', '这个预设的条目、格式和插入位置会换成默认的，名字不变。保存之后才生效，不保存就不会改动。')) {
-          current = {...shipped(currentKind), id: current.id, name: current.name};
-          drafts.set(currentKind + ':' + (current.id || 'new'), current);
-          render();
-          mark();
-          ctx.notify('已换成默认内容，记得保存');
-        }
-        break;
       case 'save-preset': save(); break;
       case 'use-preset': save(); ops(currentKind).use(current.id); render(); break;
       case 'lore-pick': await pickLore(); break;
       case 'add-entry':
-        current.entries.push({id: crypto.randomUUID(), title: '新条目', enabled: true, text: ''});
-        render();
-        v.root.querySelector('details:last-of-type').open = true;
+        current.entries.push({id: crypto.randomUUID(), title: '新条目', enabled: true, text: '', ...(currentKind === 'chat' ? {use: ['dm', 'group']} : {})});
         mark();
+        render();
+        openEntry(current.entries.length - 1);
         break;
-      case 'delete-entry': if (await ctx.confirm('删除这条规则？', '保存预设后生效。')) { current.entries.splice(index, 1); render(); mark(); } break;
-      case 'entry-up':
-      case 'entry-down': {
-        const to = index + (el.dataset.action === 'entry-up' ? -1 : 1);
-        if (to >= 0 && to < current.entries.length) { [current.entries[index], current.entries[to]] = [current.entries[to], current.entries[index]]; render(); mark(); }
+      case 'open-entry': openEntry(index); break;
+      case 'preset-more': {
+        const picked = await menu(ctx, current.name || '预设', [
+          {key: 'preview', icon: 'eye', label: '发送预览', note: '看看发给模型的是什么'},
+          {key: 'reset', icon: 'refresh', label: '恢复成默认内容', note: '条目、格式和插入位置换成默认的，名字不变'},
+          {key: 'export', icon: 'download', label: '导出成文件', note: '整份存成一个文件，可以交给 AI 改，改好从「＋」导入'},
+          current.id && {key: 'delete', icon: 'trash', label: '删除预设', danger: true}]);
+        if (picked === 'preview') preview();
+        if (picked === 'reset') await resetContent();
+        if (picked === 'export') await exportPreset();
+        if (picked === 'delete' && await ctx.confirm('删除这个预设？', '角色配音和画风不会被删除。')) { ops(currentKind).remove(current.id); drafts.delete(currentKind + ':' + current.id); current = null; render(); }
         break;
       }
-      case 'delete-preset':
-        if (await ctx.confirm('删除这个预设？', '角色配音和画风不会被删除。')) { ops(currentKind).remove(current.id); drafts.delete(currentKind + ':' + current.id); current = null; render(); }
-        break;
       case 'story-sources': {
         try { storyList = api.storySources(); } catch (error) { ctx.notify(error.message, {error: true}); break; }
         render();
         break;
       }
-      case 'prompt-preview': {
-        const o = ops(currentKind), error = o.validate(current);
-        if (error) throw Error(error);
-        ctx.dialog('发送预览', `<pre class="code-preview">${esc(o.preview(current))}</pre>`);
-        break;
-      }
     }
   });
+  function newPreset() {
+    currentKind = kind;
+    current = drafts.get(kind + ':new') || {...shipped(kind), name: kind === 'chat' ? '新聊天预设' : kind === 'draw' ? '新出图规则' : '新预设'};
+    drafts.set(kind + ':new', current);
+    render();
+  }
+  /** The preset as it is now (unsaved edits too), without its id: one file. */
+  async function exportPreset() {
+    const {id, ...preset} = structuredClone(current), label = KINDS.find(k => k[0] === currentKind)[1];
+    const text = JSON.stringify({format: PRESET_FILE, version: 1, kind: currentKind, preset}, null, 2);
+    try { ctx.notify('已导出 ' + await saveFile(ctx.doc, new Blob([text], {type: 'application/json'}), `${label}预设 ${current.name || ''}`.trim())); }
+    catch (error) { ctx.notify(error.message, {error: true}); }
+  }
+  /** A preset file saved as a new preset of its kind (a name already used gets a number), then opened. */
+  async function importPreset(file) {
+    if (file.size > 2000000) throw Error('文件太大了，不像是一个预设');
+    const {kind: k, preset} = readPresetFile(await file.text(), kind);
+    const names = ops(k).list().map(p => p.name);
+    let name = preset.name, n = 2;
+    while (names.includes(name)) name = `${preset.name}（${n++}）`;
+    const saved = ops(k).save({...shipped(k), ...preset, name});
+    kind = k;
+    edit(k, saved.id);
+    ctx.notify(`已导入「${saved.name}」${saved.id === ops(k).active() ? '' : '，要用它就点下面的「使用」'}`);
+  }
+  // Puts the shipped rules, format and insertion back into this preset; its name stays. Saving makes it stick.
+  async function resetContent() {
+    if (!await ctx.confirm('恢复成默认内容？', '这个预设的条目、格式和插入位置会换成默认的，名字不变。保存之后才生效，不保存就不会改动。')) return;
+    current = {...shipped(currentKind), id: current.id, name: current.name};
+    drafts.set(currentKind + ':' + (current.id || 'new'), current);
+    render();
+    mark();
+    ctx.notify('已换成默认内容，记得保存');
+  }
+  function preview() {
+    const o = ops(currentKind), error = o.validate(current);
+    if (error) { ctx.notify(error, {error: true}); return; }
+    // The chat preset's preview holds one request per place (私聊, 群聊, 朋友圈…): shown one at a time, since all of them
+    // in a row read as if every request carried every copy.
+    const parts = String(o.preview(current)).split(/^━━ (.+?) ━━\n+/m), scenes = [];
+    for (let k = 1; k < parts.length; k += 2) scenes.push([parts[k], parts[k + 1].trim()]);
+    if (scenes.length < 2) { ctx.dialog('发送预览', `<pre class="code-preview">${esc(parts.join(''))}</pre>`); return; }
+    const d = ctx.dialog('发送预览', `<div class="field"><div class="use-row">${scenes.map(([name], k) => `<label class="use-chip"><input type="radio" name="pv-scene" value="${k}" ${k ? '' : 'checked'}><span>${esc(name.replace(/（.*）/, ''))}</span></label>`).join('')}</div></div>
+      <p class="hint">每个地方是单独的一次请求，用到时才发。条目勾了几个地方，就在那几次请求里各出现一次，不会叠在一起。</p><pre class="code-preview" data-pv-scene="${esc(scenes[0][0])}">${esc(scenes[0][1])}</pre>`);
+    d.body.addEventListener('change', e => { const k = Number(e.target.value), pre = d.body.querySelector('.code-preview'); if (!scenes[k]) return; pre.dataset.pvScene = scenes[k][0]; pre.textContent = scenes[k][1]; pre.scrollTop = 0; });
+  }
   render();
   return v;
 }

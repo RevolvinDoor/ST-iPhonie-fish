@@ -1,4 +1,7 @@
+import {installDiagnostics} from '../core/runtime-diagnostics.js';
 import '../core/compat.js';
+import {installHomeSwipe} from './home-swipe.js';
+import {findRoute} from '../core/routes.js';
 import {connectBackend} from './backend-client.js';
 import {glyph, icon, spark, wave} from './icons.js';
 import {esc, avatar, plate, setAvatarPictures} from './common.js';
@@ -14,12 +17,23 @@ import {forumApp} from './forum.js';
 import {peekApp} from './peek.js';
 import {chatApp} from './chat.js';
 import {soundsApp} from './sounds.js';
+import {assistantApp} from './assistant.js';
+import {musicApp} from './music.js';
+import {gamesApp} from './games.js';
+import {bookApp} from './book.js';
+import {indieApp} from './indie.js';
+import {paintApp} from './paint.js';
+import {vnApp} from './vn.js';
+import {logsApp} from './logs.js';
 import {momentsNew, momentsSeen} from './moments.js';
 import {callScreen} from './call.js';
 import {installMotion} from './motion.js';
+import {bindNativeSelects} from './popup-select.js';
+import {grow, launch, nudge, within, visible, islandIn, moving} from './carry.js';
+import {todayPage} from './today.js';
 
 // App factories, keyed by the ids in apps.js.
-const FACTORIES = {roles: rolesApp, engines: enginesApp, presets: presetsApp, library: libraryApp, gallery: galleryApp, notes: notesApp, listen: listenApp, settings: settingsApp, draw: drawApp, chat: chatApp, forum: forumApp, peek: peekApp, sounds: soundsApp};
+const FACTORIES = {roles: rolesApp, engines: enginesApp, presets: presetsApp, library: libraryApp, gallery: galleryApp, notes: notesApp, listen: listenApp, settings: settingsApp, draw: drawApp, chat: chatApp, forum: forumApp, peek: peekApp, sounds: soundsApp, assistant: assistantApp, music: musicApp, games: gamesApp, picbook: bookApp, indie: indieApp, paint: paintApp, vn: vnApp, logs: logsApp};
 const ACTIVE_PHASES = ['playing', 'paused', 'generating', 'waiting'];
 
 // Network and battery in the status bar come from the user's own device (where the browser tells them).
@@ -44,6 +58,9 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
   const doc = win.document;
   const controller = new win.AbortController(), signal = controller.signal;
   const views = new Map(), assets = new Map();
+  const stopDiagnostics = installDiagnostics(win, (...args) => api.reportDiagnostic?.(...args));
+  signal.addEventListener('abort', stopDiagnostics, {once: true});
+  let today = null;
   const media = win.matchMedia('(prefers-color-scheme: dark)'), motion = win.matchMedia('(prefers-reduced-motion: reduce)');
   let panelVisible = true, active = null, locked = false, sheet = null, disposed = false;
   let lastPhase = '', preferences = null, appearanceKey = '', appearanceEpoch = 0, toastTimer, animation, openTimer, unread = 0, unreadTimer, fresh = 0, freshTimer;
@@ -59,13 +76,14 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
           <div class="statusbar"><time data-clock="small"></time><button class="status-icons" data-system="control" aria-label="打开控制中心，或向下拖动"><span class="net" data-net></span><span class="battery" data-battery aria-hidden="true"></span></button></div>
           <button class="pull-tab" data-system="control" aria-label="打开控制中心，也可以从屏幕顶端往下拉"></button><span class="safe-probe" aria-hidden="true"></span>
           <button class="island" data-system="island" aria-label="打开听取"><span class="island-avatar"></span><span class="island-title"></span><span class="island-wave" hidden>${wave}</span><span class="camera"></span></button>
-          <main class="home">
+          <div class="island-card" role="dialog" aria-label="正在播放" hidden><div class="ic-head"><span class="ic-avatar"></span><div><strong data-playing-speaker></strong><small data-playing-message></small></div><span class="island-wave ic-wave">${wave}</span></div><div class="ic-actions"><button data-system="toggle" aria-label="暂停或继续"></button><button data-system="stop" aria-label="停止播放">${icon('stop', true)}</button><button class="ic-open" data-app="listen">打开听取</button></div></div>
+          <main class="home"><div class="today-veil" aria-hidden="true"></div>
             <button class="home-close" data-system="close" aria-label="返回酒馆">${icon('close')}</button>
             <div class="home-pages"></div>
-            <div class="dots" aria-hidden="true"></div>
-            <nav class="phone-dock" aria-label="常用应用"></nav>
+            <div class="home-foot"><div class="dots" aria-hidden="true"></div>
+            <nav class="phone-dock" aria-label="常用应用"></nav></div>
           </main>
-          <section class="app-frame" hidden><header class="app-nav"><button class="nav-button" data-system="back" aria-label="返回">${icon('back')}</button><button class="nav-button" data-system="home" aria-label="返回桌面">${icon('home')}</button></header><div class="app-content"></div></section>
+          <section class="app-frame" hidden><div class="app-window"><header class="app-nav"><button class="nav-button" data-system="back" aria-label="返回">${icon('back')}</button><button class="nav-button" data-system="home" aria-label="返回桌面">${icon('home')}</button></header><div class="app-content"></div></div></section>
           <button class="home-indicator" data-system="home" aria-label="返回桌面"></button>
           <section class="lockscreen" role="dialog" aria-modal="true" aria-label="锁屏" hidden></section>
           <div class="toast" role="status" hidden></div>
@@ -75,7 +93,19 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
   const $ = s => mount.querySelector(s);
   const screen = $('.screen'), home = $('.home'), frame = $('.app-frame'), content = $('.app-content'), lockscreen = $('.lockscreen');
 
-  /** A short note at the bottom. Errors stay longer (20 s), can be closed with ×, and can be selected to copy. */
+  /** A short note out of the island (it grows out of it and goes back in). Errors stay longer (20 s), can be closed
+   *  with ×, and can be selected to copy. */
+  let toastMove = null;
+  function hideToast() {
+    const el = $('.toast');
+    win.clearTimeout(toastTimer);
+    if (el.hidden) return;
+    toastMove?.cancel();
+    toastMove = grow(win, el, islandIn($('.island'), el), {back: true, radius: 16, duration: 240});
+    if (!toastMove) { el.hidden = true; return; }
+    const move = toastMove;
+    move.finished.then(() => { if (toastMove !== move) return; el.hidden = true; move.cancel(); toastMove = null; }, () => {});
+  }
   function notify(text, {error = false} = {}) {
     if (disposed) return;
     if (error) api.noteError?.(text || '操作未完成');
@@ -83,11 +113,20 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
     el.innerHTML = `<span class="toast-text">${esc(text || '操作未完成')}</span>${error ? `<button type="button" class="toast-close" data-toast-close aria-label="关闭提示">${icon('close')}</button>` : ''}`;
     el.classList.toggle('error', error);
     el.setAttribute('role', error ? 'alert' : 'status');
+    const fresh = el.hidden || !!toastMove;
+    toastMove?.cancel(); toastMove = null;
     el.hidden = false;
+    if (fresh) {
+      const island = $('.island');
+      toastMove = grow(win, el, islandIn(island, el), {radius: 16, duration: 380, easing: 'bounce', fade: 1});
+      const move = toastMove;
+      move?.finished.then(() => { if (toastMove === move) toastMove = null; }, () => {});
+      nudge(win, island, [{scale: '1'}, {scale: '1.07 1.12'}, {scale: '1'}], {duration: 360, easing: 'soft'});
+    }
     win.clearTimeout(toastTimer);
-    toastTimer = win.setTimeout(() => el.hidden = true, error ? 20000 : 4500);
+    toastTimer = win.setTimeout(hideToast, error ? 20000 : 4500);
   }
-  const fail = error => notify(error?.message, {error: true});
+  const fail = error => { api.reportDiagnostic?.('小手机界面', error); notify(error?.message, {error: true}); };
   function run(fn) {
     try {
       const result = fn();
@@ -95,10 +134,10 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
       return result;
     } catch (error) { fail(error); }
   }
+  bindNativeSelects(win.document);
   mount.addEventListener('click', e => {
     if (!e.target.closest('[data-toast-close]')) return;
-    win.clearTimeout(toastTimer);
-    $('.toast').hidden = true;
+    hideToast();
   });
   function syncInert() {
     home.inert = !!active || locked || !!sheet;
@@ -108,11 +147,12 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
   }
 
   // ---------- Sheets ----------
-  function dialog(title, html, {top = false} = {}) {
+  /** add: a 「＋」 in the title bar (its label), for a list that grows there; listened for as a click on [data-sheet-add]. */
+  function dialog(title, html, {top = false, add = ''} = {}) {
     sheet?.close(null);
     const focus = doc.activeElement, overlay = doc.createElement('div');
     overlay.className = 'overlay' + (top ? ' top' : '');
-    overlay.innerHTML = `<section class="sheet" role="dialog" aria-modal="true" aria-label="${esc(title)}"><header class="sheet-header"><h2>${esc(title)}</h2><button class="nav-button" data-sheet-close aria-label="关闭">${icon('close')}</button></header><div class="sheet-body">${html}</div></section>`;
+    overlay.innerHTML = `<section class="sheet" role="dialog" aria-modal="true" aria-label="${esc(title)}"><header class="sheet-header"><h2>${esc(title)}</h2>${add ? `<button type="button" class="sheet-add" data-sheet-add aria-label="${esc(add)}">${icon('add')}</button>` : ''}<button class="nav-button" data-sheet-close aria-label="关闭">${icon('close')}</button></header><div class="sheet-body">${html}</div></section>`;
     screen.append(overlay);
     let live = true;
     const callbacks = [];
@@ -121,10 +161,10 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
       body: overlay.querySelector('.sheet-body'),
       get live() { return live; },
       onClose(fn) { callbacks.push(fn); },
-      close(value = null) {
+      close(value = null, {from = 0} = {}) {
         if (!live) return;
         live = false;
-        overlay.remove();
+        leave(overlay, from);
         if (sheet === result) sheet = null;
         syncInert();
         for (const callback of callbacks) callback(value);
@@ -153,14 +193,74 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
       if (e.shiftKey && doc.activeElement === first) { e.preventDefault(); last.focus(); }
       else if (!e.shiftKey && doc.activeElement === last) { e.preventDefault(); first.focus(); }
     });
+    if (!top) dragToClose(overlay, result);
     sheet = result;
     syncInert();
-    overlay.querySelector('button').focus({preventScroll: true});
+    // A bottom sheet takes the focus itself (its × is hidden; focusing it would bring it back into view).
+    const sheetEl = overlay.querySelector('.sheet');
+    if (top) overlay.querySelector('button').focus({preventScroll: true}); else { sheetEl.tabIndex = -1; sheetEl.focus({preventScroll: true}); }
     return result;
+  }
+  /**
+   * A sheet that closes slides down as its shade fades. It is out of the way at once: no clicks, and it is no longer
+   * an .overlay (a new sheet, or a look for an open one, does not find it). from: where a drag let go of it.
+   */
+  function leave(overlay, from = 0) {
+    const panel = overlay.querySelector('.sheet');
+    // Only a plain bottom sheet: the control center has its own way out, a pop-over in 画画 sits where it was put.
+    if (motion.matches || overlay.className !== 'overlay' || typeof panel?.animate !== 'function') { overlay.remove(); return; }
+    overlay.inert = true;
+    overlay.classList.replace('overlay', 'overlay-out');
+    const gone = () => overlay.remove(), h = panel.offsetHeight || 400;
+    overlay.animate([{opacity: 1}, {opacity: 0}], {duration: 240, easing: 'ease-in', fill: 'forwards'});
+    panel.animate([{transform: `translateY(${from}px)`}, {transform: `translateY(${Math.max(140, h * .55)}px)`}], {duration: 240, easing: 'cubic-bezier(.45,0,.8,.55)', fill: 'forwards'}).finished.then(gone, gone);
+    win.setTimeout(gone, 500);
+  }
+  /**
+   * A sheet pulled down by its top (the grabber and the title) follows the finger, its shade lightening; let go far or
+   * fast enough it closes, otherwise it springs back. Pushed up it hardly moves.
+   */
+  function dragToClose(overlay, d) {
+    const panel = overlay.querySelector('.sheet'), head = overlay.querySelector('.sheet-header');
+    let g = null;
+    head.addEventListener('pointerdown', e => {
+      if (e.button > 0 || overlay.className !== 'overlay' || e.target.closest('button,input,select,textarea,a')) return;
+      g = {id: e.pointerId, y: e.clientY, dy: 0, v: 0, last: {y: e.clientY, t: e.timeStamp}, on: false};
+    });
+    head.addEventListener('pointermove', e => {
+      if (!g || e.pointerId !== g.id) return;
+      const dy = e.clientY - g.y;
+      if (!g.on) {
+        if (Math.abs(dy) < 6) return;
+        if (dy < 0) { g = null; return; }
+        g.on = true;
+        try { head.setPointerCapture(e.pointerId); } catch { /* fine */ }
+        panel.style.animation = 'none'; panel.style.transition = 'none';
+      }
+      g.dy = dy < 0 ? -Math.sqrt(-dy) * 2 : dy;
+      const h = panel.offsetHeight || 400;
+      panel.style.transform = `translateY(${g.dy}px)`;
+      overlay.style.backgroundColor = `rgba(10,20,40,${(.36 * (1 - Math.min(1, Math.max(0, g.dy) / h))).toFixed(3)})`;
+      if (e.timeStamp > g.last.t) { g.v = (e.clientY - g.last.y) / (e.timeStamp - g.last.t); g.last = {y: e.clientY, t: e.timeStamp}; }
+    });
+    const end = e => {
+      if (!g || e.pointerId !== g.id) return;
+      const was = g;
+      g = null;
+      if (!was.on) return;
+      const h = panel.offsetHeight || 400, fresh = e.timeStamp - was.last.t < 90;
+      if (e.type !== 'pointercancel' && (was.dy > h * .28 || (fresh && was.v > .55 && was.dy > 20))) { d.close(null, {from: was.dy}); return; }
+      panel.style.transition = 'transform .5s cubic-bezier(.2,1.25,.3,1)';
+      panel.style.transform = '';
+      overlay.style.backgroundColor = '';
+      win.setTimeout(() => { panel.style.transition = ''; }, 520);
+    };
+    head.addEventListener('pointerup', end);
+    head.addEventListener('pointercancel', end);
   }
   function confirm(title, text = '') {
     return new Promise(resolve => {
-      const d = dialog(title, `<p class="help-copy">${esc(text)}</p><div class="actions"><button type="button" class="secondary" data-action="cancel">取消</button><button type="button" class="primary" data-action="confirm">确认</button></div>`);
+      const d = dialog(title, `<p class="help-copy" data-keep-hint>${esc(text)}</p><div class="actions"><button type="button" class="secondary" data-action="cancel">取消</button><button type="button" class="primary" data-action="confirm">确认</button></div>`);
       d.onClose(value => resolve(value === true));
       d.body.addEventListener('click', e => {
         const action = e.target.closest('button')?.dataset.action;
@@ -169,12 +269,12 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
       });
     });
   }
-  const help = text => dialog('说明', `<p class="help-copy">${esc(text)}</p>`);
+  const help = text => dialog('说明', `<p class="help-copy" data-keep-hint>${esc(text)}</p>`);
 
-  const routeFor = name => api.getState().routes.find(r => r.name === name);
+  const routeFor = name => findRoute(api.getState().routes, name);
   const engineOf = name => { const r = routeFor(name); return r?.voice ? r.engine : 'none'; };
   const ctx = {api, doc, win, notify, dialog, confirm, help, lock, open, routeFor, engineOf, openPendingRole: name => openPendingRole(name), visible: name => active === name && !locked,
-    editEngine: id => views.get('engines')?.edit?.(id), showPresetKind: kind => views.get('presets')?.showKind?.(kind), momentsSeen: () => { if (fresh) { fresh = 0; renderHome(); } }};
+    editEngine: id => views.get('engines')?.edit?.(id), showPresetKind: kind => views.get('presets')?.showKind?.(kind), openDraw: request => { open('draw'); views.get('draw')?.load?.(request); }, momentsSeen: () => { if (fresh) { fresh = 0; renderHome(); } }};
   installMotion(win, mount, signal);
   // On a computer the phone is a floating window: its top bar moves it.
   const stageBar = $('.stage-bar'), sizeButton = $('[data-system=size]');
@@ -202,37 +302,85 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
   const callState = () => { try { const c = api.callStatus?.() || null; calls.update(c?.state === 'ended' ? null : c); } catch { /* not in the tavern */ } };
 
   // ---------- Navigation ----------
-  function open(name, roleId) {
+  // An app grows out of what opened it (its icon, the island) and shrinks back into it, or into its icon, on the way
+  // home, as on an iPhone (ui/carry.js launch); the home screen zooms past behind it. Turning round halfway (home
+  // while it opens, or the icon again while it closes) carries on from where the window is. Without motion it just shows.
+  let carrying = [], openedFrom = null, launching = null;
+  function stopCarry() { const o = launching ? {at: launching.openness(), speed: launching.speed()} : null; for (const a of carrying) a?.cancel(); carrying = []; launching = null; delete screen.dataset.carrying; return o; }
+  const iconOf = name => home.querySelector(`.app-icon[data-app="${name}"] .icon-tile`);
+  function open(name, roleId, from = null) {
     if (!FACTORIES[name]) return;
     sheet?.close(null);
     unlock();
+    const source = from || (!active && !home.hidden ? iconOf(name) : null);
+    const was = stopCarry();
+    if (active && active !== name) views.get(active)?.leave?.();
     active = name;
     let v = views.get(name);
     if (!v) { v = FACTORIES[name](ctx); views.set(name, v); content.append(v.root); }
     else run(() => v.refresh());
     for (const [id, view] of views) view.root.hidden = id !== name;
-    home.hidden = true;
     frame.hidden = false;
     screen.dataset.view = 'app';
-    screen.dataset.opening = 'true';
-    win.clearTimeout(openTimer);
-    openTimer = win.setTimeout(() => delete screen.dataset.opening, 260);
+    openedFrom = source;
+    const grown = source && !home.hidden ? launch(win, screen, frame, source, {home, ...(was || {})}) : null;
+    if (grown) {
+      screen.dataset.carrying = '';
+      carrying = [grown]; launching = grown;
+      grown.finished.then(ok => { if (!ok || launching !== grown) return; if (active === name) home.hidden = true; grown.cancel(); delete screen.dataset.carrying; carrying = []; launching = null; });
+    } else {
+      // Not out of an icon: the page rises in.
+      home.hidden = true;
+      screen.dataset.opening = 'true';
+      win.clearTimeout(openTimer);
+      openTimer = win.setTimeout(() => delete screen.dataset.opening, 260);
+    }
     syncInert();
     $('.app-nav [data-system=back]').focus({preventScroll: true});
     if (roleId && v.edit) v.edit(roleId);
     v.onPlayback?.(playback);
   }
-  function showHome() {
+  function showHome(immediate = false) {
     sheet?.close(null);
     if (locked) return;
-    const arriving = active !== null;
+    const leaving = active, was = stopCarry();
+    if (leaving) views.get(leaving)?.leave?.();
     active = null;
     home.hidden = false;
-    frame.hidden = true;
     screen.dataset.view = 'home';
+    placeHome();
     syncInert();
-    if (arriving) homeIn();
+    if (immediate) { frame.hidden = true; today?.leave(); const pagesEl = $('.home-pages'); pagesEl.scrollLeft = pagesEl.clientWidth; homeIn(); return; }
+    if (!leaving) { frame.hidden = true; today?.leave(); const pagesEl = $('.home-pages'); pagesEl.scrollTo({left: pagesEl.clientWidth, behavior: moving(win) ? 'smooth' : 'auto'}); return; }
+    // Back into what it came out of, or its own icon on the page showing; else it sinks away in the middle.
+    const target = [openedFrom, iconOf(leaving)].find(el => el?.isConnected && visible(within(el, frame)));
+    const shrink = target ? launch(win, screen, frame, target, {back: true, home, ...(was || {})}) : null;
+    if (shrink) {
+      screen.dataset.carrying = '';
+      carrying = [shrink]; launching = shrink;
+      shrink.finished.then(ok => { if (!ok || launching !== shrink) return; if (!active) frame.hidden = true; shrink.cancel(); delete screen.dataset.carrying; carrying = []; launching = null; });
+      return;
+    }
+    // No icon to go back into: it sinks away in the middle.
+    const sink = nudge(win, frame, [{transform: 'scale(1)', opacity: 1}, {transform: 'scale(.9)', opacity: 0}], {duration: 240, easing: 'out', fill: 'forwards'});
+    if (!sink) { frame.hidden = true; homeIn(); return; }
+    screen.dataset.carrying = '';
+    const back = nudge(win, home, [{transform: 'scale(1.06)', opacity: 0}, {transform: 'scale(1)', opacity: 1}], {duration: 340, easing: 'out'});
+    carrying = [sink, back];
+    sink.finished.then(() => { if (carrying[0] !== sink) return; if (!active) frame.hidden = true; sink.cancel(); delete screen.dataset.carrying; carrying = []; }, () => {});
   }
+  /** The first app page shows first, the first time the home screen can be seen (not while an app hides it); 今天 is a swipe to the right. */
+  let placed = false;
+  function placeHome() { const el = $('.home-pages'); if (placed || !today || home.hidden || !el.clientWidth) return; el.scrollLeft = el.clientWidth; placed = true; }
+  // The dots and the dock float over the bottom of the pages: the app pages keep their height clear.
+  const foot = $('.home-foot'), footRoom = () => { if (foot.offsetHeight) home.style.setProperty('--home-foot', foot.offsetHeight + 'px'); };
+  if (win.ResizeObserver) { const watch = new win.ResizeObserver(footRoom); watch.observe(foot); signal.addEventListener('abort', () => watch.disconnect()); }
+  // The phone may open hidden (a closed panel): placed when it first has a size.
+  if (win.ResizeObserver) { const watch = new win.ResizeObserver(() => { placeHome(); if (placed) watch.disconnect(); }); watch.observe($('.home-pages')); signal.addEventListener('abort', () => watch.disconnect()); }
+  /** The app page showing (0: the first), 今天 not counted; -1 on 今天. */
+  function pageNow() { const el = $('.home-pages'); return Math.round(el.scrollLeft / (el.clientWidth || 1)) - (today ? 1 : 0); }
+  let todayTimer = 0;
+  function todayLater() { win.clearTimeout(todayTimer); todayTimer = win.setTimeout(() => run(() => today?.refresh()), 300); }
   // Icons and widgets come in one after another when the home screen appears (not when a badge redraws it).
   let homeTimer = 0;
   function homeIn() {
@@ -243,6 +391,8 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
     homeTimer = win.setTimeout(() => delete screen.dataset.homeIn, 800);
   }
   function back() {
+    // The page an app draws next comes in from the left (ui/common.js).
+    screen.dataset.navBack = String(Date.now());
     if (sheet) { sheet.close(null); return; }
     if (locked) { unlock(); return; }
     if (active && views.get(active)?.back?.()) return;
@@ -250,6 +400,7 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
   }
   function lock() {
     sheet?.close(null);
+    if (active) views.get(active)?.leave?.();
     locked = true;
     renderLock();
     lockscreen.hidden = false;
@@ -262,6 +413,7 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
     lockscreen.hidden = true;
     syncInert();
     if (!active) homeIn();
+    if (active && panelVisible && !doc.hidden) run(() => views.get(active)?.resume?.());
     if (active) $('.app-nav [data-system=back]').focus({preventScroll: true});
     else home.querySelector('.app-icon')?.focus({preventScroll: true});
   }
@@ -273,11 +425,14 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
   }
 
   // ---------- Clock and theme ----------
+  let lastClock = '';
   function clock() {
     const now = new Date();
     const time = now.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit', hour12: false});
     const date = now.toLocaleDateString('zh-CN', {month: 'long', day: 'numeric', weekday: 'long'});
     for (const el of mount.querySelectorAll('[data-clock]')) el.textContent = el.dataset.clock === 'date' ? date : time;
+    // The 今天 clock and calendar move on with the minute.
+    if (time !== lastClock) { lastClock = time; today?.paint(['clock', 'calendar']); }
   }
   const isDark = () => doc.documentElement.dataset.theme === 'dark';
   function applyThemeMode() {
@@ -306,8 +461,13 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
     const pages = shown.map((ids, index) => `<div class="home-page">${index === 0
       ? `<div class="clock-block"><p class="home-date" data-clock="date"></p><p class="home-clock" data-clock="large"></p></div><div class="widgets"><button class="widget live-wave" data-system="island" data-widget="playing"></button><div class="widget" data-widget="cast"></div></div>`
       : ''}<div class="apps-grid">${ids.map(appIcon).join('')}</div></div>`).join('');
-    $('.home-pages').innerHTML = pages;
-    $('.dots').innerHTML = shown.length > 1 ? shown.map((_, i) => `<i${i === 0 ? ' data-on' : ''}></i>`).join('') : '';
+    // 今天 (ui/today.js) stays first and is not drawn again; the app pages after it are.
+    const pagesEl = $('.home-pages'), made = doc.createElement('template');
+    made.innerHTML = pages;
+    pagesEl.replaceChildren(...(today ? [today.root] : []), ...made.content.children);
+    placeHome();
+    $('.dots').innerHTML = shown.length > 1 ? shown.map((_, i) => `<i${i === pageNow() ? ' data-on' : ''}></i>`).join('') : '';
+    today?.paint();
     $('.phone-dock').innerHTML = HOME.dock.map(appIcon).join('');
     clock();
     renderWidgets();
@@ -328,16 +488,60 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
         : `<span class="widget-line">还没有角色</span><button class="chip-button" data-app="roles">新增角色</button>`}`;
     }
   }
+  // ---------- 音乐 on the lock screen and in the control center ----------
+  const musicNow = () => { try { return api.musicStatus?.() || null; } catch { return null; } };
+  const musicLine = s => { const t = s?.track; return !t ? '点这里打开音乐' : s.phase === 'loading' ? '正在找这首歌……' : s.phase === 'error' ? s.message : s.lyric || (t.artist || (t.from === 'bgm' ? '背景音乐' : '')); };
+  /** The song playing (cover, song, its lyric line, previous / play / next); a tap on the song opens 音乐. */
+  function musicTile(where) {
+    const s = musicNow(), t = s?.track, playing = s?.phase === 'playing';
+    if (!t && where === 'lock') return '';
+    const line = musicLine(s);
+    return `<div class="${where === 'lock' ? 'widget' : 'control-tile wide'} music-tile" data-music-tile data-song="${esc(t ? t.title + '|' + t.artist : '')}" data-has="${!!t}" data-playing="${playing ? '1' : ''}">
+      <button type="button" class="music-tile-open" data-app="music" aria-label="打开音乐"><span class="music-tile-disc" aria-hidden="true">${icon('music')}</span><span class="music-tile-text"><strong>${esc(t ? t.title : '音乐')}</strong><small data-music-line>${esc(line)}</small></span></button>
+      ${t ? `<span class="music-tile-buttons"><button type="button" data-music="prev" aria-label="上一首">${icon('prev', true)}</button><button type="button" data-music="toggle" data-on="${playing}" aria-label="${playing ? '暂停' : '播放'}">${icon(playing ? 'pause' : 'play', true)}</button><button type="button" data-music="next" aria-label="下一首">${icon('skip', true)}</button></span>` : ''}</div>`;
+  }
+  /** The song changed, or its lyric line: every music tile on screen follows — patched in place while the same song
+   *  plays (rebuilt each second, its turning disc would start over), rebuilt for another song. */
+  function paintMusic() {
+    const s = musicNow(), t = s?.track, songKey = t ? t.title + '|' + t.artist : '';
+    for (const el of mount.querySelectorAll('[data-music-tile]')) {
+      const where = el.classList.contains('widget') ? 'lock' : 'control';
+      if (el.dataset.song === songKey && el.dataset.has === String(!!t)) {
+        const playing = s?.phase === 'playing';
+        el.dataset.playing = playing ? '1' : '';
+        const line = el.querySelector('[data-music-line]'), text = musicLine(s);
+        if (line && line.textContent !== text) line.textContent = text;
+        const b = el.querySelector('[data-music=toggle]');
+        if (b && b.dataset.on !== String(playing)) { b.dataset.on = String(playing); b.innerHTML = icon(playing ? 'pause' : 'play', true); b.setAttribute('aria-label', playing ? '暂停' : '播放'); }
+        continue;
+      }
+      const html = musicTile(where);
+      if (!html) { el.remove(); continue; }
+      const tpl = doc.createElement('template'); tpl.innerHTML = html;
+      el.replaceWith(tpl.content.firstElementChild);
+    }
+    // A song started while the lock screen shows and it had no music widget yet.
+    if (locked && !lockscreen.querySelector('[data-music-tile]')) { const html = musicTile('lock'); if (html) lockscreen.querySelector('.lock-bottom')?.insertAdjacentHTML('beforebegin', html); }
+  }
+  mount.addEventListener('click', e => {
+    const b = e.target.closest('[data-music]');
+    if (!b) return;
+    e.stopPropagation();
+    const go = {prev: api.musicPrev, toggle: api.musicToggle, next: api.musicNext}[b.dataset.music];
+    if (go) run(() => go());
+  }, {signal, capture: true});
   function renderLock() {
     const on = ACTIVE_PHASES.includes(playback.phase) && playback.speaker;
     lockscreen.innerHTML = `${icon('lock')}<p class="home-date" data-clock="date"></p><p class="home-clock" data-clock="large"></p>
       <div class="widget live-wave" data-engine="${on ? engineOf(playback.speaker) : 'none'}"><span class="widget-head"><span class="eyebrow">Now Playing</span>${wave}</span>${on ? `<span class="who">${avatar(playback.speaker, engineOf(playback.speaker), 30)}${plate(playback.speaker)}</span>` : ''}<span class="widget-line" data-playing-message>${esc(playback.line?.translation || playback.message || '点击台词开始')}</span></div>
+      ${musicTile('lock')}
       <div class="lock-bottom"><button class="primary" data-system="unlock">点这里进入</button><button class="chip-button" data-system="unlock">跳过锁屏</button></div>`;
     clock();
   }
 
   async function appearance(phone) {
     preferences = phone;
+    today?.setList(phone.widgets);
     applyThemeMode();
     const dark = isDark();
     const key = JSON.stringify([phone.wallpaper, phone.icons, phone.iconStyle, dark]);
@@ -365,6 +569,34 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
 
   /** 动态壁纸 on or off (settings); the CSS also stops it for reduced motion and while an app is open. */
   function wallMotion() { screen.dataset.wallMotion = api.getState().general.wallpaperMotion === false ? 'off' : 'on'; }
+
+  // ---------- The island's mini player ----------
+  // A tap on the island while something plays opens it into a small player (who, the line, pause, stop, 听取); a tap
+  // anywhere else, or the playing ending, takes it back in.
+  let cardMove = null;
+  const card = () => $('.island-card');
+  function openCard() {
+    const el = card();
+    if (!el.hidden && !cardMove) return;
+    cardMove?.cancel(); cardMove = null;
+    el.hidden = false;
+    $('.island').dataset.open = '';
+    cardMove = grow(win, el, islandIn($('.island'), el), {radius: 16, duration: 380, easing: 'bounce', fade: 1});
+    const move = cardMove;
+    move?.finished.then(() => { if (cardMove === move) cardMove = null; }, () => {});
+    el.querySelector('[data-system=toggle]')?.focus({preventScroll: true});
+  }
+  function closeCard({now = false} = {}) {
+    const el = card();
+    if (el.hidden) return;
+    cardMove?.cancel();
+    cardMove = now ? null : grow(win, el, islandIn($('.island'), el), {back: true, radius: 16, duration: 240});
+    const done = () => { el.hidden = true; delete $('.island').dataset.open; };
+    if (!cardMove) { done(); return; }
+    const move = cardMove;
+    move.finished.then(() => { if (cardMove !== move) return; done(); move.cancel(); cardMove = null; }, () => {});
+  }
+  mount.addEventListener('pointerdown', e => { if (!card().hidden && !e.target.closest('.island-card,.island')) closeCard(); }, {signal, capture: true});
 
   // ---------- Playback ----------
   function animate() {
@@ -402,8 +634,13 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
     $('.island-avatar').textContent = (state.speaker || '').slice(0, 1);
     $('.island-title').textContent = on ? (state.phase === 'waiting' ? '等待 ' + state.speaker : state.speaker || '听取') : '';
     $('.island-wave').hidden = !on || state.phase === 'waiting';
+    const c = card();
+    c.dataset.engine = island.dataset.engine;
+    c.querySelector('.ic-avatar').innerHTML = on && state.speaker ? avatar(state.speaker, engineOf(state.speaker), 40) : '';
+    if (!on || !state.speaker) closeCard();
     island.setAttribute('aria-label', on ? '查看 ' + state.speaker + ' 的播放状态' : '打开听取');
     renderWidgets();
+    today?.paint(['playing']);
     for (const el of mount.querySelectorAll('[data-playing-speaker]')) el.textContent = state.speaker || '等待播放';
     for (const el of mount.querySelectorAll('[data-playing-message]')) el.textContent = state.line?.translation || state.message || '点击台词开始';
     for (const el of mount.querySelectorAll('[data-system=toggle]')) {
@@ -464,6 +701,7 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
     for (const el of mount.querySelectorAll('[data-net-label]')) el.textContent = n.label;
     for (const el of mount.querySelectorAll('[data-battery-label]')) el.textContent = b ? `${b.level}%${b.charging ? ' · 充电中' : b.low ? ' · 电量低' : ''}` : '电量未知';
     $('.status-icons').setAttribute('aria-label', `打开控制中心，或向下拖动（${n.label}，${batteryText}）`);
+    today?.paint(['battery']);
   }
   win.addEventListener('online', paintDevice, {signal});
   win.addEventListener('offline', paintDevice, {signal});
@@ -483,6 +721,7 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
     const d = dialog('控制中心', `<div class="control-grid">
       <div class="control-tile wide cc-device"><span class="net" data-net></span><span data-net-label></span><span class="cc-battery"><span class="battery" data-battery aria-hidden="true"></span><span data-battery-label></span></span></div>
       <div class="control-tile wide live-wave" data-engine="${on ? engineOf(playback.speaker) : 'none'}">${on ? avatar(playback.speaker, engineOf(playback.speaker), 42) : wave}<div><strong data-playing-speaker></strong><small data-playing-message></small></div><button class="play-round" data-system="toggle" aria-label="暂停或继续">${icon('play', true)}</button></div>
+      ${musicTile('control')}
       <div class="control-tile wide" style="flex-direction:column;align-items:stretch"><div class="meter-label"><span>播放音量</span><output>${Math.round(p.volume * 100)}%</output></div><input class="slider" data-control="volume" type="range" min="0" max="100" value="${Math.round(p.volume * 100)}" aria-label="播放音量"></div>
       <div class="control-tile wide cc-toggles">${toggles.map(([key, glyphKey, label, value]) => `<button class="cc-toggle" data-control="${key}" aria-pressed="${value}"><span class="bubble">${icon(glyphKey)}</span>${label}</button>`).join('')}<button class="cc-toggle" data-system="power" aria-pressed="true"><span class="bubble">${icon('lock')}</span>锁屏</button></div>
       <div class="control-tile wide" style="flex-direction:column;align-items:stretch"><span>主题</span><div class="segmented">${[['system', '跟随系统'], ['light', '日间'], ['dark', '夜间']].map(([key, label]) => `<button data-theme="${key}" aria-pressed="${p.theme === key}">${label}</button>`).join('')}</div></div>
@@ -590,7 +829,7 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
   mount.addEventListener('click', event => {
     const b = event.target.closest('button');
     if (!b || b.disabled) return;
-    if (b.dataset.app) { open(b.dataset.app); return; }
+    if (b.dataset.app) { open(b.dataset.app, undefined, b.closest('.island-card') || b.querySelector('.icon-tile') || b); closeCard({now: true}); return; }
     if (b.dataset.openRole) { open('roles', b.dataset.openRole); return; }
     if (b.hasAttribute('data-slot')) { notify('这个位置留给以后的新 App'); return; }
     if (!b.dataset.system) return;
@@ -603,44 +842,29 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
         case 'unlock': unlock(); break;
         case 'island': {
           const pending = playback.phase === 'waiting' && api.pendingRole();
-          if (pending) openPendingRole(pending); else open('listen');
+          if (pending) openPendingRole(pending);
+          else if (b.hasAttribute('data-active') && b.classList.contains('island')) { if (card().hidden) openCard(); else closeCard(); }
+          else open('listen', undefined, b);
           break;
         }
         case 'control': if (Date.now() - pulledAt > 400) control(); break;
         case 'size': b.textContent = api.panelSize?.() || b.textContent; break;
         case 'toggle': api.toggle(); break;
-        case 'help': help('桌面左右滑动翻页，图标打开对应应用；底部横条或左上角返回键回到桌面。\n从屏幕顶端往下拉（或点右上角的信号和电量）打开控制中心，往上推收起。侧键可以看锁屏，锁屏随时可以跳过。\n\n信号和电量是你设备上的真实状态（有的浏览器不提供电量，比如 Safari、Firefox）。语音只在点击台词、播放或试听时生成。'); break;
+        case 'stop': api.stop(); break;
+        case 'help': help('桌面左右滑动翻页，图标打开对应应用；第一页再往右滑是「今天」小组件页，点「编辑」或长按小组件可以添加、移除、拖动换位置；底部横条或左上角返回键回到桌面。\n从屏幕顶端往下拉（或点右上角的信号和电量）打开控制中心，往上推收起。侧键可以看锁屏，锁屏随时可以跳过。\n\n信号和电量是你设备上的真实状态（有的浏览器不提供电量，比如 Safari、Firefox）。语音只在点击台词、播放或试听时生成。'); break;
       }
     });
   }, {signal});
-  // A mouse drags the home screen sideways to change page (fingers swipe it natively); a drag is not also a tap.
-  {
-    const pagesEl = $('.home-pages');
-    let drag = null, dragged = 0;
-    pagesEl.addEventListener('pointerdown', e => { if (e.pointerType === 'mouse' && e.button === 0 && pagesEl.children.length > 1) drag = {id: e.pointerId, x: e.clientX, left: pagesEl.scrollLeft, moved: false}; }, {signal});
-    win.addEventListener('pointermove', e => {
-      if (!drag || e.pointerId !== drag.id) return;
-      const dx = e.clientX - drag.x;
-      if (!drag.moved && Math.abs(dx) < 6) return;
-      if (!drag.moved) { drag.moved = true; pagesEl.style.scrollSnapType = 'none'; pagesEl.style.scrollBehavior = 'auto'; }
-      pagesEl.scrollLeft = drag.left - dx;
-    }, {signal});
-    win.addEventListener('pointerup', e => {
-      const d = drag; drag = null;
-      if (!d?.moved) return;
-      const w = pagesEl.clientWidth || 1, dx = e.clientX - d.x;
-      let page = Math.round(d.left / w);
-      if (Math.abs(dx) > w * 0.15) page += dx < 0 ? 1 : -1;
-      page = Math.max(0, Math.min(pagesEl.children.length - 1, page));
-      pagesEl.style.scrollSnapType = ''; pagesEl.style.scrollBehavior = '';
-      pagesEl.scrollTo({left: page * w, behavior: 'smooth'});
-      dragged = Date.now();
-    }, {signal});
-    pagesEl.addEventListener('click', e => { if (Date.now() - dragged < 350) { e.stopPropagation(); e.preventDefault(); } }, {signal, capture: true});
-  }
+  // A drag pages the desktop without selecting its labels or dragging images.
+  installHomeSwipe($('.home-pages'),{signal});
+  // How far 今天 is in (1: all of it): the wallpaper blurs and the dock and dots go, following the finger.
   $('.home-pages').addEventListener('scroll', e => {
-    const i = Math.round(e.target.scrollLeft / (e.target.clientWidth || 1));
+    const w = e.target.clientWidth || 1, i = pageNow(), into = today ? Math.min(1, Math.max(0, 1 - e.target.scrollLeft / w)) : 0;
     mount.querySelectorAll('.dots i').forEach((dot, k) => dot.toggleAttribute('data-on', k === i));
+    home.style.setProperty('--today', into.toFixed(3));
+    home.toggleAttribute('data-today', into > .5);
+    home.toggleAttribute('data-today-in', into > .002);
+    if (into < .2 && today?.editing) today.leave();
   }, {signal, passive: true});
   // Mouse and pen through pointer events; fingers through touch events, whose moves can be held back from scrolling.
   mount.addEventListener('pointerdown', e => { if (e.pointerType !== 'touch' && e.button === 0) gestureStart(e.target, e.clientX, e.clientY); }, {signal});
@@ -664,7 +888,7 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
     }
   }, {signal});
   doc.addEventListener('pointerdown', () => delete doc.documentElement.dataset.keyboard, {signal});
-  doc.addEventListener('visibilitychange', animate, {signal});
+  doc.addEventListener('visibilitychange', () => { if (doc.hidden && active) views.get(active)?.leave?.(); else if (active && !locked && panelVisible) run(() => views.get(active)?.resume?.()); animate(); }, {signal});
   media.addEventListener('change', theme, {signal});
   motion.addEventListener('change', animate, {signal});
 
@@ -676,21 +900,25 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
       lastPhase = event.phase;
       paintPlayback(event);
     }
-    if (event.type === 'settings') { theme(); renderWidgets(); animate(); wallMotion(); run(refreshAvatars); }
+    if (event.type === 'settings') { theme(); renderWidgets(); today?.paint(['cast', 'wallet']); animate(); wallMotion(); run(refreshAvatars); }
     if (event.type === 'phone') run(() => appearance(event.preferences));
+    if (['chat', 'library', 'space'].includes(event.type)) todayLater();
     if (event.type === 'library') {
-      const key = ({favorites: 'library', cache: 'library', photos: 'gallery', notes: 'notes'})[event.collection];
+      const key = ({favorites: 'library', cache: 'library', photos: 'gallery', notes: 'notes', books: 'picbook'})[event.collection];
       if (active === key) run(() => views.get(key)?.refresh());
     }
     if (event.type === 'audio-ready') views.get('listen')?.onPlayback?.(api.status());
     if (event.type === 'draw') views.get('draw')?.onDraw?.(event);
+    if (event.type === 'logs') views.get('logs')?.onLogs?.();
+    if (event.type === 'assistant') run(() => views.get('assistant')?.onAssistant?.(event));
+    if (event.type === 'music') { run(() => views.get('music')?.onMusic?.(event)); paintMusic(); }
     if (event.type === 'balance') run(() => views.get('engines')?.onBalance?.(event));
-    if (event.type === 'chat') { run(() => views.get('chat')?.onChat?.(event)); countUnread(); }
+    if (event.type === 'chat') { run(() => views.get('chat')?.onChat?.(event)); countUnread(); if (event.incoming && !(active === 'chat' && views.get('chat')?.showing?.() === event.threadId)) notify(`${event.incoming.from}：${event.incoming.kind === 'text' ? event.incoming.text : '发来' + (event.incoming.count > 1 ? ` ${event.incoming.count} 条` : '一条') + '消息'}`.slice(0, 80)); }
     if (event.type === 'moments') { views.get('chat')?.onMoments?.(event); countMoments(); }
     if (event.type === 'call') calls.update(event.call);
     if (event.type === 'forum' || event.type === 'peek') { const app = event.type; if (active === app) run(() => views.get(app)?.refresh()); }
     // 分区: another card was opened in the tavern; the open app and the badges follow it.
-    if (event.type === 'space') { if (active && views.get(active)?.refresh) run(() => views.get(active).refresh()); countUnread(); countMoments(); }
+    if (event.type === 'space') { renderWidgets(); today?.paint(['cast']); run(refreshAvatars); if (active && views.get(active)?.refresh) run(() => views.get(active).refresh()); countUnread(); countMoments(); }
     if (event.type === 'sync') {
       views.get('settings')?.onSync?.();
       // Content from another device: say so once, when that sync is over.
@@ -723,8 +951,20 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
   }
 
   // ---------- Host hooks ----------
-  const previousOpenRole = win.stTtsOpenRole, previousVisibility = win.stTtsPanelVisibility, previousOpenDraw = win.stTtsOpenDraw;
+  const previousOpenRole = win.stTtsOpenRole, previousVisibility = win.stTtsPanelVisibility, previousOpenDraw = win.stTtsOpenDraw, previousOpenThread = win.stTtsOpenThread;
   win.stTtsOpenRole = id => open('roles', id);
+  const previousOpenApp = win.stTtsOpenApp;
+  /** An App the tavern page asked for (the music island's double tap): taken when the phone shows, or right away. */
+  // 'chat:moments': the chat app on 动态 (the 动态小窗's tap).
+  function openPart(value) {
+    const [name, part] = String(value || '').split(':');
+    if (!FACTORIES[name]) return false;
+    open(name);
+    if (part === 'moments') views.get('chat')?.showMoments?.();
+    return true;
+  }
+  function takeApp() { return openPart(api.takeApp?.()); }
+  win.stTtsOpenApp = name => run(() => name && openPart(name) || takeApp());
   function takeDraw() {
     const request = api.takeDraw?.();
     if (!request) return false;
@@ -733,12 +973,37 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
     return true;
   }
   win.stTtsOpenDraw = () => run(takeDraw);
-  win.stTtsPanelVisibility = visible => {
+  /** The chat a message card on the tavern page was double-tapped for (msg-island.js). */
+  function takeThread() {
+    const id = api.takeThread?.();
+    if (!id) return false;
+    open('chat');
+    views.get('chat')?.openThread?.(id);
+    return true;
+  }
+  win.stTtsOpenThread = () => run(takeThread);
+  // The browser's back while the phone is open (the edge swipe on a phone, see index.js): whatever is on top closes
+  // the way Esc closes it (a picture, the 改提示词 box, a sheet), else the app goes back a step. false at home: the
+  // phone itself closes.
+  win.stTtsBack = () => {
+    if (!sheet && !locked && !active && !doc.querySelector('.sttts-ask, .sttts-viewer, .album-viewer')) return false;
+    const keyboard = doc.documentElement.dataset.keyboard;
+    doc.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Escape', bubbles: true, cancelable: true}));
+    // It was not a key: the phone keeps its animations (they are off while a keyboard is used).
+    if (keyboard === undefined) delete doc.documentElement.dataset.keyboard;
+    return true;
+  };
+  win.stTtsPanelVisibility = (visible, {preserveView = false} = {}) => {
+    const reopening = visible && !panelVisible;
     panelVisible = visible;
     if (visible) { callState(); run(refreshAvatars); floatingBar(); }
-    if (!visible) sheet?.close(null);
+    if (!visible) { sheet?.close(null); if (active) views.get(active)?.leave?.(); }
     else if (takeDraw()) { /* opened from a chat picture */ }
+    else if (takeThread()) { /* opened from a message card */ }
+    else if (takeApp()) { /* opened from the music island */ }
     else if (preferences?.lockOnOpen && !api.pendingRole()) lock();
+    else if (reopening && !preserveView && !preferences?.lockOnOpen && !api.pendingRole()) { unlock(); showHome(true); }
+    else if (active && !locked && !doc.hidden) run(() => views.get(active)?.resume?.());
     animate();
   };
   function dispose() {
@@ -754,18 +1019,25 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
     setAvatarPictures({});
     for (const url of assets.values()) win.URL.revokeObjectURL(url);
     assets.clear();
-    win.clearInterval(clockTimer);
+    win.clearInterval(clockTimer); win.clearTimeout(todayTimer);
+    today?.dispose();
     win.clearTimeout(toastTimer);
     win.clearTimeout(openTimer);
     win.clearTimeout(unreadTimer); win.clearTimeout(freshTimer);
     win.cancelAnimationFrame(animation);
     win.stTtsOpenRole = previousOpenRole;
+    win.stTtsOpenApp = previousOpenApp;
     win.stTtsPanelVisibility = previousVisibility;
     win.stTtsOpenDraw = previousOpenDraw;
+    win.stTtsOpenThread = previousOpenThread;
+    if (win.stTtsBack) delete win.stTtsBack;
   }
   win.addEventListener('pagehide', dispose, {signal});
+  today = todayPage({doc, win, api, open, confirm, dialog, notify, signal, engineOf, appIcon, playback: () => playback, battery: () => batteryState(battery),
+    openThread: (id, from) => { open('chat', undefined, from); views.get('chat')?.openThread?.(id); }});
   applyThemeMode();
   renderHome();
+  run(() => today.refresh());
   const clockTimer = win.setInterval(clock, 15000);
   paintDevice();
   countUnread();
@@ -785,6 +1057,7 @@ export function createPhoneApp({window: win, api, mount = win.document.getElemen
     const pending = api.pendingRole();
     if (pending) openPendingRole(pending);
     else if (takeDraw()) { /* opened from a chat picture */ }
+    else if (takeApp()) { /* opened from the music island */ }
     else if (p.lockOnOpen) lock();
   }).catch(error => {
     if (disposed) return;

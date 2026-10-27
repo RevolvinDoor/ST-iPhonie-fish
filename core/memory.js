@@ -8,6 +8,7 @@
 // exact words of a long-gone moment can come back. Searching is local (BM25 over Chinese two-character pieces, as in
 // 剧情剪辑台) and, with a 向量模型 set up, mixed with embedding similarity.
 // No DOM, storage or network here: the plans, the prompts, the parsers, the search and the texts sent to the model.
+import {promptText} from './prompt-rules.js';
 import {messageLine} from './chat.js';
 
 export const MEMORY_LIMITS = Object.freeze({batch: [10, 200], stage: [2, 20], epic: [2, 20], recall: [0, 10], text: 6000, nodes: 600, chunk: 8, cap: 8000});
@@ -108,6 +109,30 @@ export function removeNode(book, id) {
   return out;
 }
 
+/**
+ * The book after messages were deleted (gone: the times they were sent; left: the chat as it is now). A 摘要 made from
+ * any of them goes, and so does every 摘要 after it (they would be written again anyway: what is written up goes back
+ * to before the first one gone), with the summaries merged from them; the summaries before stand as they were. The
+ * messages left there are written up again later, so nothing deleted stays in the memory. Unchanged when no summary
+ * held a deleted message.
+ */
+export function pruneBook(book, gone, left) {
+  const times = (gone || []).filter(Number.isFinite);
+  const hit = (book?.nodes || []).filter(n => n.level === 0 && times.some(t => t >= n.from && t <= n.to));
+  if (!hit.length) return book;
+  const earliest = Math.min(...hit.map(n => n.from));
+  const drop = new Set(book.nodes.filter(n => n.level === 0 && n.from >= earliest).map(n => n.id));
+  // A summary merged from any dropped one goes too (and one merged from that).
+  for (let grew = true; grew;) { grew = false; for (const n of book.nodes) if (!drop.has(n.id) && (n.covers || []).some(c => drop.has(c))) { drop.add(n.id); grew = true; } }
+  const out = structuredClone(book);
+  out.nodes = out.nodes.filter(n => !drop.has(n.id)).map(n => drop.has(n.coveredBy) ? {...n, coveredBy: ''} : n);
+  const before = said({messages: left}).filter(m => m.at < earliest).at(-1);
+  out.through = before?.id || '';
+  out.throughAt = before ? before.at : earliest - 1;
+  out.at = Date.now();
+  return out;
+}
+
 // ---------- Prompts ----------
 const pad = n => String(n).padStart(2, '0');
 export function day(at) { const d = new Date(at); return `${d.getMonth() + 1}月${d.getDate()}日`; }
@@ -126,23 +151,19 @@ export function transcript(messages, user) {
   }
   return out.join('\n');
 }
-const SHARED = ['只根据下面的内容写，不续写、不编造没发生的事，不替任何人做新决定。',
-  '写清是谁说的、谁做的；用名字，不用“我”“你”。日期照原文写。',
-  '直接写正文，不要标题、不要前言后语，不要用代码块。'];
+
 /**
  * The request that writes up a batch of messages (level 0) or merges nodes (level 1+).
  * who: the chat's name ('和澄音' or a group's name); user: the user's name.
  */
-export function buildMemoryRequest({level, messages = [], nodes = [], user = '我', who = '', group = false}) {
+export function buildMemoryRequest({prompts = {}, level, messages = [], nodes = [], user = '我', who = '', group = false}) {
   const where = group ? `群聊「${who}」` : `${user}和${who}的手机聊天`;
   if (level === 0) {
-    return [{role: 'system', content: [`你在整理${where}的记录，写成一段以后能直接拿来接着聊的聊天摘要（150 到 400 字）。`,
-      '要留下：聊了什么、发生了什么（时间顺序）；约定、承诺和计划（含日期）；送的礼物、红包、转账；打过的电话说了什么；提到的喜好、习惯、近况；称呼和关系、情绪的变化；还没解决的事。寒暄和重复的话可以省掉。', ...SHARED].join('\n')},
+    return [{role: 'system', content: promptText(prompts, 'memory', 'system', {'摘要': true, '哪里': where})},
       {role: 'user', content: `聊天记录：\n${transcript(messages, user)}`}];
   }
-  const name = levelName(level), size = level === 1 ? '300 到 700 字' : '400 到 900 字';
-  return [{role: 'system', content: [`你在整理${where}的长期记忆：把下面几段按时间排好的${levelName(level - 1)}合成一份「${name}」（${size}）。`,
-    '先按时间说清这段时间里的主线和转折，再写：关系和称呼现在是什么样、还有效的约定和承诺、对方的喜好和习惯、没解决的事。前后矛盾时以后面的为准，写出“原来…后来…”。细节宁可多留，不要只写空泛的总结。', ...SHARED].join('\n')},
+  const system = promptText(prompts, 'memory', 'system', {'哪里': where, '下一层': levelName(level - 1), '这一层': levelName(level), '字数': level === 1 ? '300 到 700 字' : '400 到 900 字'});
+  return [{role: 'system', content: system},
     {role: 'user', content: nodes.map(n => `【${levelName(n.level)} · ${span(n.from, n.to)}】\n${n.text}`).join('\n\n')}];
 }
 /** The written text: think blocks, code fences and a stray heading line dropped. */
