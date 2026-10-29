@@ -5,6 +5,7 @@
 //
 // 候选音色池 entry: {engine, voice, model, name, gender: 'female'|'male'|'', age: 'child'|'young'|'adult'|'old'|'', style}.
 import {promptText} from './prompt-rules.js';
+import {languageCode, languageName} from './languages.js';
 
 export const POOL_LIMIT = 200;
 export const VOICE_GENDERS = Object.freeze({female: '女', male: '男'});
@@ -26,6 +27,38 @@ export function normalizePool(list) {
 }
 // ---------- 音色池文件 ----------
 const LANGUAGE_WORDS = {zh: '中文', ja: '日语', en: '英语', ko: '韩语', yue: '粤语', fr: '法语', de: '德语', es: '西班牙语', ru: '俄语'};
+const LANGUAGE_PATTERNS = {
+  zh: /中文|汉语|普通话|国语|华语|中配|chinese|mandarin|(?<![a-z])(?:zh|cn)(?![a-z])/i,
+  ja: /日语|日文|日配|日本语|japanese|(?<![a-z])(?:ja|jp)(?![a-z])/i,
+  en: /英语|英文|英配|english|(?<![a-z])en(?![a-z])/i,
+  ko: /韩语|韩文|朝鲜语|韩配|korean|(?<![a-z])(?:ko|kr)(?![a-z])/i,
+  yue: /粤语|广东话|白话|粤配|cantonese|(?<![a-z])yue(?![a-z])/i,
+  fr: /法语|法文|french|(?<![a-z])fr(?![a-z])/i,
+  de: /德语|德文|german|(?<![a-z])de(?![a-z])/i,
+  es: /西班牙语|西语|西文|spanish|(?<![a-z])es(?![a-z])/i,
+  ru: /俄语|俄文|russian|(?<![a-z])ru(?![a-z])/i,
+  it: /意大利语|意语|意文|italian|(?<![a-z])it(?![a-z])/i,
+  pt: /葡萄牙语|葡语|葡文|portuguese|(?<![a-z])pt(?![a-z])/i,
+  ar: /阿拉伯语|阿语|arabic|(?<![a-z])ar(?![a-z])/i,
+  hi: /印地语|hindi|(?<![a-z])hi(?![a-z])/i,
+  th: /泰语|泰文|thai|(?<![a-z])th(?![a-z])/i,
+  vi: /越南语|越语|vietnamese|(?<![a-z])vi(?![a-z])/i,
+};
+/**
+ * Whether a pool entry matches the target spoken language:
+ * - Unremarked entries (`!entry.style?.trim()`) are always included in the candidate pool.
+ * - Entries with a remark (`entry.style`) must match the target language in their remark.
+ */
+export function matchesPoolLanguage(entry, language) {
+  const raw = String(language ?? '').trim();
+  if (!raw) return true;
+  const style = String(entry?.style ?? '').trim();
+  if (!style) return true;
+  const code = languageCode(raw);
+  if (code && LANGUAGE_PATTERNS[code]) return LANGUAGE_PATTERNS[code].test(style);
+  const lower = style.toLowerCase(), label = languageName(raw).toLowerCase();
+  return lower.includes(raw.toLowerCase()) || (!!label && lower.includes(label));
+}
 /** Gender and age guessed from the words that describe a voice (少女、大叔、妈妈…); '' when they do not say or disagree. */
 export function guessVoice(words) {
   const t = String(words ?? '').toLowerCase(), either = t.replace(/少年少女|男女|男声女声/g, '');
@@ -66,8 +99,9 @@ export const poolLine = v => [v.name, VOICE_GENDERS[v.gender], VOICE_AGES[v.age]
  * What is known of a character, for picking a voice: their card (when the tavern has one by that name), what they
  * said, and the story lines that mention them. Kept short (the model only needs gender, age and manner).
  */
-export function voiceProfile({name, card = '', said = [], story = []}) {
+export function voiceProfile({name, language = '', card = '', said = [], story = []}) {
   const lines = [`名字：${name}`];
+  if (String(language || '').trim()) lines.push(`台词语言：${languageName(language)}`);
   if (card.trim()) lines.push(`角色卡：${card.trim().slice(0, 800)}`);
   if (said.length) lines.push(`TA 说过的话：\n${said.slice(-6).map(s => '- ' + s).join('\n').slice(0, 600)}`);
   if (story.length) lines.push(`剧情里提到 TA 的地方：\n${story.slice(-8).map(s => '- ' + s).join('\n').slice(0, 1400)}`);
@@ -90,8 +124,8 @@ export function parsePick(reply, count) {
 }
 
 /** What to search a voice library for: {gender, age, words} by the model (words: a few short search terms). */
-export function searchRequest(profile, engine, prompts = {}) {
-  return [{role: 'system', content: promptText(prompts, 'auto-voice', 'search', {'Fish': engine === 'fish'})},
+export function searchRequest(profile, engine, prompts = {}, language = '') {
+  return [{role: 'system', content: promptText(prompts, 'auto-voice', 'search', {'Fish': engine === 'fish', '语言': language ? languageName(language) : ''})},
     {role: 'user', content: `【角色】\n${profile}\n\n要找什么样的声音？`}];
 }
 export function parseSearch(reply) {

@@ -167,7 +167,7 @@ function tagNote(key,model){if(key==='doubao')return '合成 2.0：台词的情�
  if(key==='mini')return '台词里的情绪会自动对应到下面这几个（中文也行）；对应不上时由模型自己判断。'+(model.startsWith('speech-2.8')?'原文里还能插下面这些圆括号语气声。':'');
  if(key==='eleven')return elevenTagged(model)?'原文里用方括号英文标签控制语气，如 [whispers]、[sarcastic]；台词的情绪会自动放在开头。'+(model==='eleven_v4'?'v4 只用稳定性和音色相似度两项设置。':''):'这个模型不读语气标签，情绪靠措辞和标点表达。';
  if(key==='fish'&&fishDrama(model))return '像给配音演员说戏：台词的情绪会自动放在开头的方括号里，可以写一整句，中文英文都行，如 [强忍着眼泪，却努力笑着]、[defensive, slightly uneasy tone]。原文里在发生的位置插声音和停顿，如 [sigh]、[pause]；只想改几个词就用成对标签包住，如 <whisper>Go on without me.</whisper>。';
- return fishS1(model)?'圆括号固定标签：情绪放句首，如 (sad)；语气和声音可以放在句中，如 (whispering)、(laughing)。台词的情绪会自动写成句首标签。':'台词的「情绪」字段写「语速,表现力」（如 1,0.7），由插件自动作为语速与表现力参数发送；原文里穿插方括号声音标记，如 [happy]、[sad]、[whispering]、[slight pause]、[sigh]。';
+ return fishS1(model)?'圆括号固定标签：情绪放句首，如 (sad)；语气和声音可以放在句中，如 (whispering)、(laughing)。台词的情绪会自动写成句首标签。':'台词的「情绪」字段写「语速,表现力」（如 1,0.7），由插件自动作为语速与表现力参数发送；原文里在变调或发声处穿插 25 种方括号声音标记（如 [happy]、[crying]、[whispering]、[slight pause]）及简短英文演技指令（如 [Trembling voice]、[Cold and mocking tone]）。';
 }
 /** The MiniMax emotion for a line's 情绪, or '' to let the model choose (unknown words, or not supported by the model). */
 function miniEmotion(model,emotion){const word=String(emotion||'').trim().toLowerCase();if(!word)return '';const found=Object.entries(MINI_EMOTION_WORDS).find(([,words])=>words.some(w=>word===w||word.includes(w)))?.[0]||'';return tags('mini',model).includes(found)?found:'';}

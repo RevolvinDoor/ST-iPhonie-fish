@@ -1,7 +1,7 @@
 // 自动挑音色, tavern side: when a character speaks for the first time (or 重新挑 in the 角色 App), the text model picks
 // their voice — from the 候选音色池 first, else from the voice library of the engine most roles use — and the route is
 // saved marked as picked automatically (autoVoice, with the reason). One character at a time.
-import {normalizePool, poolLine, voiceProfile, pickRequest, parsePick, searchRequest, parseSearch} from './core/auto-voice.js';
+import {normalizePool, poolLine, voiceProfile, pickRequest, parsePick, searchRequest, parseSearch, matchesPoolLanguage} from './core/auto-voice.js';
 import {plainStory} from './core/chat.js';
 import {findRoute} from './core/routes.js';
 
@@ -13,14 +13,14 @@ export function createVoiceHost({context, settings, backend, saidBy = () => []})
   let chain = Promise.resolve();
   const ask = prompt => backend.generateText(context(), {prompt, trimNames: false, responseLength: 1500});
 
-  function profileOf(name) {
+  function profileOf(name, language = '') {
     const ctx = context(), card = ctx?.characters?.find?.(c => c?.name === name);
     const story = [];
     for (const m of (ctx?.chat || []).slice(-40)) {
       if (m?.is_system) continue;
       for (const part of plainStory(String(m?.mes || '')).split(/\n+/)) if (part.includes(name)) story.push(`${m.name || ''}：${part.trim().slice(0, 200)}`);
     }
-    return voiceProfile({name, card: card ? [card.description, card.personality].filter(Boolean).join('\n') : '', said: saidBy(name), story});
+    return voiceProfile({name, language, card: card ? [card.description, card.personality].filter(Boolean).join('\n') : '', said: saidBy(name), story});
   }
   /** The engine to search: the one most voiced roles use, else Fish (its public library needs no account). */
   function libraryEngine() {
@@ -28,8 +28,8 @@ export function createVoiceHost({context, settings, backend, saidBy = () => []})
     for (const r of settings().routes) if (r.voice && ['fish', 'mini', 'eleven'].includes(r.engine)) counts[r.engine] = (counts[r.engine] || 0) + 1;
     return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'fish';
   }
-  async function fromLibrary(profile, engine) {
-    const want = parseSearch(await ask(searchRequest(profile, engine, settings().promptRules)));
+  async function fromLibrary(profile, engine, language = '') {
+    const want = parseSearch(await ask(searchRequest(profile, engine, settings().promptRules, language)));
     const connection = settings().connections[engine];
     let found = [];
     if (engine === 'fish') {
@@ -53,14 +53,16 @@ export function createVoiceHost({context, settings, backend, saidBy = () => []})
   async function choose(name, force) {
     const route = findRoute(settings().routes, name);
     if (route?.voice && !force) return route;
-    const profile = profileOf(name), pool = normalizePool(settings().voicePool);
+    const language = String(route?.language || settings().general?.defaultLanguage || 'zh').trim();
+    const profile = profileOf(name, language);
+    const pool = normalizePool(settings().voicePool).filter(v => matchesPoolLanguage(v, language));
     let chosen = null;
     if (pool.length) {
       const candidates = pool.map(v => ({...v, label: `[${ENGINE_NAMES[v.engine]}] ${poolLine(v)}`}));
       const picked = parsePick(await ask(pickRequest(profile, candidates, {prompts: settings().promptRules})), candidates.length);
       if (picked) chosen = {...candidates[picked.index], reason: picked.reason, from: '候选池'};
     }
-    if (!chosen) chosen = await fromLibrary(profile, libraryEngine());
+    if (!chosen) chosen = await fromLibrary(profile, libraryEngine(), language);
     if (!chosen) throw Error(`没能给「${name}」挑到音色，可以在角色 App 里手动选`);
     return backend.saveRoute({...(route || {}), name, engine: chosen.engine, voice: chosen.voice, model: chosen.model || '',
       autoVoice: true, autoName: chosen.name, autoReason: `${chosen.from}：${chosen.reason || chosen.name}`});
